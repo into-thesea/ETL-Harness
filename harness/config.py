@@ -118,19 +118,34 @@ class ServerSettings(BaseSettings):
 
 
 class SandboxSettings(BaseSettings):
-    """安全沙箱配置（Docker 容器隔离）。"""
+    """安全沙箱配置（OpenSandbox 控制面 + Docker 容器隔离）。
+
+    沙箱由独立的 OpenSandbox 服务端承载（infra/opensandbox-server/），
+    本框架只持有客户端连接信息，不直接操作 Docker。
+    """
 
     model_config = SettingsConfigDict(env_prefix="SANDBOX_", extra="ignore")
 
     enabled: bool = True
-    image: str = "python:3.12-slim"
-    memory_limit: str = "512m"
+
+    # --- OpenSandbox 控制面（对应 infra/opensandbox-server/sandbox.toml）---
+    server_url: str = "http://127.0.0.1:8080"
+    api_key: str = "etl-harness-local-dev-key"
+
+    # --- 沙箱容器（自建镜像见 infra/Dockerfile.sandbox）---
+    image: str = "etl-harness-sandbox:latest"
+    workdir: str = "/home/sandbox"
     cpu_limit: float = 1.0
+    memory_limit: str = "512m"
+    ready_timeout_seconds: int = 180
+
+    # --- 单次执行（信任边界，勿放宽）---
     timeout_seconds: int = 30
+    max_timeout_seconds: int = 300
+    artifact_max_bytes: int = 32 * 1024 * 1024
+
+    # --- 网络：False 时下发 NetworkPolicy(default_action="deny")，容器无出网 ---
     network_enabled: bool = False
-    workdir: str = "/sandbox/workspace"
-    max_concurrent: int = 5
-    container_name_prefix: str = "etl-harness-sandbox-"
 
 
 class TraceSettings(BaseSettings):

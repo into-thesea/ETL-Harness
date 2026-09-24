@@ -34,6 +34,24 @@ logger = logging.getLogger(__name__)
 ToolHandler = Callable[[dict, dict], tuple[bool, str, dict]]
 
 
+def _default_sandbox() -> Optional[Any]:
+    """按配置构造默认沙箱执行器。
+
+    SandboxExecutor 构造不触碰网络（首次执行才连 OpenSandbox 服务端），
+    因此这里默认构造是安全的。sandbox.enabled=False 时返回 None，此时
+    标了 run_in_sandbox 的工具会 fail closed，不会退化为裸跑。
+    """
+    from harness.config import settings
+
+    if not settings.sandbox.enabled:
+        logger.info("sandbox.enabled=False，高风险工具将 fail closed")
+        return None
+
+    from harness.sandbox import SandboxExecutor
+
+    return SandboxExecutor()
+
+
 def render_tool_descriptions(tools: list[ToolDef]) -> str:
     """根据给定工具列表渲染给 LLM 看的工具描述文本（Broker 与其受限视图共用）。"""
     if not tools:
@@ -78,14 +96,16 @@ class ToolBroker:
         Args:
             middleware_manager: 可插拔中间件管理器（可选，没有则不执行 Hook）
             pdp: PDP 策略决策点实例（可选，没有则跳过权限检查）
-            sandbox_executor: 安全沙箱执行器（可选，高风险工具走沙箱）
+            sandbox_executor: 安全沙箱执行器。缺省按 sandbox.enabled 自动构造
+                （构造不触碰网络，首次执行才连接）；显式传 None 且沙箱启用时同样
+                走自动构造，传 False 可显式关闭。
             audit_logger: 审计器实例（可选，没有则不记录审计日志）
         """
         self._tools: dict[str, tuple[ToolDef, ToolHandler]] = {}
         self._call_log: dict[str, list[float]] = {}
         self.middleware = middleware_manager
         self.pdp = pdp
-        self.sandbox = sandbox_executor
+        self.sandbox = sandbox_executor if sandbox_executor is not None else _default_sandbox()
         self.audit = audit_logger
 
     # ------------------------------------------------------------------
@@ -255,9 +275,19 @@ class ToolBroker:
         # ---- 6. 调用实现函数 ----
         start_time = time.time()
         try:
-            if tool_def.run_in_sandbox and self.sandbox is not None:
-                # 高风险工具走安全沙箱
-                ok, text, artifacts = self.sandbox.execute(handler, args, context, tool_def.sandbox_config)
+            if tool_def.run_in_sandbox:
+                # 高风险工具必须走沙箱；沙箱缺失时 fail closed，绝不裸跑
+                if self.sandbox is None:
+                    ok, text, artifacts = (
+                        False,
+                        f"沙箱已禁用（sandbox.enabled=False），拒绝执行高风险工具 "
+                        f"{tool_name!r}（fail closed）。",
+                        {},
+                    )
+                else:
+                    ok, text, artifacts = self.sandbox.execute(
+                        tool_def, args, context, tool_def.sandbox_config
+                    )
             else:
                 ok, text, artifacts = handler(args, context)
 

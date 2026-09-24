@@ -44,6 +44,9 @@ data/
 logs/
 *.log
 
+# OpenSandbox 服务端运行时状态（本地 sqlite；服务端 venv 由顶层 .venv/ 规则覆盖）
+infra/opensandbox-server/state/
+
 # 测试
 .pytest_cache/
 .coverage

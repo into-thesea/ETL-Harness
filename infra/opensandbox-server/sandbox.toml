@@ -1,0 +1,72 @@
+# ============================================================================
+# OpenSandbox Server 配置 —— ETL-Harness 专用
+#
+# 启动：
+#   infra/opensandbox-server/start.ps1        （或直接跑 .venv\Scripts\opensandbox-server.exe --config 本文件）
+#
+# 说明：服务端是 ETL-Harness 的「沙箱层」基础设施，与 Redis/Kafka/MinIO 同级。
+# 客户端 SDK（项目 .venv 里的 opensandbox）通过 HTTP 连本服务，不直连 Docker。
+# ============================================================================
+
+[server]
+host = "127.0.0.1"
+port = 8080
+max_sandbox_timeout_seconds = 86400
+# 本地开发用固定 key；生产改为从环境变量注入并轮换
+api_key = "etl-harness-local-dev-key"
+
+[log]
+level = "INFO"
+
+[runtime]
+type = "docker"
+execd_image = "opensandbox/execd:v1.0.22"
+
+# ---------------------------------------------------------------------------
+# 文件访问平面（PPT 所述「主机 + 沙箱双层文件访问平面」的落地点）
+#
+# 本项目的文件两层：
+#   主机平面 = 项目 VFS（data/vfs/workspace、data/vfs/reports）
+#   沙箱平面 = 容器内私有文件系统（/tmp/...）
+#   之间的唯一通道 = SDK 的 Filesystem API（write_file / read_file / search …）
+#
+# 因此这里**禁止一切宿主路径 bind mount**：沙箱进程看不到任何宿主路径，
+# 文件内容经 API 显式搬运，天然带审计点与大小上限，比挂载更严格。
+# 仅在确有「大文件免搬运」需求时才加入白名单，例如：
+#   allowed_host_paths = ["D:/ETL-Harness/data/vfs"]
+# ---------------------------------------------------------------------------
+[storage]
+allowed_host_paths = []
+volume_default_size = "1Gi"
+
+[store]
+# 默认 sqlite，无需 Postgres/Redis。库文件放项目内，不写用户目录。
+type = "sqlite"
+path = "D:/ETL-Harness/infra/opensandbox-server/state/opensandbox.db"
+
+[docker]
+network_mode = "bridge"
+# 每个沙箱占 2~3 个宿主端口（带 egress sidecar 时 3 个）
+port_range_min = 40000
+port_range_max = 60000
+drop_capabilities = [
+    "AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW",
+    "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG",
+]
+no_new_privileges = true
+apparmor_profile = ""
+# 限制进程数，降低 fork 炸弹对宿主的冲击
+pids_limit = 4096
+seccomp_profile = ""
+
+[ingress]
+mode = "direct"
+
+[egress]
+image = "opensandbox/egress:v1.1.7"
+mode = "dns"
+readiness_timeout_seconds = 30.0
+
+[renew_intent]
+enabled = false
+min_interval_seconds = 60

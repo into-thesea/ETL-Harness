@@ -1,0 +1,35 @@
+# ============================================================================
+# ETL-Harness 沙箱镜像
+#
+# 用途：code_executor 工具在 OpenSandbox 中执行 LLM 生成的分析代码时使用的容器镜像。
+# 预装 pandas/numpy/matplotlib/scipy，使沙箱内可离线执行分析代码（首启后无需联网）。
+#
+# 构建：
+#   docker build -f infra/Dockerfile.sandbox -t etl-harness-sandbox:latest infra/
+#
+# 与宿主 tools/ 的版本对齐策略：均不锁定版本，让 pip 在构建时解析当期最新，
+# 随宿主 .venv 一同演进，避免沙箱与宿主 pandas 语义漂移（pandas 3.x 有破坏性变更）。
+# ============================================================================
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    MPLBACKEND=Agg \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# 分析运行时（与 tools/ 用到的库对齐）
+RUN pip install --no-cache-dir \
+        pandas \
+        numpy \
+        matplotlib \
+        scipy
+
+# 中文字体：chart_generator 生成图表的场景在宿主侧完成；沙箱内若自绘图也需要
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends fonts-noto-cjk \
+ && rm -rf /var/lib/apt/lists/*
+
+# 非 root 运行（与 OpenSandbox 的 no_new_privileges / capability 剥离策略叠加）
+RUN useradd -m -u 1000 sandbox
+USER sandbox
+WORKDIR /home/sandbox

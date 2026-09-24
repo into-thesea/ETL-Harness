@@ -341,7 +341,17 @@ def test_chart_generator() -> None:
 
 
 def test_code_executor() -> None:
+    """沙箱代码执行：经 OpenSandbox 隔离容器执行，含双层文件平面往返。
+
+    依赖沙箱基础设施（OpenSandbox 服务端 + Docker）。未就绪时本项**直接失败**，
+    不做静默跳过 —— 沙箱是本项目的安全边界，其可用性不该被降级掩盖。
+    """
+    from harness.sandbox.client import SandboxClient
     from tools.code_executor import handle as code_handler
+
+    ready, reason = SandboxClient().available()
+    assert ready, f"沙箱基础设施不可用：{reason}"
+
     tmp = tempfile.mkdtemp(prefix="etl_code_")
     broker = ToolBroker()
     register_builtin_tools(broker)
@@ -356,14 +366,44 @@ print('分组结果：', df.groupby('g')['a'].sum().to_dict())
     assert ok, text
     assert "分组结果" in art["execution"]["stdout"]
     assert art["execution"]["returncode"] == 0
+    assert art["execution"]["sandbox"] == "opensandbox"
 
     # 以下直接调 handler，避开 code_executor 5 次/分钟的限流（限流属 broker 层）
     ok, _, art = code_handler({"code": "print(123 * 456)"}, ctx)
     assert ok and "56088" in art["execution"]["stdout"]
 
-    # 环境变量注入数据目录
-    ok, _, art = code_handler({"code": "import os; print(os.environ['ETL_WORKSPACE_DIR'])"}, ctx)
-    assert ok and tmp in art["execution"]["stdout"]
+    # 隔离：环境变量指向**沙箱内**路径，宿主路径不得外泄
+    ok, text, art = code_handler({
+        "code": "import os; w = os.environ['ETL_WORKSPACE_DIR']; print(w)"
+    }, ctx)
+    assert ok, text
+    assert "/home/sandbox/in" in art["execution"]["stdout"], art
+    assert tmp not in art["execution"]["stdout"], "宿主路径泄漏进了沙箱"
+
+    # 文件平面 主机 -> 沙箱：输入同步
+    with open(os.path.join(tmp, "input.csv"), "w", encoding="utf-8") as fh:
+        fh.write("a,b\n1,2\n3,4\n")
+    ok, text, art = code_handler({"code": """
+import os, pandas as pd
+df = pd.read_csv(os.path.join(os.environ['ETL_WORKSPACE_DIR'], 'input.csv'))
+print('行数', len(df), '合计', int(df['a'].sum()))
+"""}, ctx)
+    assert ok, text
+    assert "行数 2 合计 4" in art["execution"]["stdout"], art
+
+    # 文件平面 沙箱 -> 主机：产物按类型回灌
+    ok, text, art = code_handler({"code": """
+import os, pandas as pd
+out = os.environ['ETL_REPORTS_DIR']
+pd.DataFrame({'x': [1, 2]}).to_csv(os.path.join(out, 'result.csv'), index=False)
+with open(os.path.join(out, 'note.md'), 'w', encoding='utf-8') as f:
+    f.write('# 来自沙箱的产物')
+print('已写产物')
+"""}, ctx)
+    assert ok, text
+    assert {w["name"] for w in art["execution"]["artifacts_written"]} == {"result.csv", "note.md"}, art
+    assert os.path.isfile(os.path.join(tmp, "result.csv"))
+    assert os.path.isfile(os.path.join(tmp, "note.md"))
 
     # 运行期错误应被捕获（ok=False，stderr 有 traceback）
     ok, text, art = code_handler({"code": "raise ValueError('boom')"}, ctx)
@@ -375,11 +415,37 @@ print('分组结果：', df.groupby('g')['a'].sum().to_dict())
         ok, text, _ = code_handler({"code": bad}, ctx)
         assert not ok and "守卫" in text, f"应拦截: {bad}"
 
-    # 超时强杀
-    ok, _, art = code_handler({"code": "import time; time.sleep(5)", "timeout_seconds": 1}, ctx)
-    assert not ok and art["execution"]["timed_out"] is True
+    # 超时：由沙箱服务端强制终止
+    ok, _, art = code_handler({"code": "import time; time.sleep(60)", "timeout_seconds": 5}, ctx)
+    assert not ok and art["execution"]["timed_out"] is True, art
 
-    print("9. code_executor 执行 ok（pandas计算/中文/环境变量/错误捕获/安全守卫/超时）")
+    print("9. code_executor 沙箱执行 ok（pandas/中文/文件平面往返/错误捕获/安全守卫/超时）")
+
+
+def test_sandbox_fail_closed() -> None:
+    """沙箱不可用时必须拒绝执行，绝不在宿主上退化为进程执行。
+
+    这是安全边界本身，因此独立成项：指向一个必然连不上的端口模拟服务端故障，
+    断言"拒绝执行"而不是"降级跑通"。
+    """
+    from harness.config import SandboxSettings
+    from harness.sandbox import SandboxClient, SandboxExecutor
+    from tools.code_executor import TOOL_DEF
+
+    # 指向一个必然拒绝连接的端口，模拟服务端故障
+    dead = SandboxSettings(server_url="http://127.0.0.1:9", api_key="irrelevant")
+    client = SandboxClient(dead)
+
+    ready, _ = client.available()
+    assert not ready, "指向死端口时不应判定为可用"
+
+    executor = SandboxExecutor(client=client)
+    ok, text, _ = executor.execute(TOOL_DEF, {"code": "print('不该被执行')"}, {}, None)
+    assert not ok, f"沙箱不可用时必须拒绝执行，实际返回 ok=True：{text}"
+    assert "沙箱不可用" in text, text
+    assert "不该被执行" not in text, "拒绝信息里不得出现执行结果"
+
+    print("10. 沙箱不可用时 fail closed ok（拒绝执行，未降级为宿主进程）")
 
 
 def _main() -> None:
@@ -391,6 +457,7 @@ def _main() -> None:
     test_sql_query()
     test_chart_generator()
     test_code_executor()
+    test_sandbox_fail_closed()
     print("=== 数据分析工具冒烟测试通过 ===")
 
 
