@@ -241,6 +241,16 @@ def _snapshot_artifacts() -> set[str]:
     return files
 
 
+def _human_size(n: int) -> str:
+    """人类可读大小。不能用 n // 1024 —— 会把 613 字节的完整报告显示成「0 KB」，
+    看起来像文件损坏。"""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
 def _list_artifacts(before: set[str]) -> None:
     print("\n" + "=" * 64)
     print("VFS 本次产物清单（与运行前快照 diff 出的新增文件）")
@@ -256,7 +266,7 @@ def _list_artifacts(before: set[str]) -> None:
                     continue
                 new.append((os.path.relpath(path, base), os.path.getsize(path)))
         for rel, size in sorted(new):
-            print(f"  - {rel}  ({size // 1024} KB)")
+            print(f"  - {rel}  ({_human_size(size)})")
         if not new:
             print("  （无新增）")
 
@@ -286,7 +296,10 @@ def _build_llm():
     return ScriptedAnalysisLLM(RAW_FILE, CLEAN_STEM)
 
 
-def main() -> None:
+DEFAULT_GOAL = f"对销售数据 {RAW_FILE} 做端到端分析：体检 → 清洗 → EDA → 出图 → 报告"
+
+
+def main(goal: str | None = None) -> None:
     # 真实组件：注册全部内置工具 + 默认 7 个子 Agent + 内存任务存储 + 硬校验质量门
     # 审计接入：每次工具调用落 data/audit/audit.jsonl，可用 sandbox_used 字段
     # 直接核对高风险工具是否真的走了沙箱。
@@ -310,9 +323,7 @@ def main() -> None:
     print("启动 Plan-and-Execute 端到端链路")
     print("=" * 64)
     state = graph.invoke(
-        make_plan_execute_state(
-            f"对销售数据 {RAW_FILE} 做端到端分析：体检 → 清洗 → EDA → 出图 → 报告"
-        ),
+        make_plan_execute_state(goal or DEFAULT_GOAL),
         config={"recursion_limit": 80},
     )
 
@@ -343,4 +354,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    # 可选传入自定义目标，用于驱动不同深度的分析链路（例如强制走 coder/沙箱）：
+    #   python -m examples.data_analysis_demo "用 Python 代码计算各品类月度环比与异常值明细"
+    main(sys.argv[1] if len(sys.argv) > 1 else None)

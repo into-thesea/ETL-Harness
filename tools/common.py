@@ -55,13 +55,29 @@ def reports_dir(context: Optional[dict]) -> str:
 def resolve_input_path(file_path: str, context: Optional[dict] = None) -> str:
     """把工具入参里的文件路径解析为真实绝对路径。
 
-    支持：绝对路径；相对工作目录；相对项目根 / data 目录。
+    支持：VFS 逻辑路径（/workspace/x.csv、/reports/x.md）；绝对路径；
+    相对工作目录；相对项目根 / data 目录。
     """
     if not file_path or not isinstance(file_path, str):
         raise ToolDataError("file_path 不能为空")
+
+    # 1) VFS 逻辑路径优先映射。
+    #    LLM 从上游工具产物里拿到的是 /workspace/...、/reports/... 这类 VFS 路径，
+    #    若直接交给 os.path.isabs 会被判为"本机绝对路径"而必然失败（Windows 上以
+    #    / 开头同样判为绝对），连候选目录都不会尝试 —— 必须先做映射。
+    normalized = file_path.replace("\\", "/").lstrip("/")
+    if "/" in normalized:
+        head, _, rel = normalized.partition("/")
+        if head in ("workspace", "reports") and rel:
+            base = workspace_dir(context) if head == "workspace" else reports_dir(context)
+            cand = os.path.join(base, rel)
+            if os.path.exists(cand):
+                return cand
+            raise ToolDataError(_not_found_message(file_path, context))
+
     if os.path.isabs(file_path):
         if not os.path.exists(file_path):
-            raise ToolDataError(f"文件不存在：{file_path}")
+            raise ToolDataError(_not_found_message(file_path, context))
         return file_path
 
     candidates = [
@@ -73,10 +89,31 @@ def resolve_input_path(file_path: str, context: Optional[dict] = None) -> str:
     for cand in candidates:
         if os.path.exists(cand):
             return cand
-    # 都不存在时返回最可能的位置，交由读取步骤报清晰错误
-    raise ToolDataError(
-        f"文件不存在：{file_path}（已查找 {workspace_dir(context)}、项目根、data/）"
-    )
+    raise ToolDataError(_not_found_message(file_path, context))
+
+
+def _not_found_message(file_path: str, context: Optional[dict]) -> str:
+    """文件不存在的报错 —— **必须列出实际可用文件**。
+
+    否则 LLM 只能反复猜文件名（实测会猜 orders.db / data.xlsx / raw_orders.csv
+    等不存在的名字，耗尽步数上限）。把候选列出来，让它一步自纠。
+    """
+    ws = workspace_dir(context)
+    try:
+        available = sorted(
+            n for n in os.listdir(ws) if os.path.isfile(os.path.join(ws, n))
+        )
+    except OSError:
+        available = []
+
+    if available:
+        shown = "、".join(available[:20])
+        more = f"（共 {len(available)} 个，仅列前 20）" if len(available) > 20 else ""
+        hint = f"workspace 现有文件：{shown}{more}。请直接使用其中的文件名。"
+    else:
+        hint = f"workspace 目录为空（{ws}）。请先用 data_cleaner 或其它工具产出数据文件。"
+
+    return f"文件不存在：{file_path}。{hint}"
 
 
 # ----------------------------------------------------------------------
