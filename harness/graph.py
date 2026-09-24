@@ -26,6 +26,7 @@ def build_executor_graph(
     middleware: Optional[MiddlewareManager] = None,
     checkpointer: Any = None,
     system_prefix: str = "",
+    tool_mode: str = "react",
 ):
     """编译 ReAct 执行子图。
 
@@ -40,12 +41,17 @@ def build_executor_graph(
         middleware: 可选的中间件管理器。
         checkpointer: 可选的 LangGraph Checkpointer（断点恢复）。
         system_prefix: 子 Agent 专属角色/职责提示（委派时注入）。
+        tool_mode: 工具调用范式 —— ``"react"``（拼文本 + 解析 JSON，模型无关、
+            过程可见，用于教学/调试/兼容弱模型）或 ``"native"``（OpenAI 原生
+            Function Calling，工具结构由 API 保证，生产更稳）。两者复用同一套
+            Broker 与工具，最终都归一化到 ``broker.invoke(name, args)``。
 
     Returns:
         编译后的 LangGraph，可 .invoke(state) / .stream(state)。
     """
     nodes = ReActNodes(
-        llm=llm, broker=broker, middleware=middleware, system_prefix=system_prefix
+        llm=llm, broker=broker, middleware=middleware, system_prefix=system_prefix,
+        tool_mode=tool_mode,
     )
 
     graph = StateGraph(AgentState)
@@ -95,6 +101,7 @@ def make_executor_state(
         "long_term_context": "",
         "last_action": None,
         "last_action_input": None,
+        "pending_tool_calls": [],
         "last_observation": None,
         "final_answer": None,
         "error": None,

@@ -64,8 +64,12 @@ mode = "direct"
 
 [egress]
 image = "opensandbox/egress:v1.1.7"
+# dns 模式 = FQDN 级出网管控（配合 Credential Vault，让真实密钥不进入沙箱负载）
 mode = "dns"
-readiness_timeout_seconds = 30.0
+# 就绪等待上限。默认 30s 在「高频连续建沙箱」下不够：实测 51 次连续调用时
+# egress sidecar 会因 Docker 负载起不来，报 SANDBOX_START_FAILED。
+# 放宽到 120s，避免把并发压力误判成启动失败。
+readiness_timeout_seconds = 120.0
 
 [renew_intent]
 enabled = false

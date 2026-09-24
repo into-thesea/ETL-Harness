@@ -82,6 +82,7 @@ class PlanExecuteNodes:
         max_replans: int = 2,
         approval_callback: Optional[ApprovalCallback] = None,
         upstream_chars: int = 1200,
+        tool_mode: str = "react",
     ) -> None:
         self.llm = llm
         self.broker = broker
@@ -95,6 +96,8 @@ class PlanExecuteNodes:
         self.max_replans = max_replans
         self.approval_callback = approval_callback
         self.upstream_chars = upstream_chars
+        # 子任务执行体的工具调用范式："react" 或 "native"（见 nodes.ReActNodes）
+        self.tool_mode = tool_mode
         self._subgraph_cache: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -109,6 +112,7 @@ class PlanExecuteNodes:
                 self.llm, scoped,
                 middleware=self.middleware,
                 system_prefix=agent_def.system_prompt,
+                tool_mode=self.tool_mode,
             )
         return self._subgraph_cache[agent_name]
 
@@ -355,12 +359,18 @@ def build_plan_execute_graph(
     max_replans: int = 2,
     approval_callback: Optional[ApprovalCallback] = None,
     checkpointer: Any = None,
+    tool_mode: str = "react",
 ):
-    """编译顶层 Plan-and-Execute 图并返回（compiled graph）。"""
+    """编译顶层 Plan-and-Execute 图并返回（compiled graph）。
+
+    Args:
+        tool_mode: 子任务执行体的工具调用范式，``"react"`` 或 ``"native"``
+            （原生 Function Calling）。见 ``harness.nodes.ReActNodes``。
+    """
     nodes = PlanExecuteNodes(
         llm=llm, broker=broker, planner=planner, store=store, registry=registry,
         gate=gate, middleware=middleware, max_replans=max_replans,
-        approval_callback=approval_callback,
+        approval_callback=approval_callback, tool_mode=tool_mode,
     )
 
     g = StateGraph(PlanExecuteState)

@@ -59,6 +59,13 @@ class AgentState(TypedDict):
     last_action_input: dict | None
     """工具参数。"""
 
+    pending_tool_calls: list[dict]
+    """待执行的工具调用批次（原生 Function Calling 模式）。
+
+    模型一次可返回多个 tool_calls；think 节点原样存入，action 节点逐个执行
+    并回传配对 ``tool_call_id`` 的 ``role="tool"`` 消息。ReAct 模式下恒为空。
+    """
+
     last_observation: str | None
     """上一步观察结果。"""
 

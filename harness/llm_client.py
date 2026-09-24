@@ -14,9 +14,37 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from openai import OpenAI
+
+
+@dataclass
+class ToolCall:
+    """模型发起的一次函数调用（原生 Function Calling）。
+
+    ``id`` 是服务端给的调用标识，回传结果时必须用 ``role="tool"`` +
+    ``tool_call_id`` 与之配对，否则多轮调用会被服务端拒绝。
+    """
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class ToolChatResult:
+    """带工具的原生对话结果。"""
+
+    content: str
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    raw_message: dict[str, Any] = field(default_factory=dict)
+    """可直接追加回历史的 assistant 消息（含 tool_calls），保持与 OpenAI 契约一致。"""
+
+    @property
+    def wants_tools(self) -> bool:
+        return bool(self.tool_calls)
 
 
 class JSONParseError(RuntimeError):
@@ -142,6 +170,70 @@ class LLMClient:
         raise JSONParseError(
             f"模型输出两次都无法解析为 JSON。\n第一次输出: {raw[:300]}\n第二次输出: {raw2[:300]}"
         )
+
+    # ------------------------------------------------------------------
+    # 原生 Function Calling
+    # ------------------------------------------------------------------
+    def chat_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict],
+        tool_choice: str | dict = "auto",
+        temperature: Optional[float] = None,
+    ) -> ToolChatResult:
+        """带工具清单的原生对话（OpenAI Function Calling）。
+
+        工具清单经 API 的 ``tools`` 参数下发，``tool_calls`` 的结构由服务端
+        保证 —— 这是相对 ReAct「拼文本 + 解析 JSON」的核心收益。
+
+        Args:
+            messages: 对话历史，可含 ``role="tool"`` + ``tool_call_id`` 的消息。
+            tools: OpenAI tools 结构，由 ``broker.list_tools_openai_format()`` 生成。
+            tool_choice: ``"auto"`` / ``"none"`` / ``"required"``，或指定某个函数。
+            temperature: 覆盖默认温度。
+
+        Returns:
+            ToolChatResult。``tool_calls`` 为空表示模型直接给出了回答。
+        """
+        temp = self.temperature if temperature is None else temperature
+        resp = self._client.chat.completions.create(
+            model=self.model,
+            messages=messages,  # type: ignore[arg-type]
+            temperature=temp,
+            tools=tools or None,
+            tool_choice=tool_choice if tools else None,
+        )
+        message = resp.choices[0].message
+        content = (message.content or "").strip()
+
+        calls: list[ToolCall] = []
+        raw_calls: list[dict[str, Any]] = []
+        for tc in (getattr(message, "tool_calls", None) or []):
+            raw_args = getattr(tc.function, "arguments", None) or "{}"
+            try:
+                parsed = json.loads(raw_args)
+            except (json.JSONDecodeError, TypeError):
+                parsed = {}
+            if not isinstance(parsed, dict):
+                parsed = {"_value": parsed}
+            calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=parsed))
+            # 保留原始 arguments 字符串，使 assistant 消息按原样回灌历史
+            raw_calls.append({
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.function.name, "arguments": raw_args},
+            })
+
+        raw_message: dict[str, Any] = {"role": "assistant", "content": content}
+        if raw_calls:
+            raw_message["tool_calls"] = raw_calls
+
+        return ToolChatResult(content=content, tool_calls=calls, raw_message=raw_message)
+
+    @staticmethod
+    def tool_result_message(tool_call_id: str, content: str) -> dict[str, Any]:
+        """构造工具结果消息（``role="tool"`` + 与调用配对的 ``tool_call_id``）。"""
+        return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
 
 
 # ----------------------------------------------------------------------

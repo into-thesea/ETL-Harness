@@ -311,10 +311,16 @@ def main(goal: str | None = None) -> None:
     gate = QualityGate(llm=llm, use_critic=False)  # 关闭语义 Critic，只跑硬校验
     planner = TaskPlanner(llm, broker=broker, available_agents=registry.names())
 
+    # 工具调用范式："react"（默认，过程可见、模型无关）或 "native"（OpenAI 原生
+    # Function Calling，工具结构由 API 保证）。用 ETL_TOOL_MODE 切换做 A/B 对比。
+    tool_mode = (os.environ.get("ETL_TOOL_MODE") or "react").strip().lower()
+
     graph = build_plan_execute_graph(
         llm, broker, planner=planner, store=store,
         registry=registry, gate=gate, max_replans=2,
+        tool_mode=tool_mode,
     )
+    print(f"工具调用范式：tool_mode={tool_mode}")
 
     make_dirty_data()
     artifacts_before = _snapshot_artifacts()
