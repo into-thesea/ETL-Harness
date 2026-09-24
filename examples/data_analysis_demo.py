@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from harness.agents.registry import AgentRegistry
+from harness.audit import get_audit_logger
 from harness.orchestrator import build_plan_execute_graph, make_plan_execute_state
 from harness.planning import QualityGate, TaskPlanner, TaskStore
 from harness.tool_broker import ToolBroker
@@ -227,32 +228,73 @@ class ScriptedAnalysisLLM:
 # ----------------------------------------------------------------------
 # 3. 组装真实编排图并运行
 # ----------------------------------------------------------------------
-def _list_artifacts() -> None:
+def _snapshot_artifacts() -> set[str]:
+    """记录 VFS 现有的全部文件，用于运行后 diff 出「本次新增产物」。
+
+    不能用文件名前缀过滤：Mock 用固定名，真实 LLM 会自拟文件名
+    （advanced_metrics.json、品类销售TopN.png …），前缀过滤会把它们全部漏掉。
+    """
+    files: set[str] = set()
+    for base in (workspace_dir({}), reports_dir({})):
+        for root, _, names in os.walk(base):
+            files.update(os.path.join(root, n) for n in names)
+    return files
+
+
+def _list_artifacts(before: set[str]) -> None:
     print("\n" + "=" * 64)
-    print("VFS 本次产物清单（真实落盘文件）")
+    print("VFS 本次产物清单（与运行前快照 diff 出的新增文件）")
     print("=" * 64)
-    ws = workspace_dir({})
-    rp = reports_dir({})
-    for label, base, prefix in (
-        ("workspace 数据集", ws, ("sales_demo", "sales_cleaned")),
-        ("reports 报告/图表", rp, ("sales_cleaned", "demo_")),
-    ):
+    for label, base in (("workspace 数据集", workspace_dir({})),
+                        ("reports 报告/图表", reports_dir({}))):
         print(f"\n[{label}]  {base}")
-        for root, _, files in os.walk(base):
-            for f in sorted(files):
-                if f.startswith(prefix):
-                    rel = os.path.relpath(os.path.join(root, f), base)
-                    size = os.path.getsize(os.path.join(root, f))
-                    print(f"  - {rel}  ({size // 1024} KB)")
+        new = []
+        for root, _, names in os.walk(base):
+            for n in names:
+                path = os.path.join(root, n)
+                if path in before:
+                    continue
+                new.append((os.path.relpath(path, base), os.path.getsize(path)))
+        for rel, size in sorted(new):
+            print(f"  - {rel}  ({size // 1024} KB)")
+        if not new:
+            print("  （无新增）")
+
+
+def _build_llm():
+    """真实 LLM 优先；未配置 API Key 时退回脚本化 Mock（离线可跑）。
+
+    两者实现同一套 ``chat`` / ``chat_json`` 契约，因此下游的
+    planner / nodes / gate / orchestrator 完全无感。
+    """
+    from harness.config import settings
+
+    key = (settings.llm.api_key or "").strip()
+    if key:
+        from harness.llm_client import LLMClient
+
+        print(f"LLM：真实模型 {settings.llm.model} @ {settings.llm.base_url}")
+        return LLMClient(
+            api_key=key,
+            base_url=settings.llm.base_url,
+            model=settings.llm.model,
+            temperature=settings.llm.temperature,
+            timeout=float(settings.llm.timeout_seconds),
+        )
+
+    print("LLM：未配置 DEEPSEEK_API_KEY，退回脚本化 Mock（离线模式）")
+    return ScriptedAnalysisLLM(RAW_FILE, CLEAN_STEM)
 
 
 def main() -> None:
     # 真实组件：注册全部内置工具 + 默认 7 个子 Agent + 内存任务存储 + 硬校验质量门
-    broker = ToolBroker()
+    # 审计接入：每次工具调用落 data/audit/audit.jsonl，可用 sandbox_used 字段
+    # 直接核对高风险工具是否真的走了沙箱。
+    broker = ToolBroker(audit_logger=get_audit_logger())
     register_builtin_tools(broker)
     registry = AgentRegistry()
     store = TaskStore(backend="memory")
-    llm = ScriptedAnalysisLLM(RAW_FILE, CLEAN_STEM)
+    llm = _build_llm()
     gate = QualityGate(llm=llm, use_critic=False)  # 关闭语义 Critic，只跑硬校验
     planner = TaskPlanner(llm, broker=broker, available_agents=registry.names())
 
@@ -262,9 +304,10 @@ def main() -> None:
     )
 
     make_dirty_data()
+    artifacts_before = _snapshot_artifacts()
 
     print("\n" + "=" * 64)
-    print("启动 Plan-and-Execute 端到端链路（Mock LLM）")
+    print("启动 Plan-and-Execute 端到端链路")
     print("=" * 64)
     state = graph.invoke(
         make_plan_execute_state(
@@ -296,7 +339,7 @@ def main() -> None:
     print("=" * 64)
     print(state["final_answer"])
 
-    _list_artifacts()
+    _list_artifacts(artifacts_before)
 
 
 if __name__ == "__main__":

@@ -11,10 +11,21 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# 把 .env 注入 os.environ 后再实例化任何 Settings。
+#
+# 为什么需要这一步：pydantic-settings 的 env_file **不会传播到嵌套模型** ——
+# 顶层 Settings 虽然声明了 env_file=".env"，但其嵌套字段（llm / redis / sandbox …）
+# 各自是独立的 BaseSettings，只从 os.environ 读取。结果是 .env 整体失效，
+# 框架一直静默运行在代码默认值上（例如 llm.api_key 恒为空、llm.model 恒为默认）。
+# 显式 load_dotenv 让所有嵌套模型都能读到，且不覆盖已存在的真实环境变量。
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 class LLMSettings(BaseSettings):

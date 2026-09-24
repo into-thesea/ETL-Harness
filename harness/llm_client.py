@@ -60,12 +60,38 @@ class LLMClient:
     # ------------------------------------------------------------------
     # 底层调用
     # ------------------------------------------------------------------
-    def _raw_chat(self, messages: list[dict[str, str]], temperature: float) -> str:
-        resp = self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,  # type: ignore[arg-type]
-            temperature=temperature,
-        )
+    def _raw_chat(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float,
+        json_mode: bool = False,
+    ) -> str:
+        """底层调用。
+
+        json_mode=True 时请求服务端的原生 JSON 输出（response_format），
+        由服务端保证输出是合法 JSON，从根上减少解析失败。部分 OpenAI 兼容
+        端点不支持该参数，因此失败时自动退回普通调用（由 chat_json 的
+        容错解析与自修重试兜底）。
+        """
+        kwargs: dict[str, Any] = {}
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        try:
+            resp = self._client.chat.completions.create(
+                model=self.model,
+                messages=messages,  # type: ignore[arg-type]
+                temperature=temperature,
+                **kwargs,
+            )
+        except Exception:
+            if not json_mode:
+                raise
+            # 端点不支持 response_format：退回普通调用
+            resp = self._client.chat.completions.create(
+                model=self.model,
+                messages=messages,  # type: ignore[arg-type]
+                temperature=temperature,
+            )
         content = resp.choices[0].message.content or ""
         return content.strip()
 
@@ -87,12 +113,12 @@ class LLMClient:
     ) -> dict[str, Any]:
         """要求模型输出 JSON 并解析为 dict。
 
-        解析失败时自动重试一次：把模型上次的非法回复作为 assistant 消息
-        回灌，再追加一条 user 消息要求"重新输出合法 JSON"。
-        第二次仍失败则抛出 :class:`JSONParseError`。
+        优先使用服务端原生 JSON 模式；解析失败时自动重试一次：把模型上次的
+        非法回复作为 assistant 消息回灌，再追加一条 user 消息要求"重新输出
+        合法 JSON"。第二次仍失败则抛出 :class:`JSONParseError`。
         """
         temp = self.temperature if temperature is None else temperature
-        raw = self._raw_chat(messages, temp)
+        raw = self._raw_chat(messages, temp, json_mode=True)
 
         parsed = _try_extract_json(raw)
         if parsed is not None:
