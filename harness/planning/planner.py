@@ -1,0 +1,236 @@
+"""harness.planning.planner —— LLM 任务规划器 / 重规划器（Plan-and-Execute 的 Planner）。
+
+输入用户目标，让 LLM 产出一个结构化 TaskPlan：
+- 每个子任务带 title / description / assigned_to（专业子 Agent）/ depends_on（依赖）
+  / acceptance_criteria（质量门验收标准）/ expected_artifacts（预期产物）。
+- LLM 用"步骤序号（从 0 开始）"表达依赖，本模块负责把序号映射成稳定的 task_id，
+  并校验负责人是否在已知子 Agent 名单内（未知则回退通用 executor）。
+
+重规划 replan：执行偏离/失败时，保留已完成步骤（含结论与产物），让 LLM 只补
+"剩余/调整后的步骤"，计划版本 +1。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Optional
+
+from harness.models import TaskPlan, TaskStatus, TaskStep
+from harness.tool_broker import ToolBroker
+
+logger = logging.getLogger(__name__)
+
+
+# 数据分析 / ETL 的专业子 Agent 角色提示（与后续 agents 注册表保持一致）。
+# critic 是质量门裁判、supervisor 是主控，均不参与执行，故不在此列。
+DEFAULT_AGENT_ROLES: dict[str, str] = {
+    "inspector": "数据体检员：读取数据，输出 schema、行数、缺失率、质量风险画像",
+    "cleaner": "数据清洗工程师：处理缺失/重复/类型/异常/文本规范，产出干净数据集与清洗报告",
+    "analyst": "EDA 分析师：分布、统计、相关性、对比、假设检验，可做只读 SQL 查询",
+    "chartist": "可视化工程师：依据结论选择图型，产出图表图片",
+    "coder": "沙箱执行员：在隔离沙箱中运行自定义 pandas/python，完成复杂变换与临时建模",
+    "reporter": "报告撰写员：汇总各步结论与图表，产出最终分析报告",
+    "executor": "通用执行员：当任务无法明确归入上述专业角色时使用",
+}
+
+DEFAULT_EXECUTOR = "executor"
+
+
+class TaskPlanner:
+    """把目标拆成 TaskPlan；执行受阻时重规划。
+
+    Args:
+        llm: 具备 ``chat_json(messages) -> dict`` 的对象（LLMClient 或 Mock）。
+        broker: 可选 ToolBroker，用于把当前可用工具清单告诉规划器。
+        available_agents: 可分派的子 Agent 名列表，默认用内置数据分析角色。
+        default_agent: LLM 给出未知负责人时的回退角色。
+    """
+
+    def __init__(
+        self,
+        llm: Any,
+        broker: Optional[ToolBroker] = None,
+        available_agents: Optional[list[str]] = None,
+        default_agent: str = DEFAULT_EXECUTOR,
+    ) -> None:
+        self.llm = llm
+        self.broker = broker
+        self.roles = available_agents or list(DEFAULT_AGENT_ROLES.keys())
+        self.default_agent = default_agent
+
+    # ------------------------------------------------------------------
+    # Prompt 构造
+    # ------------------------------------------------------------------
+    def _agent_hints(self) -> str:
+        lines = []
+        for name in self.roles:
+            desc = DEFAULT_AGENT_ROLES.get(name, name)
+            lines.append(f"- {name}: {desc}")
+        return "\n".join(lines)
+
+    def _tool_hints(self) -> str:
+        if self.broker is not None:
+            desc = self.broker.list_tool_descriptions()
+            return desc if desc.strip() else "（当前没有注册任何工具）"
+        return "（未提供工具清单）"
+
+    def _output_contract(self) -> str:
+        return (
+            "## 输出格式（只输出一个 JSON，不要 Markdown 代码块或多余文字）\n"
+            '{"tasks": [\n'
+            '  {"title": "简短标题",\n'
+            '   "description": "这一步具体要做什么、输入是什么、产出什么",\n'
+            '   "assigned_to": "上面某个子 Agent 名",\n'
+            '   "depends_on": [前置步骤的序号，从 0 开始；没有依赖则给 []],\n'
+            '   "acceptance_criteria": ["可判定的验收标准1", "验收标准2"],\n'
+            '   "expected_artifacts": ["预期产物，如 /workspace/profile.json"]\n'
+            "  }]}\n"
+            "注意：depends_on 只能引用【本 JSON 中步骤的序号】（第一个步骤序号为 0）。\n"
+        )
+
+    def _plan_messages(self, goal: str, context: str) -> list[dict]:
+        system = (
+            "你是一名资深数据分析项目负责人，擅长把复杂的数据分析 / ETL 目标拆解为"
+            "有序、可执行、可验收的子任务，并分派给合适的专业子 Agent。\n"
+            "拆解原则：\n"
+            "1. 遵循 数据体检 → 清洗 → 探索分析 → 图表/复杂计算 → 报告 的主干，按实际需要裁剪；\n"
+            "2. 每个子任务应当能由对应子 Agent 在有限步数内独立完成；\n"
+            "3. 明确先后依赖，能并行的不要强行串行；\n"
+            "4. 为每个子任务写出可客观判定的验收标准与预期产物。\n\n"
+            f"## 可分派的子 Agent\n{self._agent_hints()}\n\n"
+            f"## 可调用的工具\n{self._tool_hints()}\n\n"
+            f"{self._output_contract()}"
+        )
+        user = f"用户目标：\n{goal}\n"
+        if context:
+            user += f"\n补充背景：\n{context}\n"
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    def _replan_messages(self, old_plan: TaskPlan, feedback: str) -> list[dict]:
+        done_lines = []
+        for i, t in enumerate(old_plan.tasks):
+            if t.status in (TaskStatus.COMPLETED, TaskStatus.SKIPPED):
+                done_lines.append(
+                    f"[{i}] {t.title}（{t.status.value}）结论：{t.result or '(无)'}"
+                )
+        done_block = "\n".join(done_lines) or "（暂无已完成步骤）"
+
+        system = (
+            "你是数据分析项目负责人。原计划在执行中遇到问题，需要你重规划【尚未完成】的部分。\n"
+            "要求：\n"
+            "1. 只输出还需要执行（或需要调整）的新步骤，不要重复已经完成的步骤；\n"
+            "2. 新步骤之间的依赖用【你本次输出列表内的序号（从 0 开始）】表示；\n"
+            "3. 针对反馈中的失败原因调整方案，必要时换用不同子 Agent 或补一个前置修复步骤。\n\n"
+            f"## 可分派的子 Agent\n{self._agent_hints()}\n\n"
+            f"{self._output_contract()}"
+        )
+        user = (
+            f"原始目标：{old_plan.goal}\n\n"
+            f"已完成步骤（系统会自动保留，不要重复）：\n{done_block}\n\n"
+            f"重规划反馈 / 失败信息：\n{feedback}\n"
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    # ------------------------------------------------------------------
+    # 解析 LLM 输出
+    # ------------------------------------------------------------------
+    def _parse_steps(self, data: dict[str, Any]) -> list[TaskStep]:
+        raw_tasks = data.get("tasks")
+        if not isinstance(raw_tasks, list) or not raw_tasks:
+            raise ValueError("规划器返回中没有有效的 tasks 列表")
+
+        # 第一轮：先实例化，拿到每个步骤的稳定 task_id 与 序号→id 映射
+        steps: list[TaskStep] = []
+        index_to_id: dict[int, str] = {}
+        for i, item in enumerate(raw_tasks):
+            if not isinstance(item, dict):
+                raise ValueError(f"第 {i} 个任务不是对象")
+            title = str(item.get("title", "")).strip() or f"步骤 {i + 1}"
+            assigned = str(item.get("assigned_to", "")).strip()
+            if assigned not in self.roles:
+                logger.warning("规划器给出未知子 Agent %r，回退为 %s", assigned, self.default_agent)
+                assigned = self.default_agent
+            step = TaskStep(
+                title=title,
+                description=str(item.get("description", "")),
+                assigned_to=assigned,
+                acceptance_criteria=[str(x) for x in item.get("acceptance_criteria", [])],
+                expected_artifacts=[str(x) for x in item.get("expected_artifacts", [])],
+            )
+            index_to_id[i] = step.task_id
+            steps.append(step)
+
+        # 第二轮：把"序号依赖"翻译成 task_id 依赖（非法序号忽略）
+        for i, item in enumerate(raw_tasks):
+            deps = item.get("depends_on", []) or []
+            if not isinstance(deps, list):
+                continue
+            mapped = []
+            for dep in deps:
+                try:
+                    dep_index = int(dep)
+                except (TypeError, ValueError):
+                    continue
+                if dep_index == i:
+                    continue  # 不允许自依赖
+                target = index_to_id.get(dep_index)
+                if target and target not in mapped:
+                    mapped.append(target)
+            steps[i].depends_on = mapped
+
+        return steps
+
+    # ------------------------------------------------------------------
+    # 对外 API
+    # ------------------------------------------------------------------
+    def plan(self, goal: str, context: str = "") -> TaskPlan:
+        """首次规划：目标 → TaskPlan（未持久化，交由 TaskStore.create_plan 校验保存）。"""
+        data = self.llm.chat_json(self._plan_messages(goal, context))
+        steps = self._parse_steps(data)
+        plan = TaskPlan(goal=goal, tasks=steps)
+        plan.current_task_id = steps[0].task_id if steps else None
+        plan.compute_progress()
+        logger.info("Planner 产出计划：%d 个任务（goal=%.40s）", len(steps), goal)
+        return plan
+
+    def replan(self, old_plan: TaskPlan, feedback: str = "") -> TaskPlan:
+        """重规划：保留已完成步骤，追加 LLM 给出的新步骤，版本 +1。"""
+        data = self.llm.chat_json(self._replan_messages(old_plan, feedback))
+        new_steps = self._parse_steps(data)
+
+        done = [
+            t for t in old_plan.tasks
+            if t.status in (TaskStatus.COMPLETED, TaskStatus.SKIPPED)
+        ]
+
+        # 让新步骤的第一步隐式依赖"最后一个已完成步骤"，衔接前后拓扑
+        if done and new_steps:
+            last_done_id = done[-1].task_id
+            if last_done_id not in new_steps[0].depends_on:
+                new_steps[0].depends_on.append(last_done_id)
+
+        merged = done + new_steps
+        plan = TaskPlan(
+            plan_id=old_plan.plan_id,
+            goal=old_plan.goal,
+            tasks=merged,
+            version=old_plan.version + 1,
+            replan_count=old_plan.replan_count + 1,
+        )
+        plan.current_task_id = new_steps[0].task_id if new_steps else None
+        plan.compute_progress()
+        logger.info(
+            "Replanner v%d：保留 %d 个已完成，新增 %d 个任务",
+            plan.version, len(done), len(new_steps),
+        )
+        return plan
+
+
+__all__ = ["TaskPlanner", "DEFAULT_AGENT_ROLES"]
