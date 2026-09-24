@@ -210,6 +210,13 @@ class RuntimeSettings(BaseSettings):
     default_timeout_seconds: int = 300
     context_summary_threshold: int = 500  # 超过这个字符数的结果自动沉淀到 VFS
 
+    # 子任务执行体的工具调用范式（见 harness.nodes.ReActNodes）：
+    #   "react"  —— 工具清单拼进提示、解析模型 JSON 输出；过程可见、模型无关，
+    #               用于教学/调试/兼容弱模型
+    #   "native" —— OpenAI 原生 Function Calling，工具结构由 API 保证，
+    #               支持一次多个 tool_calls；用于生产
+    agent_tool_mode: str = "react"
+
 
 class Settings(BaseSettings):
     """全局配置聚合。
