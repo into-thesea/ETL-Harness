@@ -58,6 +58,7 @@ class HarnessService:
         self._locks: dict[str, asyncio.Lock] = {}
         self.graph: Any = None
         self.llm: Any = None
+        self.datasources: Any = None
         if auto_assemble:
             self.assemble()
 
@@ -85,6 +86,15 @@ class HarnessService:
         skills_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "skills")
         skill_registry.load_directory(skills_dir)
 
+        # 多数据源（C5）：从 DATASOURCE_SOURCES 加载命名 MySQL/PostgreSQL 源
+        from harness.config import settings as _settings
+
+        from harness.datasources import DataSourceManager
+
+        datasources = DataSourceManager()
+        datasources.load_from_settings(_settings.datasource)
+        self.datasources = datasources
+
         self.llm = llm
         self.graph = build_plan_execute_graph(
             llm, broker,
@@ -92,6 +102,7 @@ class HarnessService:
             checkpointer=self.checkpointer,
             context_manager=context_manager,
             skill_registry=skill_registry,
+            datasources=datasources,
         )
         logger.info("HarnessService assembled (checkpointer=%s)", type(self.checkpointer).__name__)
         return self.graph

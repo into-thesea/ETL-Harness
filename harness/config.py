@@ -249,6 +249,22 @@ class ContextSettings(BaseSettings):
     """确定性降级摘要中，每条旧消息最多保留多少字符。"""
 
 
+class DataSourceSettings(BaseSettings):
+    """命名数据源配置（C5：SQLAlchemy 统一连接层）。
+
+    通过环境变量 ``DATASOURCE_SOURCES`` 配置多个命名数据源，值为 JSON 对象：
+        {"mysql_prod": "mysql+pymysql://ro:pass@host:3306/db",
+         "pg_dwh": "postgresql+psycopg2://ro:pass@host:5432/dwh"}
+    也支持简单的 ``name=url,name=url`` 形式（密码中的特殊字符请做 URL 编码）。
+    SQLite 文件无需在此配置 —— sql_query 的 db_path 会自动注册只读源。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="DATASOURCE_", extra="ignore")
+
+    sources: str = ""
+    default: str = Field("", description="默认数据源名（未指定 data_source/db_path 时使用）")
+
+
 class Settings(BaseSettings):
     """全局配置聚合。
 
@@ -272,6 +288,7 @@ class Settings(BaseSettings):
     vfs: VFSSettings = Field(default_factory=VFSSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
+    datasource: DataSourceSettings = Field(default_factory=DataSourceSettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
 
 

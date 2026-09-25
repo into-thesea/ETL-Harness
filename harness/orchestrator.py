@@ -88,6 +88,7 @@ class PlanExecuteNodes:
         context_manager: Any = None,
         subgraph_checkpointer: Any = None,
         skill_registry: Any = None,
+        datasources: Any = None,
     ) -> None:
         self.llm = llm
         self.broker = broker
@@ -113,6 +114,10 @@ class PlanExecuteNodes:
         # Skill 注册中心（harness.skills.SkillRegistry），透传给每个子任务子图；
         # None 表示不注入技能指引。
         self.skill_registry = skill_registry
+        # SQLAlchemy 数据源管理器（harness.datasources.DataSourceManager），
+        # 经执行子图的节点构造注入（不进 state、不被 checkpointer 序列化）；
+        # None 时 sql_query 用进程默认单例。
+        self.datasources = datasources
         self._subgraph_cache: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -135,6 +140,7 @@ class PlanExecuteNodes:
                 checkpointer=self.subgraph_checkpointer,
                 skill_registry=self.skill_registry,
                 allowed_skills=allowed_skills,
+                datasources=self.datasources,
             )
         return self._subgraph_cache[agent_name]
 
@@ -429,6 +435,7 @@ def build_plan_execute_graph(
     context_manager: Any = None,
     subgraph_checkpointer: Any = None,
     skill_registry: Any = None,
+    datasources: Any = None,
 ):
     """编译顶层 Plan-and-Execute 图并返回（compiled graph）。
 
@@ -453,6 +460,7 @@ def build_plan_execute_graph(
             subgraph_checkpointer if subgraph_checkpointer is not None else checkpointer
         ),
         skill_registry=skill_registry,
+        datasources=datasources,
     )
 
     g = StateGraph(PlanExecuteState)

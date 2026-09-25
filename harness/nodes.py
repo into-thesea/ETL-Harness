@@ -101,6 +101,7 @@ class ReActNodes:
         context_manager: Optional[Any] = None,
         skill_registry: Optional[Any] = None,
         allowed_skills: Optional[list[str]] = None,
+        datasources: Optional[Any] = None,
     ) -> None:
         if tool_mode not in ("react", "native"):
             raise ValueError(f"tool_mode 只能是 'react' 或 'native'，收到 {tool_mode!r}")
@@ -118,6 +119,10 @@ class ReActNodes:
         # None 表示不限定，按任务相关性匹配（skills 字段为空时的默认语义）。
         self.skill_registry = skill_registry
         self.allowed_skills = allowed_skills
+        # 数据源管理器（harness.datasources.DataSourceManager）是运行时基础设施，
+        # 经节点构造注入（不进 state、不被 checkpointer 序列化），sql_query 经
+        # broker invoke 的 context 取用；None 时 sql_query 用进程默认单例。
+        self.datasources = datasources
 
     # ------------------------------------------------------------------
     # 工具执行前审批闸门（Human-in-the-Loop）
@@ -688,6 +693,7 @@ class ReActNodes:
             "agent_id": state.get("agent_id"),
             "role": state.get("role", "analyst"),
             "working_memory": state.get("working_memory", {}),
+            "data_source_manager": self.datasources,
             "step": state.get("current_step"),
         }
 
@@ -759,6 +765,7 @@ class ReActNodes:
             "agent_id": state.get("agent_id"),
             "role": state.get("role", "analyst"),
             "working_memory": state.get("working_memory", {}),
+            "data_source_manager": self.datasources,
             "step": state.get("current_step"),
         }
 

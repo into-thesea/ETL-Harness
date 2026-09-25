@@ -30,6 +30,7 @@ def build_executor_graph(
     context_manager: Any = None,
     skill_registry: Any = None,
     allowed_skills: Optional[list[str]] = None,
+    datasources: Any = None,
 ):
     """编译 ReAct 执行子图。
 
@@ -61,6 +62,7 @@ def build_executor_graph(
         llm=llm, broker=broker, middleware=middleware, system_prefix=system_prefix,
         tool_mode=tool_mode, context_manager=context_manager,
         skill_registry=skill_registry, allowed_skills=allowed_skills,
+        datasources=datasources,
     )
 
     graph = StateGraph(AgentState)
