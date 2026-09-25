@@ -12,12 +12,24 @@ DeepSeek / 通义千问 / Kimi / Ollama / OpenAI 官方……
 
 from __future__ import annotations
 
+import contextvars
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from openai import OpenAI
+
+logger = logging.getLogger(__name__)
+
+
+# 调用归因上下文：子图节点在调用 LLM 前绑定（agent_id/session_id/trace_id/task_id），
+# LLMClient 记录单次 usage 时读取，把 Token 消耗归因到具体子 Agent / 子任务。
+# 未绑定时（顶层 plan/gate/synthesize）归到 "supervisor"。
+_usage_context: contextvars.ContextVar[Optional[dict[str, str]]] = contextvars.ContextVar(
+    "etl_llm_usage_context", default=None
+)
 
 
 @dataclass
@@ -45,6 +57,20 @@ class ToolChatResult:
     @property
     def wants_tools(self) -> bool:
         return bool(self.tool_calls)
+
+
+@dataclass
+class TokenUsage:
+    """单次 LLM 调用的 Token 用量（含归因信息）。"""
+
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    agent_id: str = "supervisor"
+    session_id: str = ""
+    trace_id: str = ""
+    task_id: str = ""
 
 
 class JSONParseError(RuntimeError):
@@ -78,6 +104,15 @@ class LLMClient:
             timeout=timeout,
         )
 
+        # Token 用量统计（C3）：全局累计 + 按 Agent 归因 + 单次明细
+        self.usage_records: list[TokenUsage] = []
+        self.usage_total: dict[str, int] = {
+            "calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+        }
+        self.usage_by_agent: dict[str, dict[str, int]] = {}
+        # 可选监听器 ``fn(TokenUsage)``，由审计 / tracer 层订阅；其异常不影响主流程
+        self.usage_listener: Optional[Any] = None
+
     # ------------------------------------------------------------------
     # 运行时配置
     # ------------------------------------------------------------------
@@ -88,6 +123,42 @@ class LLMClient:
     # ------------------------------------------------------------------
     # 底层调用
     # ------------------------------------------------------------------
+    def _record_usage(self, resp: Any) -> None:
+        """从响应提取 usage 并累计 / 归因（响应无 usage 字段则跳过）。"""
+        u = getattr(resp, "usage", None)
+        if u is None:
+            return
+        ctx = _usage_context.get() or {}
+        usage = TokenUsage(
+            model=self.model,
+            prompt_tokens=getattr(u, "prompt_tokens", 0) or 0,
+            completion_tokens=getattr(u, "completion_tokens", 0) or 0,
+            total_tokens=getattr(u, "total_tokens", 0) or 0,
+            agent_id=ctx.get("agent_id") or "supervisor",
+            session_id=ctx.get("session_id", ""),
+            trace_id=ctx.get("trace_id", ""),
+            task_id=ctx.get("task_id", ""),
+        )
+        self.usage_records.append(usage)
+        total = self.usage_total
+        total["calls"] += 1
+        total["prompt_tokens"] += usage.prompt_tokens
+        total["completion_tokens"] += usage.completion_tokens
+        total["total_tokens"] += usage.total_tokens
+        bucket = self.usage_by_agent.setdefault(
+            usage.agent_id,
+            {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        )
+        bucket["calls"] += 1
+        bucket["prompt_tokens"] += usage.prompt_tokens
+        bucket["completion_tokens"] += usage.completion_tokens
+        bucket["total_tokens"] += usage.total_tokens
+        if self.usage_listener is not None:
+            try:
+                self.usage_listener(usage)
+            except Exception:  # noqa: BLE001 - 监听器失败不得影响调用主流程
+                logger.warning("usage_listener raised", exc_info=True)
+
     def _raw_chat(
         self,
         messages: list[dict[str, str]],
@@ -120,6 +191,7 @@ class LLMClient:
                 messages=messages,  # type: ignore[arg-type]
                 temperature=temperature,
             )
+        self._record_usage(resp)
         content = resp.choices[0].message.content or ""
         return content.strip()
 
@@ -203,6 +275,7 @@ class LLMClient:
             tools=tools or None,
             tool_choice=tool_choice if tools else None,
         )
+        self._record_usage(resp)
         message = resp.choices[0].message
         content = (message.content or "").strip()
 
@@ -234,6 +307,49 @@ class LLMClient:
     def tool_result_message(tool_call_id: str, content: str) -> dict[str, Any]:
         """构造工具结果消息（``role="tool"`` + 与调用配对的 ``tool_call_id``）。"""
         return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+
+    def usage_summary(self) -> str:
+        """返回可读的累计 Token 用量与按 Agent 归因。"""
+        t = self.usage_total
+        lines = [
+            f"LLM Token 用量（{t['calls']} 次调用 · 模型 {self.model}）："
+            f"prompt={t['prompt_tokens']} completion={t['completion_tokens']} "
+            f"total={t['total_tokens']}"
+        ]
+        if self.usage_by_agent:
+            lines.append("  按 Agent 归因：")
+            for agent, b in sorted(
+                self.usage_by_agent.items(), key=lambda kv: -kv[1]["total_tokens"]
+            ):
+                lines.append(
+                    f"    {agent}: {b['calls']}次 total={b['total_tokens']}"
+                    f"（in={b['prompt_tokens']} / out={b['completion_tokens']}）"
+                )
+        return "\n".join(lines)
+
+    def reset_usage(self) -> None:
+        """清空累计统计（单次明细一并清空）。"""
+        self.usage_records = []
+        self.usage_total = {
+            "calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+        }
+        self.usage_by_agent = {}
+
+
+# ----------------------------------------------------------------------
+# 调用归因上下文（供 nodes 在子图调用 LLM 前后绑定 / 重置）
+# ----------------------------------------------------------------------
+def bind_usage_context(**context: str) -> contextvars.Token:
+    """绑定当前调用栈的归因上下文（agent_id/session_id/trace_id/task_id）。
+
+    返回 token，调用方须在 finally 中用 :func:`reset_usage_context` 重置。
+    """
+    return _usage_context.set(dict(context))
+
+
+def reset_usage_context(token: contextvars.Token) -> None:
+    """重置由 :func:`bind_usage_context` 设置的归因上下文。"""
+    _usage_context.reset(token)
 
 
 # ----------------------------------------------------------------------
@@ -278,4 +394,10 @@ def _try_extract_json(text: str) -> Optional[dict[str, Any]]:
     return None
 
 
-__all__ = ["LLMClient", "JSONParseError"]
+__all__ = [
+    "LLMClient",
+    "JSONParseError",
+    "TokenUsage",
+    "bind_usage_context",
+    "reset_usage_context",
+]

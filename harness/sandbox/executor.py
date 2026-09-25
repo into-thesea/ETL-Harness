@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import logging
 import os
+from datetime import datetime
 from typing import Any, Callable
 
 from harness.sandbox.client import (
@@ -162,6 +163,9 @@ class SandboxExecutor:
         workspace = _host_dir(context, "workspace_dir", "workspace")
         reports = _host_dir(context, "reports_dir", "reports")
 
+        # C3「生成代码留档」：执行前把 AI 生成的代码存到 workspace 根，供审计与复现
+        code_archive = _archive_generated_code(code, workspace, tool_def.name)
+
         # ---- 平面搬运：主机 workspace -> 沙箱 /in ----
         inputs = _collect_inputs(workspace, self.client.settings.artifact_max_bytes)
 
@@ -200,6 +204,7 @@ class SandboxExecutor:
             "sandbox": "opensandbox",
             "sandbox_id": outcome.sandbox_id,
             "inputs_synced": sorted(inputs),
+            "code_archive": code_archive,
             "artifacts_written": written,
         }
 
@@ -248,6 +253,26 @@ def _host_dir(context: dict, key: str, kind: str) -> str:
     path = os.path.join(project_root(), "data", "vfs", kind)
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def _archive_generated_code(code: str, workspace: str, tool_name: str) -> str:
+    """把 AI 生成的代码留档到 workspace 根（C3），返回其 vfs_path。
+
+    文件名 ``exec_<时间戳>_<工具名>.py``（带毫秒，避免同秒覆盖）。
+    落盘失败不阻断执行（仅告警、返回空串）—— 留档是审计能力，不是执行前置。
+    """
+    now = datetime.now()
+    stamp = now.strftime("%Y%m%d_%H%M%S_") + f"{now.microsecond // 1000:03d}"
+    name = f"exec_{stamp}_{tool_name}.py"
+    dest = os.path.join(workspace, name)
+    try:
+        os.makedirs(workspace, exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as fh:
+            fh.write(code)
+    except OSError as exc:
+        logger.warning("生成代码留档失败：%s", exc)
+        return ""
+    return f"/workspace/{name}"
 
 
 def _collect_inputs(workspace: str, limit: int) -> dict[str, bytes]:

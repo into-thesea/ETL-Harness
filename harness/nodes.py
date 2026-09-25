@@ -21,7 +21,12 @@ from typing import Any, Optional
 from langchain_core.messages import BaseMessage
 from langgraph.types import interrupt
 
-from harness.llm_client import LLMClient, _try_extract_json
+from harness.llm_client import (
+    LLMClient,
+    _try_extract_json,
+    bind_usage_context,
+    reset_usage_context,
+)
 from harness.middleware import MiddlewareContext, MiddlewareManager
 from harness.models import ThoughtStep
 from harness.state import AgentState
@@ -191,6 +196,18 @@ class ReActNodes:
         return self.skill_registry.render_for_context(
             goal=goal, task=goal, allowed_skills=self.allowed_skills
         )
+
+    def _bind_usage(self, state: AgentState):
+        """绑定当前子任务的归因上下文（agent/session/trace），返回 reset token。"""
+        return bind_usage_context(
+            agent_id=state.get("agent_id", "") or "",
+            session_id=state.get("session_id", "") or "",
+            trace_id=state.get("trace_id", "") or "",
+        )
+
+    @staticmethod
+    def _unbind_usage(token) -> None:
+        reset_usage_context(token)
 
     # ------------------------------------------------------------------
     # 工作记忆资产索引（让 LLM 知道"已经获取了什么数据"）
@@ -457,9 +474,13 @@ class ReActNodes:
             )
             return update
 
-        result = self.llm.chat_with_tools(
-            messages, self.broker.list_tools_openai_format()
-        )
+        _usage_tok = self._bind_usage(state)
+        try:
+            result = self.llm.chat_with_tools(
+                messages, self.broker.list_tools_openai_format()
+            )
+        finally:
+            self._unbind_usage(_usage_tok)
         new_messages = [result.raw_message]
 
         # 步数耗尽：无论模型想调工具还是没给结论，都强制收尾，避免死循环
@@ -565,7 +586,11 @@ class ReActNodes:
 
         # 正常调用 LLM
         if raw is None:
-            raw = self.llm.chat(messages)
+            _usage_tok = self._bind_usage(state)
+            try:
+                raw = self.llm.chat(messages)
+            finally:
+                self._unbind_usage(_usage_tok)
             if self.middleware is not None:
                 raw = self.middleware.exec_after_llm(ctx, raw)
 

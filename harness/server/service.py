@@ -57,6 +57,7 @@ class HarnessService:
         self._bg_tasks: dict[str, asyncio.Task] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self.graph: Any = None
+        self.llm: Any = None
         if auto_assemble:
             self.assemble()
 
@@ -84,6 +85,7 @@ class HarnessService:
         skills_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "skills")
         skill_registry.load_directory(skills_dir)
 
+        self.llm = llm
         self.graph = build_plan_execute_graph(
             llm, broker,
             planner=planner, store=store, registry=registry, gate=gate,
@@ -169,8 +171,7 @@ class HarnessService:
             return None
         return self._snap_to_dict(thread_id, snap)
 
-    @staticmethod
-    def _snap_to_dict(thread_id: str, snap: Any) -> dict:
+    def _snap_to_dict(self, thread_id: str, snap: Any) -> dict:
         values = snap.values or {}
         pending: list[dict] = []
         for t in snap.tasks or []:
@@ -183,6 +184,7 @@ class HarnessService:
 
         plan = values.get("plan")
         progress = getattr(plan, "progress", None)
+        token_usage = getattr(self.llm, "usage_total", None)
 
         return {
             "thread_id": thread_id,
@@ -192,6 +194,7 @@ class HarnessService:
             "final_answer": values.get("final_answer"),
             "error": values.get("error"),
             "pending_approvals": pending,
+            "token_usage": dict(token_usage) if token_usage else None,
         }
 
     async def submit_approval(

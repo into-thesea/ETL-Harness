@@ -46,6 +46,9 @@ class TaskStatusResponse(BaseModel):
     final_answer: Optional[str] = None
     error: Optional[str] = None
     pending_approvals: list[PendingApproval] = []
+    token_usage: Optional[dict[str, int]] = Field(
+        None, description="累计 Token 用量（calls/prompt/completion/total）"
+    )
 
 
 class HealthResponse(BaseModel):
