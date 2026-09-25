@@ -25,9 +25,11 @@ import pandas as pd
 
 from harness.agents.registry import AgentRegistry
 from harness.audit import get_audit_logger
+from harness.context import ContextManager
 from harness.orchestrator import build_plan_execute_graph, make_plan_execute_state
 from harness.planning import QualityGate, TaskPlanner, TaskStore
 from harness.tool_broker import ToolBroker
+from harness.vfs import VirtualFileSystem
 from tools import register_builtin_tools
 from tools.common import reports_dir, workspace_dir
 
@@ -296,6 +298,42 @@ def _build_llm():
     return ScriptedAnalysisLLM(RAW_FILE, CLEAN_STEM)
 
 
+def _print_context_budget(cm: ContextManager) -> None:
+    """打印上下文预算（均来自配置，便于比对调参前后的差异）。"""
+    b = cm.budget
+    print(
+        "上下文预算："
+        f"沉淀阈值 {b.sink_threshold_chars} 字符 / "
+        f"单条上限 {b.observation_char_limit} / "
+        f"保留最近 {b.keep_recent_messages} 条 / "
+        f"历史预算 {b.max_history_chars} 字符"
+    )
+
+
+def _report_context_activity(cm: ContextManager) -> None:
+    """汇总上下文管理的实际动作 —— 这是调参要看的实测数据。
+
+    关注两点：① 有多少工具结果真的超过了沉淀阈值（阈值是否过激）；
+    ② 沉淀后的提示长度（是否达成了"大结果不进上下文"的目标）。
+    """
+    print("\n" + "=" * 64)
+    print("上下文管理实际动作（实测）")
+    print("=" * 64)
+    refs_by_session = cm.snapshot().get("refs") or {}
+    total = 0
+    for session_id, refs in refs_by_session.items():
+        print(f"\n[会话 {session_id[:8]}…] 沉淀 {len(refs)} 个大结果：")
+        for ref in refs:
+            print(f"  - {ref['tool']}  {ref['chars']} 字符 → {ref['path']}")
+        total += len(refs)
+    if total == 0:
+        print(
+            f"（本次无工具结果超过沉淀阈值 {cm.budget.sink_threshold_chars} 字符，未产生沉淀）"
+        )
+    else:
+        print(f"\n合计沉淀 {total} 个大结果（阈值 {cm.budget.sink_threshold_chars} 字符）")
+
+
 DEFAULT_GOAL = f"对销售数据 {RAW_FILE} 做端到端分析：体检 → 清洗 → EDA → 出图 → 报告"
 
 
@@ -314,10 +352,16 @@ def main(goal: str | None = None) -> None:
     # 工具调用范式取自全局配置（环境变量 AGENT_TOOL_MODE），非本示例私有的开关
     from harness.config import settings
 
+    # 上下文管理在这里「装配一次」—— 框架提供参数，装配点负责构造实例并注入。
+    # 阶段5 服务化后，装配点会移到服务层；本示例只是当前唯一的装配点。
+    context_manager = ContextManager(vfs=VirtualFileSystem())
+    _print_context_budget(context_manager)
+
     graph = build_plan_execute_graph(
         llm, broker, planner=planner, store=store,
         registry=registry, gate=gate, max_replans=2,
         tool_mode=settings.runtime.agent_tool_mode,
+        context_manager=context_manager,
     )
     print(f"工具调用范式：agent_tool_mode={settings.runtime.agent_tool_mode}")
 
@@ -356,6 +400,7 @@ def main(goal: str | None = None) -> None:
     print(state["final_answer"])
 
     _list_artifacts(artifacts_before)
+    _report_context_activity(context_manager)
 
 
 if __name__ == "__main__":
