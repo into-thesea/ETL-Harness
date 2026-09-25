@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime
 from typing import Any, Optional
@@ -41,7 +42,13 @@ class KafkaProducerWrapper:
         self._local_fallback_dir = settings.runtime.audit_dir
         self._connected = False
         self._ensure_local_dir()
-        self._connect()
+        # 连接放到后台 daemon 线程：kafka-python 对不可达 broker 的 bootstrap
+        # 会同步阻塞数秒~数十秒，绝不能拖慢首个工具调用。连接成功前，
+        # 所有 send 一律走本地缓冲（_write_local），消息不丢。
+        self._connection_thread = threading.Thread(
+            target=self._connect, name="kafka-connect", daemon=True
+        )
+        self._connection_thread.start()
 
     def _ensure_local_dir(self) -> None:
         """确保本地回退目录存在。"""

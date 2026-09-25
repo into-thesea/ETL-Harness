@@ -27,11 +27,13 @@ import uuid
 from typing import Any, Callable, Optional
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
 from typing import TypedDict
 
 from harness.agents.registry import AgentRegistry
 from harness.graph import build_executor_graph, make_executor_state
 from harness.models import SubAgentResult, TaskPlan, TaskStatus
+from harness.nodes import ReActNodes
 from harness.planning.gate import GateDecision, QualityGate
 from harness.planning.planner import TaskPlanner
 from harness.planning.task_store import TaskStore
@@ -84,6 +86,7 @@ class PlanExecuteNodes:
         upstream_chars: int = 1200,
         tool_mode: str = "react",
         context_manager: Any = None,
+        subgraph_checkpointer: Any = None,
     ) -> None:
         self.llm = llm
         self.broker = broker
@@ -102,6 +105,10 @@ class PlanExecuteNodes:
         # 上下文管理（harness.context.ContextManager），透传给每个子任务执行子图。
         # None 表示不启用 —— 调用方（如服务层）可注入自带 VFS 的实例。
         self.context_manager = context_manager
+        # 子任务执行子图的 checkpointer：让子图内的工具审批 interrupt 可暂停/恢复。
+        # None 时子图无 checkpointer，子图 interrupt 无法暂停（审批不生效）——
+        # 服务层应注入（可与顶层图共用同一实例，靠 thread_id 区分）。
+        self.subgraph_checkpointer = subgraph_checkpointer
         self._subgraph_cache: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -118,6 +125,7 @@ class PlanExecuteNodes:
                 system_prefix=agent_def.system_prompt,
                 tool_mode=self.tool_mode,
                 context_manager=self.context_manager,
+                checkpointer=self.subgraph_checkpointer,
             )
         return self._subgraph_cache[agent_name]
 
@@ -192,8 +200,27 @@ class PlanExecuteNodes:
             trace_id=state.get("trace_id"),
         )
 
+        # 子任务独立 thread_id：同一子任务重试 / 审批恢复时复用，从断点续跑而非重跑
+        sub_thread_id = f"{state.get('session_id', 'default')}:{task.task_id}"
+        sub_config = {"configurable": {"thread_id": sub_thread_id}}
+
         start = time.time()
-        out = subgraph.invoke(sub_state)
+        out = subgraph.invoke(sub_state, sub_config)
+
+        # 子图在工具审批 interrupt 处暂停：冒泡到顶层图等待人工决策
+        pending_interrupts = out.get("__interrupt__")
+        if pending_interrupts:
+            request = pending_interrupts[0].value
+            if isinstance(request, dict):
+                request = dict(request)
+                request.setdefault("task_id", task.task_id)
+                request.setdefault("task_title", task.title)
+                request.setdefault("sub_agent", agent_def.name)
+            # resume 后本节点重新执行：子图同 thread_id 幂等返回同一中断，
+            # 此处 interrupt 立即返回审批值，再用 Command 恢复子图。
+            decision = interrupt(request)
+            out = subgraph.invoke(Command(resume=decision), sub_config)
+
         duration_ms = int((time.time() - start) * 1000)
 
         success = out.get("status") == "finished" and bool(out.get("final_answer"))
@@ -284,16 +311,41 @@ class PlanExecuteNodes:
         task = state["current_task"]
         result = state["last_result"]
 
-        if self.approval_callback is not None and self.approval_callback(task, result):
+        # 兼容旧 approval_callback（若显式配置仍按同步回调处理）
+        if self.approval_callback is not None:
+            if self.approval_callback(task, result):
+                self.store.mark_completed(
+                    plan, task.task_id, result=result.conclusion, artifacts=result.artifacts
+                )
+                return {"plan": plan, "last_decision": "approved", "feedback": ""}
+            self.store.mark_failed(plan, task.task_id, error="审批回调未批准")
+            return {"plan": plan, "last_decision": "rejected", "status": "failed",
+                    "error": f"子任务 {task.title} 未通过人工审批"}
+
+        # 正确形态：interrupt 暂停，审批人经服务层 Command(resume=...) 下发决策
+        payload = {
+            "type": "gate_review",
+            "task_id": task.task_id,
+            "task_title": task.title,
+            "sub_agent": task.assigned_to,
+            "conclusion": (result.conclusion if result else "")[:1500],
+            "note": state.get("feedback", ""),
+        }
+        raw_decision = interrupt(payload)
+        approved, comment = ReActNodes._parse_approval(raw_decision)
+
+        if approved:
             self.store.mark_completed(
-                plan, task.task_id, result=result.conclusion, artifacts=result.artifacts
+                plan, task.task_id,
+                result=result.conclusion if result else "",
+                artifacts=result.artifacts if result else {},
             )
             return {"plan": plan, "last_decision": "approved", "feedback": ""}
 
-        reason = "子任务需要人工审批，但未配置审批回调或未获批准"
+        reason = f"人工审批未通过：{comment or '未说明原因'}"
         self.store.mark_failed(plan, task.task_id, error=reason)
         return {"plan": plan, "last_decision": "rejected", "status": "failed",
-                "error": f"子任务 {task.title} 未通过人工审批"}
+                "error": f"子任务 {task.title} {reason}"}
 
     # ------------------------------------------------------------------
     # 节点：汇总
@@ -366,10 +418,15 @@ def build_plan_execute_graph(
     checkpointer: Any = None,
     tool_mode: str = "react",
     context_manager: Any = None,
+    subgraph_checkpointer: Any = None,
 ):
     """编译顶层 Plan-and-Execute 图并返回（compiled graph）。
 
     Args:
+        checkpointer: 顶层图的 checkpointer（审批 interrupt 必需）。
+        subgraph_checkpointer: 子任务执行子图的 checkpointer。None 时默认
+            复用顶层 ``checkpointer``（同一实例、不同 thread_id 命名空间），
+            这样只需构造一个 checkpointer 即可让两层 interrupt 都生效。
         tool_mode: 子任务执行体的工具调用范式，``"react"`` 或 ``"native"``
             （原生 Function Calling）。见 ``harness.nodes.ReActNodes``。
         context_manager: 上下文管理器（``harness.context.ContextManager``），
@@ -380,6 +437,9 @@ def build_plan_execute_graph(
         gate=gate, middleware=middleware, max_replans=max_replans,
         approval_callback=approval_callback, tool_mode=tool_mode,
         context_manager=context_manager,
+        subgraph_checkpointer=(
+            subgraph_checkpointer if subgraph_checkpointer is not None else checkpointer
+        ),
     )
 
     g = StateGraph(PlanExecuteState)

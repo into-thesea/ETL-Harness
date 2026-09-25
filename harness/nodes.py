@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from langchain_core.messages import BaseMessage
+from langgraph.types import interrupt
 
 from harness.llm_client import LLMClient, _try_extract_json
 from harness.middleware import MiddlewareContext, MiddlewareManager
@@ -105,6 +106,55 @@ class ReActNodes:
         # 上下文管理（harness.context.ContextManager）。None 表示不启用 —— 由上层
         # orchestrator 默认构造并透传；直接构造本类时可显式传入或留空。
         self.context_manager = context_manager
+
+    # ------------------------------------------------------------------
+    # 工具执行前审批闸门（Human-in-the-Loop）
+    # ------------------------------------------------------------------
+    def _request_tool_approval(
+        self, tool_name: str, args: dict, state: AgentState
+    ) -> tuple[bool, str]:
+        """高风险工具执行前请求人工审批（LangGraph interrupt）。
+
+        ``ToolDef.requires_approval=True`` 时，在真正执行前 interrupt 暂停，
+        把工具 / 参数 / 风险暴露给审批人；审批人经服务层 ``Command(resume=...)``
+        下发决策。返回 (是否批准, 审批意见)。
+
+        无需审批的工具直接返回 (True, "")，零中断。审批闸门在节点层而非
+        Broker 内部：interrupt 只能在 LangGraph 节点中调用，Broker 是与编排
+        解耦的普通 Python。
+        """
+        tool_def = self.broker.get(tool_name)
+        if tool_def is None or not tool_def.requires_approval:
+            return True, ""
+
+        payload = {
+            "type": "tool_approval",
+            "tool": tool_name,
+            "description": tool_def.description,
+            "arguments": args,
+            "run_in_sandbox": tool_def.run_in_sandbox,
+            "session_id": state.get("session_id"),
+            "agent_id": state.get("agent_id"),
+            "trace_id": state.get("trace_id"),
+        }
+        raw_decision = interrupt(payload)
+        approved, comment = self._parse_approval(raw_decision)
+        logger.info("Tool %s approval: approved=%s comment=%s",
+                    tool_name, approved, comment)
+        return approved, comment
+
+    @staticmethod
+    def _parse_approval(raw: Any) -> tuple[bool, str]:
+        """解析审批人下发的 resume 值（兼容 dict / 字符串）。"""
+        if isinstance(raw, dict):
+            comment = str(raw.get("comment") or raw.get("reason") or "")
+            if "approved" in raw:
+                return bool(raw["approved"]), comment
+            decision = str(raw.get("decision") or raw.get("action") or "").lower()
+            return decision in ("approve", "approved", "allow", "pass", "true", "1"), comment
+
+        text = str(raw or "").strip().lower()
+        return text in ("approve", "approved", "allow", "pass", "true", "1", "y", "yes"), ""
 
     # ------------------------------------------------------------------
     # 上下文管理的两个介入时机（未注入 ContextManager 时全部为透传，零开销）
@@ -611,6 +661,20 @@ class ReActNodes:
         for call in pending:
             name = call.get("name") or ""
             args = call.get("arguments") or {}
+
+            # 审批闸门：requires_approval 工具 interrupt 等待人工决策
+            approved, comment = self._request_tool_approval(name, args, state)
+            if not approved:
+                observation = (
+                    f"工具调用被人工审批拒绝：{comment or '未说明原因'}。"
+                    "请调整方案，不要再次请求同样的操作。"
+                )
+                observations.append(f"[{name}] {observation}")
+                tool_messages.append(
+                    self.llm.tool_result_message(call.get("id", ""), observation)
+                )
+                continue
+
             # Broker 内部跑中间件、PDP、校验、限流、沙箱、审计
             ok, text, artifacts = self.broker.invoke(name, args, invoke_context)
             observation = text if ok else f"工具调用失败：{text}"
@@ -650,13 +714,31 @@ class ReActNodes:
             "step": state.get("current_step"),
         }
 
+        # 审批闸门：requires_approval 工具 interrupt 等待人工决策
+        approved, comment = self._request_tool_approval(tool_name, tool_args, state)
+
+        # 把 observation 回填到本轮 ThoughtStep
+        steps = list(state.get("steps", []))
+        if not approved:
+            observation = (
+                f"工具调用被人工审批拒绝：{comment or '未说明原因'}。"
+                "请调整方案，不要再次请求同样的操作。"
+            )
+            if steps:
+                steps[-1] = steps[-1].model_copy(update={"observation": observation})
+            new_messages = [{"role": "user", "content": f"Observation:\n{observation}"}]
+            return {
+                "last_observation": observation,
+                "messages": new_messages,
+                "steps": steps,
+                "updated_at": self._now(),
+            }
+
         # Broker 内部会跑工具中间件、PDP、校验、限流、沙箱、审计
         ok, text, artifacts = self.broker.invoke(tool_name, tool_args, invoke_context)
         observation = text if ok else f"工具调用失败：{text}"
         observation = self._settle_observation(tool_name, observation, state)
 
-        # 把 observation 回填到本轮 ThoughtStep
-        steps = list(state.get("steps", []))
         if steps:
             steps[-1] = steps[-1].model_copy(update={"observation": observation})
 
