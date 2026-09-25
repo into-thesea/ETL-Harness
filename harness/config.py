@@ -208,7 +208,6 @@ class RuntimeSettings(BaseSettings):
     max_workers: int = 10
     default_max_steps: int = 20
     default_timeout_seconds: int = 300
-    context_summary_threshold: int = 500  # 超过这个字符数的结果自动沉淀到 VFS
 
     # 子任务执行体的工具调用范式（见 harness.nodes.ReActNodes）：
     #   "react"  —— 工具清单拼进提示、解析模型 JSON 输出；过程可见、模型无关，
@@ -216,6 +215,38 @@ class RuntimeSettings(BaseSettings):
     #   "native" —— OpenAI 原生 Function Calling，工具结构由 API 保证，
     #               支持一次多个 tool_calls；用于生产
     agent_tool_mode: str = "react"
+
+
+class ContextSettings(BaseSettings):
+    """上下文管理配置（ContextManager 的预算与沉淀策略）。
+
+    这组值决定「多大的工具结果沉淀到 VFS」与「历史压到多长」，直接改变
+    长任务的 token 消耗与信息保留度，故全部配置化，便于按模型上下文窗口调整。
+
+    注意：调大 `sink_threshold_chars` 会让更多原文留在提示里（省 VFS 但费 token）；
+    调小 `max_history_chars` 会让更早的中间过程被折叠（省 token 但可能丢脉络）。
+    两者是此消彼长的取舍，改前建议先看实测数据。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="CONTEXT_", extra="ignore")
+
+    sink_threshold_chars: int = 500
+    """工具结果超过该字符数即沉淀到 VFS（全文落盘，提示里只留摘要 + 文件卡片）。"""
+
+    observation_head_chars: int = 200
+    """沉淀后，在提示中保留的结果头部摘要字符数。"""
+
+    observation_char_limit: int = 1200
+    """无 VFS（或沉淀失败）时，单条 observation 允许进入提示的最大字符数，超出硬截断。"""
+
+    keep_recent_messages: int = 8
+    """压缩历史时，始终保留最近多少条消息的原文。"""
+
+    max_history_chars: int = 6000
+    """历史（不含 system 与工具说明）的字符软上限，超出则折叠更早的消息。"""
+
+    summary_head_chars: int = 120
+    """确定性降级摘要中，每条旧消息最多保留多少字符。"""
 
 
 class Settings(BaseSettings):
@@ -240,6 +271,7 @@ class Settings(BaseSettings):
     trace: TraceSettings = Field(default_factory=TraceSettings)
     vfs: VFSSettings = Field(default_factory=VFSSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    context: ContextSettings = Field(default_factory=ContextSettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
 
 

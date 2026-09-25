@@ -92,6 +92,7 @@ class ReActNodes:
         middleware: Optional[MiddlewareManager] = None,
         system_prefix: str = "",
         tool_mode: str = "react",
+        context_manager: Optional[Any] = None,
     ) -> None:
         if tool_mode not in ("react", "native"):
             raise ValueError(f"tool_mode 只能是 'react' 或 'native'，收到 {tool_mode!r}")
@@ -101,6 +102,28 @@ class ReActNodes:
         # 子 Agent 的专属角色/职责提示（专业子 Agent 委派时注入）；为空则通用
         self.system_prefix = system_prefix
         self.tool_mode = tool_mode
+        # 上下文管理（harness.context.ContextManager）。None 表示不启用 —— 由上层
+        # orchestrator 默认构造并透传；直接构造本类时可显式传入或留空。
+        self.context_manager = context_manager
+
+    # ------------------------------------------------------------------
+    # 上下文管理的两个介入时机（未注入 ContextManager 时全部为透传，零开销）
+    # ------------------------------------------------------------------
+    def _settle_observation(self, tool_name: str, observation: str, state: AgentState) -> str:
+        """时机一（action 之后）：工具大结果沉淀到 VFS，提示里只留摘要 + 文件卡片。"""
+        if self.context_manager is None:
+            return observation
+        return self.context_manager.settle_observation(
+            tool_name, observation, session_id=state.get("session_id") or "default"
+        )
+
+    def _compact_history(self, history: list[dict], state: AgentState) -> list[dict]:
+        """时机二（think 之前）：按预算压缩历史，并把长期记忆前插。"""
+        if self.context_manager is None:
+            return history
+        return self.context_manager.compact_history(
+            history, long_term_context=state.get("long_term_context") or ""
+        )
 
     # ------------------------------------------------------------------
     # 工具方法
@@ -200,6 +223,7 @@ class ReActNodes:
         history = self._messages_to_dicts(state.get("messages", []))
         if not history:
             history = [{"role": "user", "content": state.get("goal", "")}]
+        history = self._compact_history(history, state)
         messages = [{"role": "system", "content": self._build_system_native()}] + history
 
         ctx = MiddlewareContext(
@@ -313,6 +337,7 @@ class ReActNodes:
         history = self._messages_to_dicts(state.get("messages", []))
         if not history:
             history = [{"role": "user", "content": state.get("goal", "")}]
+        history = self._compact_history(history, state)
         messages = [{"role": "system", "content": self._build_system()}] + history
 
         ctx = MiddlewareContext(
@@ -456,6 +481,7 @@ class ReActNodes:
             # Broker 内部跑中间件、PDP、校验、限流、沙箱、审计
             ok, text, artifacts = self.broker.invoke(name, args, invoke_context)
             observation = text if ok else f"工具调用失败：{text}"
+            observation = self._settle_observation(name, observation, state)
             observations.append(f"[{name}] {observation}")
             tool_messages.append(
                 self.llm.tool_result_message(call.get("id", ""), observation)
@@ -494,6 +520,7 @@ class ReActNodes:
         # Broker 内部会跑工具中间件、PDP、校验、限流、沙箱、审计
         ok, text, artifacts = self.broker.invoke(tool_name, tool_args, invoke_context)
         observation = text if ok else f"工具调用失败：{text}"
+        observation = self._settle_observation(tool_name, observation, state)
 
         # 把 observation 回填到本轮 ThoughtStep
         steps = list(state.get("steps", []))

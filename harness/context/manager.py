@@ -31,30 +31,38 @@ logger = logging.getLogger(__name__)
 # 一条 OpenAI 风格消息：{"role": "system|user|assistant|tool", "content": "..."}
 Message = dict
 
+# 消息类型约束：单个角色名，或角色名元组。None 表示不约束。
+# 对应 langchain_core.trim_messages 的 start_on / end_on 参数。
+MessageTypes = str | tuple[str, ...] | None
+
 # 摘要器：把若干条旧消息压缩成一段"前期操作回顾"（生产中通常接 LLM）
 Summarizer = Callable[[list[Message]], str]
 
 
 @dataclass
 class ContextBudget:
-    """上下文预算与沉淀策略（均可在构造时覆盖，便于按不同模型窗口调整）。"""
+    """上下文预算与沉淀策略。
 
-    sink_threshold_chars: int = settings.runtime.context_summary_threshold
-    """工具结果超过该字符数即沉淀到 VFS（默认取配置 runtime.context_summary_threshold=500）。"""
+    所有默认值来自配置段 ``ContextSettings``（环境变量前缀 ``CONTEXT_``），
+    构造时可逐项覆盖 —— 便于按不同模型的上下文窗口调整。
+    """
 
-    observation_head_chars: int = 200
+    sink_threshold_chars: int = settings.context.sink_threshold_chars
+    """工具结果超过该字符数即沉淀到 VFS（全文落盘，提示里只留摘要 + 文件卡片）。"""
+
+    observation_head_chars: int = settings.context.observation_head_chars
     """沉淀后，在提示中保留的结果头部摘要字符数。"""
 
-    observation_char_limit: int = 1200
+    observation_char_limit: int = settings.context.observation_char_limit
     """无 VFS（或沉淀失败）时，单条 observation 允许进入提示的最大字符数，超出硬截断。"""
 
-    keep_recent_messages: int = 8
+    keep_recent_messages: int = settings.context.keep_recent_messages
     """压缩历史时，始终保留最近多少条消息的原文。"""
 
-    max_history_chars: int = 6000
+    max_history_chars: int = settings.context.max_history_chars
     """历史（不含 system 与工具说明）的字符软上限，超出则折叠更早的消息。"""
 
-    summary_head_chars: int = 120
+    summary_head_chars: int = settings.context.summary_head_chars
     """确定性降级摘要中，每条旧消息最多保留多少字符。"""
 
 
@@ -163,6 +171,8 @@ class ContextManager:
         messages: list[Message],
         *,
         long_term_context: str = "",
+        start_on: MessageTypes = ("user", "assistant"),
+        end_on: MessageTypes = None,
     ) -> list[Message]:
         """按预算压缩对话历史，返回可直接拼到 system 之后的消息列表。
 
@@ -173,6 +183,24 @@ class ContextManager:
         - 折叠后仍超预算，从最旧的非锚点消息开始丢弃（最后防线）；
         - long_term_context 作为一条 system 记忆插在最前（对应 state.long_term_context）。
         注意：system 消息不由本方法管理（由 nodes 单独前插），这里会忽略传入的 system。
+
+        Args:
+            start_on: 裁剪后**保留窗口允许以何角色开头**。默认 ``("user", "assistant")``
+                —— 即**不允许以 ``role="tool"`` 开头**。
+            end_on: 保留窗口允许以何角色结尾；默认 None（不约束）。
+
+        关于 start_on 的默认值（**与 langchain_core.trim_messages 的默认 None 不同**）：
+
+        本方法服务的是本项目的 ReAct 消息协议，而该协议有一个硬约束 ——
+        **每条 ``role="tool"`` 必须紧跟其发起它的 ``assistant(tool_calls=…)``**，
+        否则服务端会以 400 拒绝（OpenAI Function Calling 契约）。裁剪若把窗口起点
+        落在 tool 消息上，就切断了这层配对，且**只在历史较长时发作**（短测试测不出）。
+
+        langchain_core 同样承认这个约束（见其 ``trim_messages`` 文档：
+        *"generally a ToolMessage can only appear after an AIMessage that involved
+        a tool call"*），但它把责任交给调用方（自行传 ``start_on``）。
+        这里采用同一机制，只是默认值取本协议的**安全值** —— 避免调用方忘记设置
+        而引入只在长任务中才暴露的间歇性 400。需要时可显式传 ``None`` 关闭约束。
         """
         b = self.budget
         history = [m for m in (messages or []) if m.get("role") != "system"]
@@ -186,15 +214,23 @@ class ContextManager:
             anchor = [history[0]]
             body = history[1:]
 
-        # 预算内且消息不多：无需压缩
+        # 预算内且消息不多：无需压缩（仍须保证不违反 start_on/end_on 约束）
         if (
             self._total_chars(anchor) + self._total_chars(body) <= b.max_history_chars
             and len(body) <= b.keep_recent_messages
         ):
+            body = self._align_window(body, start_on, end_on)
             return self._with_long_term(anchor + body, long_term_context)
 
         recent = body[-b.keep_recent_messages:] if b.keep_recent_messages > 0 else []
-        older = body[: -b.keep_recent_messages] if b.keep_recent_messages > 0 else body
+        older = body[: -b.keep_recent_messages] if b.keep_recent_messages > 0 else list(body)
+
+        # 窗口起点对齐：被挤出去的靠前消息并入 older 一起摘要（而非直接丢弃，避免丢信息）
+        aligned = self._align_window(recent, start_on, end_on)
+        dropped = len(recent) - len(aligned)
+        if dropped > 0:
+            older = older + recent[:dropped]
+        recent = aligned
 
         packed: list[Message] = list(anchor)
         if older:
@@ -207,7 +243,7 @@ class ContextManager:
 
         # 最后防线：仍超预算则丢弃最旧的非锚点消息
         if self._total_chars(packed) > b.max_history_chars:
-            packed = self._enforce_budget(packed)
+            packed = self._enforce_budget(packed, start_on=start_on, end_on=end_on)
         return self._with_long_term(packed, long_term_context)
 
     # ------------------------------------------------------------------
@@ -234,8 +270,18 @@ class ContextManager:
             lines.append(f"- {role_tag.get(role, role)}：{clip}")
         return "\n".join(lines) if lines else "（无）"
 
-    def _enforce_budget(self, messages: list[Message]) -> list[Message]:
-        """最后防线：从最旧的非锚点消息开始丢弃，直到总字符不超过预算。"""
+    def _enforce_budget(
+        self,
+        messages: list[Message],
+        *,
+        start_on: MessageTypes = None,
+        end_on: MessageTypes = None,
+    ) -> list[Message]:
+        """最后防线：从最旧的非锚点消息开始丢弃，直到总字符不超过预算。
+
+        丢弃后仍须做窗口边界对齐（``start_on``/``end_on``）—— 逐条丢弃会切断
+        ``assistant(tool_calls)`` 与 ``role="tool"`` 的配对，必须事后修正。
+        """
         anchor: list[Message] = []
         rest = messages
         if messages and messages[0].get("role") == "user":
@@ -250,7 +296,53 @@ class ContextManager:
                 continue
             kept.append(m)
             total += chars
-        return anchor + list(reversed(kept))
+        window = self._align_window(list(reversed(kept)), start_on, end_on)
+        return anchor + window
+
+    # ------------------------------------------------------------------
+    # 窗口边界对齐（对应 langchain_core.trim_messages 的 start_on / end_on）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _matches(role: str, types: MessageTypes) -> bool:
+        """角色是否落在允许的类型集合内；types 为 None 表示不约束。"""
+        if types is None:
+            return True
+        if isinstance(types, str):
+            return role == types
+        return role in types
+
+    @classmethod
+    def _align_window(
+        cls,
+        window: list[Message],
+        start_on: MessageTypes,
+        end_on: MessageTypes,
+    ) -> list[Message]:
+        """把保留窗口的**起点/终点**对齐到允许的角色。
+
+        起点不合法 → 从最旧方向剔除到第一个合法角色；终点不合法 → 从最新方向
+        剔除到最后那个合法角色；全不匹配则返回空窗口。None 表示该项不约束。
+
+        与 langchain_core.trim_messages 同一思路（它把序列反转后用 ``end_on``
+        表达起点约束），用于防止裁剪把 Function Calling 的调用/结果配对切断。
+        """
+        if start_on is not None:
+            for i, m in enumerate(window):
+                if cls._matches(m.get("role", ""), start_on):
+                    window = window[i:]
+                    break
+            else:
+                return []
+
+        if end_on is not None:
+            for i in range(len(window) - 1, -1, -1):
+                if cls._matches(window[i].get("role", ""), end_on):
+                    window = window[: i + 1]
+                    break
+            else:
+                return []
+
+        return window
 
     @staticmethod
     def _total_chars(messages: list[Message]) -> int:
@@ -284,4 +376,4 @@ class ContextManager:
         self._refs = {k: list(v) for k, v in (snapshot.get("refs") or {}).items()}
 
 
-__all__ = ["ContextManager", "ContextBudget", "Message", "Summarizer"]
+__all__ = ["ContextManager", "ContextBudget", "Message", "MessageTypes", "Summarizer"]

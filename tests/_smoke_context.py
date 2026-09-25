@@ -10,6 +10,49 @@ from harness.context import ContextBudget, ContextManager
 from harness.vfs.vfs import VirtualFileSystem
 
 
+def _fc_history() -> list:
+    """构造含 Function Calling 配对的历史：assistant(tool_calls) + 紧跟的 tool 结果。"""
+    msgs: list = [{"role": "user", "content": "任务：分析销售数据"}]
+    for i in range(6):
+        cid = f"c{i}"
+        msgs.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": cid,
+                "type": "function",
+                "function": {"name": "eda", "arguments": "{}"},
+            }],
+        })
+        # 每条结果都足够长，确保会触发压缩与预算裁剪
+        msgs.append({"role": "tool", "tool_call_id": cid, "content": f"结果{i}" + "z" * 300})
+    return msgs
+
+
+def _orphan_tool_ids(msgs: list) -> list:
+    """返回孤儿 tool 消息的 tool_call_id 列表（其发起方 assistant 不在窗口内）。"""
+    called: set = set()
+    orphans: list = []
+    for m in msgs:
+        role = m.get("role")
+        if role == "assistant":
+            for tc in (m.get("tool_calls") or []):
+                called.add(tc.get("id"))
+        elif role == "tool":
+            if m.get("tool_call_id") not in called:
+                orphans.append(m.get("tool_call_id"))
+    return orphans
+
+
+def _has_orphan_tool(msgs: list) -> bool:
+    return bool(_orphan_tool_ids(msgs))
+
+
+def _assert_no_orphan_tool(msgs: list) -> None:
+    orphans = _orphan_tool_ids(msgs)
+    assert not orphans, f"出现孤儿 tool 消息（会致服务端 400）：{orphans}"
+
+
 def main() -> None:
     # 1) token 估算：空串为 0，中文按字计
     assert ContextManager.estimate_tokens("") == 0
@@ -87,6 +130,36 @@ def main() -> None:
     # 锚点1 + 回顾1 + 最近2 = 最多 4 条
     assert len(compact_tight) <= 4
     print(f"[9] custom budget ok ({len(compact_tight)} messages)")
+
+    # 10~12) Function Calling 配对安全（start_on 约束）
+    #    背景：每条 role="tool" 必须紧跟发起它的 assistant(tool_calls=…)，否则服务端
+    #    以 400 拒绝。按条裁剪会切断配对，且**只在历史较长时发作**。以下用例专门覆盖。
+    fc = _fc_history()
+
+    # 10) 默认约束：keep_recent=1 时 recent 本会以 tool 开头，必须被对齐掉
+    cm_fc = ContextManager(budget=ContextBudget(keep_recent_messages=1))
+    packed_fc = cm_fc.compact_history(fc)
+    _assert_no_orphan_tool(packed_fc)
+    print(f"[10] FC pairing safe (default start_on): {len(fc)} -> {len(packed_fc)} messages ok")
+
+    # 11) 极紧预算会走到最后防线 _enforce_budget（逐条丢弃），仍不得出现孤儿
+    tight_fc = ContextManager(
+        budget=ContextBudget(keep_recent_messages=1, max_history_chars=400)
+    )
+    packed_tight = tight_fc.compact_history(fc)
+    _assert_no_orphan_tool(packed_tight)
+    print(f"[11] FC pairing safe under _enforce_budget: {len(packed_tight)} messages ok")
+
+    # 12) 参数确实在起作用：显式关闭约束后，同样的输入会真的产生孤儿
+    loose = ContextManager(
+        budget=ContextBudget(keep_recent_messages=1, max_history_chars=400)
+    )
+    loose_packed = loose.compact_history(fc, start_on=None)
+    assert _has_orphan_tool(loose_packed), (
+        "关闭 start_on 约束后本应出现孤儿 tool 消息 —— 若未出现，说明本用例的构造"
+        "没能触发配对切断，需调整用例（这本身也说明默认约束未在起作用）"
+    )
+    print("[12] start_on=None really disables the constraint ok（对照：关闭后出现孤儿）")
 
     print("ALL CONTEXT SMOKE TESTS PASSED")
 

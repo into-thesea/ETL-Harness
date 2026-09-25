@@ -27,6 +27,7 @@ def build_executor_graph(
     checkpointer: Any = None,
     system_prefix: str = "",
     tool_mode: str = "react",
+    context_manager: Any = None,
 ):
     """编译 ReAct 执行子图。
 
@@ -45,13 +46,15 @@ def build_executor_graph(
             过程可见，用于教学/调试/兼容弱模型）或 ``"native"``（OpenAI 原生
             Function Calling，工具结构由 API 保证，生产更稳）。两者复用同一套
             Broker 与工具，最终都归一化到 ``broker.invoke(name, args)``。
+        context_manager: 上下文管理器（``harness.context.ContextManager``）。
+            None 表示不启用上下文管理（think/action 两个介入点均为透传）。
 
     Returns:
         编译后的 LangGraph，可 .invoke(state) / .stream(state)。
     """
     nodes = ReActNodes(
         llm=llm, broker=broker, middleware=middleware, system_prefix=system_prefix,
-        tool_mode=tool_mode,
+        tool_mode=tool_mode, context_manager=context_manager,
     )
 
     graph = StateGraph(AgentState)

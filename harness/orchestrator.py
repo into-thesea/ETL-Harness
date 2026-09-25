@@ -83,6 +83,7 @@ class PlanExecuteNodes:
         approval_callback: Optional[ApprovalCallback] = None,
         upstream_chars: int = 1200,
         tool_mode: str = "react",
+        context_manager: Any = None,
     ) -> None:
         self.llm = llm
         self.broker = broker
@@ -98,6 +99,9 @@ class PlanExecuteNodes:
         self.upstream_chars = upstream_chars
         # 子任务执行体的工具调用范式："react" 或 "native"（见 nodes.ReActNodes）
         self.tool_mode = tool_mode
+        # 上下文管理（harness.context.ContextManager），透传给每个子任务执行子图。
+        # None 表示不启用 —— 调用方（如服务层）可注入自带 VFS 的实例。
+        self.context_manager = context_manager
         self._subgraph_cache: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -113,6 +117,7 @@ class PlanExecuteNodes:
                 middleware=self.middleware,
                 system_prefix=agent_def.system_prompt,
                 tool_mode=self.tool_mode,
+                context_manager=self.context_manager,
             )
         return self._subgraph_cache[agent_name]
 
@@ -360,17 +365,21 @@ def build_plan_execute_graph(
     approval_callback: Optional[ApprovalCallback] = None,
     checkpointer: Any = None,
     tool_mode: str = "react",
+    context_manager: Any = None,
 ):
     """编译顶层 Plan-and-Execute 图并返回（compiled graph）。
 
     Args:
         tool_mode: 子任务执行体的工具调用范式，``"react"`` 或 ``"native"``
             （原生 Function Calling）。见 ``harness.nodes.ReActNodes``。
+        context_manager: 上下文管理器（``harness.context.ContextManager``），
+            透传给每个子任务执行子图；None 表示不启用上下文管理。
     """
     nodes = PlanExecuteNodes(
         llm=llm, broker=broker, planner=planner, store=store, registry=registry,
         gate=gate, middleware=middleware, max_replans=max_replans,
         approval_callback=approval_callback, tool_mode=tool_mode,
+        context_manager=context_manager,
     )
 
     g = StateGraph(PlanExecuteState)
