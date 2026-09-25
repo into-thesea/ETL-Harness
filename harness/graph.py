@@ -28,6 +28,8 @@ def build_executor_graph(
     system_prefix: str = "",
     tool_mode: str = "react",
     context_manager: Any = None,
+    skill_registry: Any = None,
+    allowed_skills: Optional[list[str]] = None,
 ):
     """编译 ReAct 执行子图。
 
@@ -48,6 +50,9 @@ def build_executor_graph(
             Broker 与工具，最终都归一化到 ``broker.invoke(name, args)``。
         context_manager: 上下文管理器（``harness.context.ContextManager``）。
             None 表示不启用上下文管理（think/action 两个介入点均为透传）。
+        skill_registry: Skill 注册中心（``harness.skills.SkillRegistry``）。
+            None 表示不注入技能指引。
+        allowed_skills: 该子 Agent 可用 Skill 白名单；None 表示不限定、按相关性匹配。
 
     Returns:
         编译后的 LangGraph，可 .invoke(state) / .stream(state)。
@@ -55,6 +60,7 @@ def build_executor_graph(
     nodes = ReActNodes(
         llm=llm, broker=broker, middleware=middleware, system_prefix=system_prefix,
         tool_mode=tool_mode, context_manager=context_manager,
+        skill_registry=skill_registry, allowed_skills=allowed_skills,
     )
 
     graph = StateGraph(AgentState)

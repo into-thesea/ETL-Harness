@@ -94,6 +94,8 @@ class ReActNodes:
         system_prefix: str = "",
         tool_mode: str = "react",
         context_manager: Optional[Any] = None,
+        skill_registry: Optional[Any] = None,
+        allowed_skills: Optional[list[str]] = None,
     ) -> None:
         if tool_mode not in ("react", "native"):
             raise ValueError(f"tool_mode 只能是 'react' 或 'native'，收到 {tool_mode!r}")
@@ -106,6 +108,11 @@ class ReActNodes:
         # 上下文管理（harness.context.ContextManager）。None 表示不启用 —— 由上层
         # orchestrator 默认构造并透传；直接构造本类时可显式传入或留空。
         self.context_manager = context_manager
+        # Skill 技能系统（harness.skills.SkillRegistry）。None 表示不注入技能指引。
+        # allowed_skills 为该子 Agent 的 Skill 白名单（SubAgentDef.skills 非空时）；
+        # None 表示不限定，按任务相关性匹配（skills 字段为空时的默认语义）。
+        self.skill_registry = skill_registry
+        self.allowed_skills = allowed_skills
 
     # ------------------------------------------------------------------
     # 工具执行前审批闸门（Human-in-the-Loop）
@@ -173,6 +180,16 @@ class ReActNodes:
             return history
         return self.context_manager.compact_history(
             history, long_term_context=state.get("long_term_context") or ""
+        )
+
+    def _skill_guidance(self, state: AgentState) -> str:
+        """按当前任务匹配相关 Skill，渲染为渐进式披露文本；无匹配 / 未注入返回 ''。"""
+        if self.skill_registry is None:
+            return ""
+        # 子图 goal 即 _compose_subtask 组合的任务标题 / 描述 / 上游结论
+        goal = state.get("goal", "")
+        return self.skill_registry.render_for_context(
+            goal=goal, task=goal, allowed_skills=self.allowed_skills
         )
 
     # ------------------------------------------------------------------
@@ -400,6 +417,9 @@ class ReActNodes:
             history = [{"role": "user", "content": state.get("goal", "")}]
         history = self._compact_history(history, state)
         messages = [{"role": "system", "content": self._build_system_native()}]
+        skill = self._skill_guidance(state)
+        if skill:
+            messages.append({"role": "system", "content": skill})
         wm_index = self._format_working_memory(state.get("working_memory", {}))
         if wm_index:
             messages.append({"role": "system", "content": wm_index})
@@ -518,6 +538,9 @@ class ReActNodes:
             history = [{"role": "user", "content": state.get("goal", "")}]
         history = self._compact_history(history, state)
         messages = [{"role": "system", "content": self._build_system()}]
+        skill = self._skill_guidance(state)
+        if skill:
+            messages.append({"role": "system", "content": skill})
         wm_index = self._format_working_memory(state.get("working_memory", {}))
         if wm_index:
             messages.append({"role": "system", "content": wm_index})

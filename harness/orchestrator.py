@@ -87,6 +87,7 @@ class PlanExecuteNodes:
         tool_mode: str = "react",
         context_manager: Any = None,
         subgraph_checkpointer: Any = None,
+        skill_registry: Any = None,
     ) -> None:
         self.llm = llm
         self.broker = broker
@@ -109,6 +110,9 @@ class PlanExecuteNodes:
         # None 时子图无 checkpointer，子图 interrupt 无法暂停（审批不生效）——
         # 服务层应注入（可与顶层图共用同一实例，靠 thread_id 区分）。
         self.subgraph_checkpointer = subgraph_checkpointer
+        # Skill 注册中心（harness.skills.SkillRegistry），透传给每个子任务子图；
+        # None 表示不注入技能指引。
+        self.skill_registry = skill_registry
         self._subgraph_cache: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -119,6 +123,9 @@ class PlanExecuteNodes:
         if agent_name not in self._subgraph_cache:
             agent_def = self.registry.get(agent_name)
             scoped = self.registry.scoped_broker(self.broker, agent_name)
+            # SubAgentDef.skills 非空 → 限定该子 Agent 的 Skill 白名单；
+            # 为空 → None（不限定，按任务相关性匹配）。
+            allowed_skills = list(agent_def.skills) if agent_def.skills else None
             self._subgraph_cache[agent_name] = build_executor_graph(
                 self.llm, scoped,
                 middleware=self.middleware,
@@ -126,6 +133,8 @@ class PlanExecuteNodes:
                 tool_mode=self.tool_mode,
                 context_manager=self.context_manager,
                 checkpointer=self.subgraph_checkpointer,
+                skill_registry=self.skill_registry,
+                allowed_skills=allowed_skills,
             )
         return self._subgraph_cache[agent_name]
 
@@ -419,6 +428,7 @@ def build_plan_execute_graph(
     tool_mode: str = "react",
     context_manager: Any = None,
     subgraph_checkpointer: Any = None,
+    skill_registry: Any = None,
 ):
     """编译顶层 Plan-and-Execute 图并返回（compiled graph）。
 
@@ -431,6 +441,8 @@ def build_plan_execute_graph(
             （原生 Function Calling）。见 ``harness.nodes.ReActNodes``。
         context_manager: 上下文管理器（``harness.context.ContextManager``），
             透传给每个子任务执行子图；None 表示不启用上下文管理。
+        skill_registry: Skill 注册中心（``harness.skills.SkillRegistry``），
+            透传给每个子任务子图；None 表示不注入技能指引。
     """
     nodes = PlanExecuteNodes(
         llm=llm, broker=broker, planner=planner, store=store, registry=registry,
@@ -440,6 +452,7 @@ def build_plan_execute_graph(
         subgraph_checkpointer=(
             subgraph_checkpointer if subgraph_checkpointer is not None else checkpointer
         ),
+        skill_registry=skill_registry,
     )
 
     g = StateGraph(PlanExecuteState)

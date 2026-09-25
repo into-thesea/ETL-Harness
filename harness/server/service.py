@@ -74,11 +74,22 @@ class HarnessService:
         planner = TaskPlanner(llm, broker=broker, available_agents=registry.names())
         context_manager = ContextManager(vfs=VirtualFileSystem())
 
+        # Skill 技能系统：加载 harness/skills 下全部 SKILL.md 并透传给图，
+        # 由执行体按任务上下文渐进式披露，而非一次性塞满。
+        import os
+
+        from harness.skills import SkillRegistry
+
+        skill_registry = SkillRegistry()
+        skills_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "skills")
+        skill_registry.load_directory(skills_dir)
+
         self.graph = build_plan_execute_graph(
             llm, broker,
             planner=planner, store=store, registry=registry, gate=gate,
             checkpointer=self.checkpointer,
             context_manager=context_manager,
+            skill_registry=skill_registry,
         )
         logger.info("HarnessService assembled (checkpointer=%s)", type(self.checkpointer).__name__)
         return self.graph
