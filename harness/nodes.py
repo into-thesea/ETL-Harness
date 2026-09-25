@@ -126,6 +126,131 @@ class ReActNodes:
         )
 
     # ------------------------------------------------------------------
+    # 工作记忆资产索引（让 LLM 知道"已经获取了什么数据"）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _format_working_memory(working_memory: dict) -> str:
+        """把工作记忆中的工具产物格式化为「数据资产索引摘要」，注入 LLM 上下文。
+
+        不注入完整 artifacts（那会回到上下文爆炸），只注入资产索引：
+        来源工具、关键元数据（文件名 / 行列规模 / 列名 / 产出路径）。
+        LLM 需要原始细节时，用文件工具按路径读取（渐进式披露）。
+
+        背景：工具返回 (ok, text, artifacts)，artifacts 存入 working_memory 后
+        若不注入上下文，LLM 只能看到精简 text，会因"不知道已有什么数据"而
+        反复调用同一工具（实测单任务 71 次体检、撞步数上限）。
+        """
+        if not working_memory:
+            return ""
+
+        lines = [
+            "【已获取的数据资产索引】（以下为摘要，非完整数据；"
+            "需要原始细节时用文件工具按路径读取）"
+        ]
+        has_asset = False
+
+        for key, artifacts in working_memory.items():
+            if not key.startswith("result_") or not isinstance(artifacts, dict):
+                continue
+            tool_name = key[len("result_"):]
+            has_asset = True
+
+            parts: list[str] = []
+            for art_key, art_val in artifacts.items():
+                meta = ReActNodes._extract_asset_meta(art_key, art_val)
+                if meta:
+                    parts.append(meta)
+
+            if parts:
+                lines.append(f"- {tool_name}：" + " | ".join(parts))
+            else:
+                lines.append(f"- {tool_name}：（已获取结果，完整数据已落盘）")
+
+        if not has_asset:
+            return ""
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_asset_meta(art_key: str, art_val: Any) -> str:
+        """从单个 artifact 值中提取关键元数据摘要（识别已知结构，未知结构兜底）。"""
+        if not isinstance(art_val, dict):
+            return f"{art_key}（非结构化结果）"
+
+        meta: list[str] = []
+
+        # ---- inspection 结构（data_inspector）----
+        if isinstance(art_val.get("file"), dict):
+            f = art_val["file"]
+            if f.get("file_name"):
+                meta.append(f"文件={f['file_name']}")
+            if f.get("format"):
+                meta.append(f"格式={f['format']}")
+
+        if isinstance(art_val.get("quality"), dict):
+            q = art_val["quality"]
+            if "rows" in q and "cols" in q:
+                meta.append(f"{q['rows']}行×{q['cols']}列")
+            if q.get("overall_missing_rate") is not None:
+                meta.append(f"缺失率{q['overall_missing_rate']:.1%}")
+
+        if isinstance(art_val.get("schema"), list):
+            col_names = [
+                c.get("name", "?") for c in art_val["schema"]
+                if isinstance(c, dict) and c.get("name")
+            ]
+            if col_names:
+                shown = col_names[:8]
+                suffix = "…" if len(col_names) > 8 else ""
+                meta.append(f"列=[{','.join(shown)}]{suffix}")
+
+        if isinstance(art_val.get("risks"), list):
+            high = [
+                r for r in art_val["risks"]
+                if isinstance(r, dict) and r.get("level") == "high"
+            ]
+            if high:
+                names = [str(r.get("column") or "整表") for r in high[:3]]
+                meta.append(f"高风险{len(high)}项({','.join(names)})")
+
+        # ---- eda overview 结构 ----
+        if isinstance(art_val.get("overview"), dict):
+            ov = art_val["overview"]
+            if "rows" in ov and "cols" in ov:
+                meta.append(f"{ov['rows']}行×{ov['cols']}列")
+            if ov.get("numeric_cols"):
+                meta.append(f"数值列{len(ov['numeric_cols'])}")
+            if ov.get("categorical_cols"):
+                meta.append(f"类别列{len(ov['categorical_cols'])}")
+            if ov.get("target"):
+                meta.append(f"目标={ov['target']}")
+
+        # ---- cleaning 结构 ----
+        if art_val.get("output"):
+            meta.append(f"清洗输出={art_val['output']}")
+        if art_val.get("report_file"):
+            meta.append(f"报告={art_val['report_file']}")
+        if isinstance(art_val.get("after"), dict) and "rows" in art_val["after"]:
+            meta.append(f"清洗后{art_val['after']['rows']}行")
+
+        # ---- chart 结构 ----
+        if art_val.get("vfs_path"):
+            meta.append(f"图表={art_val['vfs_path']}")
+        elif art_val.get("abs_path"):
+            meta.append(f"图表={art_val['abs_path']}")
+        if art_val.get("chart_type"):
+            meta.append(f"图类型={art_val['chart_type']}")
+
+        # ---- 通用兜底：产出路径 ----
+        for path_field in ("output_path", "report_path", "file_path"):
+            if art_val.get(path_field) and not meta:
+                meta.append(f"产出={art_val[path_field]}")
+
+        if not meta:
+            top_keys = list(art_val.keys())[:6]
+            return f"{art_key}[{','.join(top_keys)}]" if top_keys else art_key
+        return f"{art_key}: " + "；".join(meta)
+
+    # ------------------------------------------------------------------
     # 工具方法
     # ------------------------------------------------------------------
     @staticmethod
@@ -224,7 +349,11 @@ class ReActNodes:
         if not history:
             history = [{"role": "user", "content": state.get("goal", "")}]
         history = self._compact_history(history, state)
-        messages = [{"role": "system", "content": self._build_system_native()}] + history
+        messages = [{"role": "system", "content": self._build_system_native()}]
+        wm_index = self._format_working_memory(state.get("working_memory", {}))
+        if wm_index:
+            messages.append({"role": "system", "content": wm_index})
+        messages += history
 
         ctx = MiddlewareContext(
             operation="llm/think",
@@ -333,12 +462,16 @@ class ReActNodes:
         current_step = state.get("current_step", 0) + 1
         max_steps = state.get("max_steps", 12)
 
-        # 组装消息：system（含最新工具列表）+ 历史
+        # 组装消息：system（含最新工具列表）+ 资产索引 + 历史
         history = self._messages_to_dicts(state.get("messages", []))
         if not history:
             history = [{"role": "user", "content": state.get("goal", "")}]
         history = self._compact_history(history, state)
-        messages = [{"role": "system", "content": self._build_system()}] + history
+        messages = [{"role": "system", "content": self._build_system()}]
+        wm_index = self._format_working_memory(state.get("working_memory", {}))
+        if wm_index:
+            messages.append({"role": "system", "content": wm_index})
+        messages += history
 
         ctx = MiddlewareContext(
             operation="llm/think",

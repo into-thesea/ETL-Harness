@@ -66,6 +66,64 @@ class ContextBudget:
     """确定性降级摘要中，每条旧消息最多保留多少字符。"""
 
 
+@dataclass
+class ContextStats:
+    """上下文管理器的运行统计计数器。
+
+    用于可观测性：判断沉淀阈值是否合理、压缩是否真的触发、
+    压缩省了多少字符。所有计数均为确定性累加，不依赖外部服务。
+    """
+
+    # ---- 沉淀（settle_observation）----
+    sink_count: int = 0
+    """沉淀触发次数（结果超过阈值且成功写入 VFS）。"""
+
+    sink_chars_original: int = 0
+    """沉淀前原文总字符数。"""
+
+    sink_chars_returned: int = 0
+    """沉淀后返回给上下文的摘要总字符数（含文件卡片）。"""
+
+    truncate_count: int = 0
+    """硬截断兜底次数（无 VFS 或沉淀失败，结果超过单条上限被截断）。"""
+
+    # ---- 压缩（compact_history）----
+    compact_count: int = 0
+    """历史压缩触发次数（实际进入压缩逻辑，非"无需压缩"早退）。"""
+
+    compact_messages_folded: int = 0
+    """被折叠进"前期操作回顾"摘要的消息总数。"""
+
+    compact_chars_before: int = 0
+    """压缩前（anchor + body）总字符数。"""
+
+    compact_chars_after: int = 0
+    """压缩后返回的消息总字符数。"""
+
+    budget_violation_count: int = 0
+    """最后防线触发次数（折叠后仍超预算，丢弃最旧消息）。"""
+
+    def summary(self) -> str:
+        """返回可读的多行统计摘要，供示例/日志打印。"""
+        lines = ["上下文管理统计："]
+        lines.append(
+            f"  沉淀：{self.sink_count} 次"
+            + (f"（原文 {self.sink_chars_original} 字符 → 返回 {self.sink_chars_returned} 字符，"
+               f"省 {self.sink_chars_original - self.sink_chars_returned} 字符）"
+               if self.sink_count else "")
+        )
+        lines.append(f"  硬截断：{self.truncate_count} 次")
+        lines.append(
+            f"  压缩：{self.compact_count} 次"
+            + (f"（折叠 {self.compact_messages_folded} 条消息，"
+               f"{self.compact_chars_before} → {self.compact_chars_after} 字符，"
+               f"省 {self.compact_chars_before - self.compact_chars_after} 字符）"
+               if self.compact_count else "")
+        )
+        lines.append(f"  预算违例（丢弃消息）：{self.budget_violation_count} 次")
+        return "\n".join(lines)
+
+
 class ContextManager:
     """长程任务上下文管理器。
 
@@ -87,6 +145,7 @@ class ContextManager:
         self.vfs = vfs                       # 可选 VirtualFileSystem；None 时只截断不沉淀
         self.summarizer = summarizer        # 可选 LLM 摘要函数；None 时用确定性摘要
         self.budget = budget or ContextBudget()
+        self.stats = ContextStats()         # 运行统计计数器（沉淀/压缩/截断）
         # session_id -> 已沉淀文件的引用（文件卡片），可进任务黑板/快照
         self._refs: dict[str, list[dict]] = {}
 
@@ -150,16 +209,21 @@ class ContextManager:
                     "Settled large %s result (%d chars) -> %s",
                     tool_name, len(text), vfs_path,
                 )
-                return (
+                returned = (
                     f"【工具 {tool_name} 返回结果较长（{len(text)} 字符），完整内容已沉淀到 "
                     f"{vfs_path}；需要原始细节时可用文件工具按该路径读取。】\n"
                     f"结果摘要：\n{summary}"
                 )
+                self.stats.sink_count += 1
+                self.stats.sink_chars_original += len(text)
+                self.stats.sink_chars_returned += len(returned)
+                return returned
             except Exception as e:  # noqa: BLE001 - 沉淀失败不得中断执行，降级为截断
                 logger.warning("VFS sink failed, fallback to truncation: %s", e)
 
         # 2) 无 VFS 或沉淀失败：硬截断兜底
         if len(text) > b.observation_char_limit:
+            self.stats.truncate_count += 1
             return text[: b.observation_char_limit] + "\n…（结果过长，已截断）"
         return text
 
@@ -222,6 +286,11 @@ class ContextManager:
             body = self._align_window(body, start_on, end_on)
             return self._with_long_term(anchor + body, long_term_context)
 
+        # ---- 进入压缩逻辑 ----
+        self.stats.compact_count += 1
+        chars_before = self._total_chars(anchor) + self._total_chars(body)
+        self.stats.compact_chars_before += chars_before
+
         recent = body[-b.keep_recent_messages:] if b.keep_recent_messages > 0 else []
         older = body[: -b.keep_recent_messages] if b.keep_recent_messages > 0 else list(body)
 
@@ -234,6 +303,7 @@ class ContextManager:
 
         packed: list[Message] = list(anchor)
         if older:
+            self.stats.compact_messages_folded += len(older)
             review = self._summarize(older)
             packed.append({
                 "role": "user",
@@ -243,7 +313,10 @@ class ContextManager:
 
         # 最后防线：仍超预算则丢弃最旧的非锚点消息
         if self._total_chars(packed) > b.max_history_chars:
+            self.stats.budget_violation_count += 1
             packed = self._enforce_budget(packed, start_on=start_on, end_on=end_on)
+
+        self.stats.compact_chars_after += self._total_chars(packed)
         return self._with_long_term(packed, long_term_context)
 
     # ------------------------------------------------------------------
@@ -365,15 +438,19 @@ class ContextManager:
         return list(self._refs.get(session_id, []))
 
     def snapshot(self) -> dict:
-        """导出上下文状态快照（沉淀引用 + 预算），供断点恢复。"""
+        """导出上下文状态快照（沉淀引用 + 预算 + 统计），供断点恢复。"""
         return {
             "refs": {k: list(v) for k, v in self._refs.items()},
             "budget": dict(self.budget.__dict__),
+            "stats": dict(self.stats.__dict__),
         }
 
     def restore(self, snapshot: dict) -> None:
         """从快照恢复。"""
         self._refs = {k: list(v) for k, v in (snapshot.get("refs") or {}).items()}
+        saved_stats = snapshot.get("stats")
+        if saved_stats:
+            self.stats = ContextStats(**saved_stats)
 
 
-__all__ = ["ContextManager", "ContextBudget", "Message", "MessageTypes", "Summarizer"]
+__all__ = ["ContextManager", "ContextBudget", "ContextStats", "Message", "MessageTypes", "Summarizer"]

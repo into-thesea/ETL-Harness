@@ -333,6 +333,10 @@ def _report_context_activity(cm: ContextManager) -> None:
     else:
         print(f"\n合计沉淀 {total} 个大结果（阈值 {cm.budget.sink_threshold_chars} 字符）")
 
+    # 运行统计计数器：沉淀/压缩/截断的真实计数（判断阈值与预算是否合理的依据）
+    print()
+    print(cm.stats.summary())
+
 
 DEFAULT_GOAL = f"对销售数据 {RAW_FILE} 做端到端分析：体检 → 清洗 → EDA → 出图 → 报告"
 
