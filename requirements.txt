@@ -4,6 +4,9 @@
 langgraph>=1.0.0
 langchain-core>=0.3.0
 langchain-community>=0.3.0
+# 审批中断的持久化 checkpointer（默认后端 sqlite，见 harness/checkpoint.py）
+langgraph-checkpoint-sqlite>=3.1.1
+aiosqlite>=0.22.0
 
 # ============================================================
 # LLM 调用（OpenAI 兼容，支持 DeepSeek/通义/Kimi/Ollama）

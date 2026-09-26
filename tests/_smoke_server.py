@@ -56,7 +56,7 @@ def _poll(client: TestClient, thread_id: str, until: tuple[str, ...], timeout: f
 # ----------------------------------------------------------------------
 # 用于审批测试的最小脚本 LLM：规划单个 coder 任务，coder 调 code_executor
 # ----------------------------------------------------------------------
-class _ApprovalLLM:
+class ApprovalLLM:
     def __init__(self) -> None:
         self.plan = {"tasks": [{
             "title": "运行代码", "description": "在沙箱运行一段代码",
@@ -128,7 +128,7 @@ def test_main_flow() -> None:
 # 3：审批中断 → reject 恢复
 # ----------------------------------------------------------------------
 def test_approval_reject() -> None:
-    service = HarnessService(llm=_ApprovalLLM())
+    service = HarnessService(llm=ApprovalLLM())
     app = create_app(service)
     with TestClient(app) as client:
         r = client.post("/api/v1/tasks", json={"goal": "运行一段代码"})

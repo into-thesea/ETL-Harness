@@ -43,24 +43,43 @@ class HarnessService:
 
         Args:
             checkpointer: LangGraph checkpointer（审批 interrupt 必需）。
-                默认 ``MemorySaver``（进程内，重启丢失；生产应换持久化实现）。
+                默认按 ``CHECKPOINT_BACKEND`` 装配（默认 ``sqlite``，落盘，
+                服务重启后仍能继续审批；``memory`` 为进程内实现，重启即丢）。
+                注意：默认 saver 是异步实现、绑定事件循环，因此**装配推迟到第一个
+                异步入口**（见 ``_ensure_ready``）。显式注入实例可立即装配。
             llm: 可注入的 LLM（真实 client / Mock）。None 时自动选择：
                 配置了 API Key 用真实 LLM，否则用脚本化 Mock（离线可跑）。
-            auto_assemble: 是否立即装配并编译图（测试可关闭后手动注入）。
+            auto_assemble: 是否自动装配并编译图（测试可关闭后手动装配）。
         """
-        if checkpointer is None:
-            from langgraph.checkpoint.memory import MemorySaver
-
-            checkpointer = MemorySaver()
         self.checkpointer = checkpointer
+        self._ready = False
         self._llm_override = llm
         self._bg_tasks: dict[str, asyncio.Task] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self.graph: Any = None
         self.llm: Any = None
         self.datasources: Any = None
-        if auto_assemble:
+        self._auto_assemble = auto_assemble
+        # 注入了 checkpointer 才能立即装配；否则等第一个异步入口（见 _ensure_ready）
+        if auto_assemble and checkpointer is not None:
             self.assemble()
+
+    async def _ensure_ready(self) -> None:
+        """首个异步入口的幂等前置：解析 checkpointer 并装配图。
+
+        异步 saver 绑定事件循环，只能在运行中的循环里构造，所以装配不能放在
+        ``__init__``（见 ``harness/checkpoint.py`` 模块说明）。
+        """
+        if self._ready:
+            return
+        if self.checkpointer is None:
+            from harness.checkpoint import build_checkpointer
+
+            self.checkpointer = await build_checkpointer()
+        if self._auto_assemble:
+            self.assemble()
+        else:
+            self._ready = True
 
     # ------------------------------------------------------------------
     # 装配（D16：服务层是正式装配点）
@@ -104,6 +123,7 @@ class HarnessService:
             skill_registry=skill_registry,
             datasources=datasources,
         )
+        self._ready = True
         logger.info("HarnessService assembled (checkpointer=%s)", type(self.checkpointer).__name__)
         return self.graph
 
@@ -165,6 +185,7 @@ class HarnessService:
     # ------------------------------------------------------------------
     async def create_task(self, goal: str, context: str = "", role: str = "admin") -> str:
         """创建任务并后台驱动，返回 thread_id。"""
+        await self._ensure_ready()
         thread_id = uuid.uuid4().hex
         initial = make_plan_execute_state(
             goal, context=context, session_id=thread_id, role=role
@@ -175,6 +196,7 @@ class HarnessService:
 
     async def get_status(self, thread_id: str) -> Optional[dict]:
         """返回任务状态快照；thread 不存在返回 None。"""
+        await self._ensure_ready()
         snap = await self.graph.aget_state(self._config(thread_id))
         values = snap.values or {}
         # 未见过的 thread：values 为空（无 goal）、无待执行节点 / 任务 → 不存在
@@ -218,6 +240,7 @@ class HarnessService:
         """
         from langgraph.types import Command
 
+        await self._ensure_ready()
         async with self._lock(thread_id):
             current = await self.get_status(thread_id)
             if current is None:

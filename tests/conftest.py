@@ -13,9 +13,16 @@
 
 from __future__ import annotations
 
+import os
 import socket
 
 import pytest
+
+# 测试默认用进程内 checkpointer：不让测试往仓库的 data/ 目录写状态文件，也避免
+# 每个用例拉起一条数据库连接。**默认值本身**（sqlite）由
+# tests/test_checkpoint_persistence.py 用临时文件专项验证。
+# 必须在这里设置 —— harness.config 的配置单例在首次 import 时成型。
+os.environ.setdefault("CHECKPOINT_BACKEND", "memory")
 
 
 def pytest_addoption(parser) -> None:

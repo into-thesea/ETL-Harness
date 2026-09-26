@@ -68,3 +68,6 @@ desktop.ini
 *.tmp
 *.bak
 *.stackdump
+
+# superpowers SDD 工作区（临时草稿，勿提交）
+.superpowers/

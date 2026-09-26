@@ -249,6 +249,22 @@ class ContextSettings(BaseSettings):
     """确定性降级摘要中，每条旧消息最多保留多少字符。"""
 
 
+class CheckpointSettings(BaseSettings):
+    """图状态检查点配置（审批 interrupt 的持久化）。
+
+    ``backend="sqlite"``（默认）把中断状态落盘：服务重启后仍能继续审批。
+    ``backend="memory"`` 是进程内实现，重启即丢 —— 仅用于测试与短命令流程。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="CHECKPOINT_", extra="ignore")
+
+    backend: str = "sqlite"
+    """``sqlite`` | ``memory``。未知取值会显式报错，不静默回退。"""
+
+    sqlite_path: str = "data/checkpoints.sqlite"
+    """sqlite 后端的状态文件（项目相对路径，父目录自动创建）。"""
+
+
 class DataSourceSettings(BaseSettings):
     """命名数据源配置（C5：SQLAlchemy 统一连接层）。
 
@@ -288,6 +304,7 @@ class Settings(BaseSettings):
     vfs: VFSSettings = Field(default_factory=VFSSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
+    checkpoint: CheckpointSettings = Field(default_factory=CheckpointSettings)
     datasource: DataSourceSettings = Field(default_factory=DataSourceSettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
 

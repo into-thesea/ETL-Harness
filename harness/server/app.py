@@ -129,7 +129,8 @@ def create_app(service: Optional[HarnessService] = None) -> FastAPI:
 
     Args:
         service: 可注入的 HarnessService（测试用 TestClient 时常注入）。
-            None 时自动装配（默认 MemorySaver + 自动选择 LLM）。
+            None 时自动装配（checkpointer 按 CHECKPOINT_BACKEND 解析，默认
+            落盘 SQLite；LLM 自动选择）。
     """
     svc = service or HarnessService()
     app = FastAPI(
