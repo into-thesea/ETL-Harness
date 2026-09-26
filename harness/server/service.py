@@ -94,7 +94,15 @@ class HarnessService:
         middleware = MiddlewareManager()
         middleware.register(PIIDetectionMiddleware(settings.pii))
 
-        broker = ToolBroker(middleware_manager=middleware, audit_logger=get_audit_logger())
+        # 工具级 PDP 此前从未接进装配（tool_broker 里 `if self.pdp is not None` 一直
+        # 为假）—— 权限层等于空转。这里接上：未配置规则时默认放行，行为不变。
+        from harness.pdp import PDP
+
+        broker = ToolBroker(
+            middleware_manager=middleware,
+            pdp=PDP.from_settings(settings.permission),
+            audit_logger=get_audit_logger(),
+        )
         register_builtin_tools(broker)
         registry = AgentRegistry()
         store = TaskStore(backend="memory")

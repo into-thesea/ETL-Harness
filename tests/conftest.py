@@ -34,6 +34,10 @@ def pytest_addoption(parser) -> None:
         "--require-kafka", action="store_true", default=False,
         help="Kafka 不可达时严格失败（默认 skip 该集成测试）",
     )
+    parser.addoption(
+        "--require-db", action="store_true", default=False,
+        help="PostgreSQL/MySQL 不可达时严格失败（默认 skip 该集成测试）",
+    )
 
 
 def _sandbox_available() -> tuple[bool, str]:
@@ -53,6 +57,20 @@ def _kafka_available() -> bool:
         return False
 
 
+# compose 里的开发/测试库（端口故意避开本机常见的 5432/3306）
+_DB_ENDPOINTS = (("localhost", 55432), ("localhost", 53306))
+
+
+def _db_available() -> tuple[bool, str]:
+    for host, port in _DB_ENDPOINTS:
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                pass
+        except OSError as e:
+            return False, f"{host}:{port} 不可达（{e}）"
+    return True, ""
+
+
 def pytest_runtest_setup(item) -> None:
     if list(item.iter_markers("needs_sandbox")):
         ready, reason = _sandbox_available()
@@ -66,3 +84,10 @@ def pytest_runtest_setup(item) -> None:
             if item.config.getoption("--require-kafka"):
                 pytest.fail("Kafka 不可用（--require-kafka）")
             pytest.skip("Kafka 不可用（加 --require-kafka 可严格要求）")
+
+    if list(item.iter_markers("needs_db")):
+        ready, reason = _db_available()
+        if not ready:
+            if item.config.getoption("--require-db"):
+                pytest.fail(f"数据库不可用（--require-db）：{reason}")
+            pytest.skip(f"数据库不可用（加 --require-db 可严格要求）：{reason}")

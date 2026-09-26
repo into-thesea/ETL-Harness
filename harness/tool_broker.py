@@ -414,7 +414,11 @@ class ToolBroker:
                 for td in self.list_tools()
             ],
             "middleware_enabled": self.middleware is not None,
+            # 接上 PDP ≠ 有强制力：默认策略是 allow 且没有任何规则时，它什么都不拦。
+            # 把这两件事一起报出来，免得运维看到 True 以为鉴权在生效。
             "pdp_enabled": self.pdp is not None,
+            "pdp_rules": len(getattr(self.pdp, "list_rules", dict)() or {}),
+            "pdp_default_policy": getattr(self.pdp, "default_policy", None),
             "sandbox_enabled": self.sandbox is not None,
             "audit_enabled": self.audit is not None,
         }

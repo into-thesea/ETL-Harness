@@ -6,11 +6,19 @@
 - 从 ``settings.datasource`` 批量加载命名数据源；
 - ``sql_query`` 工具按名取 Engine 执行只读查询。
 
-连接级只读加固（在 sql_query 的语句白名单之外做纵深防御）：
+连接级只读加固（在 sql_query 的语句白名单之外的纵深防御，**两层都要有**）：
 - sqlite：file URI ``?mode=ro``（文件级只读）；
-- postgresql：每个底层连接建立后 ``SET default_transaction_read_only=on``；
-- mysql：依赖【只读账号】（MySQL 无可靠的连接级只读开关），由账号权限 +
-  语句白名单双重约束。
+- postgresql：连接参数 ``options=-c default_transaction_read_only=on``
+  （libpq 参数，在会话建立时生效）；
+- mysql：连接参数 ``init_command=SET SESSION TRANSACTION READ ONLY``
+  （会话级只读事务，MySQL 5.6.5+）。
+
+**不要在 connect 事件里执行 ``SET``**：psycopg3 下那条 SET 会隐式开启事务，
+连接归还连接池时的 rollback 会把设置一并回滚 —— 结果是"看着有只读保护、实际可写"。
+本模块曾踩过这个坑（见 docs/遇到的问题.md #21），只读账号那条路上永远测不出来。
+
+数据库层只读之外，**账号权限仍是必须的**：连接参数只约束本框架建立的连接，
+绕过框架直连数据库不受它保护。
 """
 
 from __future__ import annotations
@@ -23,7 +31,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.engine.url import URL
 
@@ -37,7 +45,7 @@ class DataSourceConfig:
     name: str
     url: str = ""
     dialect: str = ""          # sqlite / mysql / postgresql
-    driver: str = ""           # pymysql / psycopg2 ...
+    driver: str = ""           # pymysql / psycopg（v3；驱动名 postgresql+psycopg）...
     username: str = ""
     password: str = ""
     host: str = ""
@@ -144,22 +152,42 @@ class DataSourceManager:
 
         common["pool_size"] = self._pool_size
         common["max_overflow"] = 2
-        engine = create_engine(url, **common)
+
+        # 连接级只读：用**连接参数**在建立会话时设置，不用 connect 事件里再执行 SET。
+        #
+        # 为什么必须改：原来的写法是 `@event.listens_for(engine, "connect")` 里
+        # `cur.execute("SET default_transaction_read_only=on")`。在 psycopg3 下，
+        # 这条 SET 会隐式开启一个事务，随后连接归还连接池时的 rollback 把设置**一并
+        # 回滚**——结果是"看起来有只读保护，实际连接可写"。这不是理论问题：用管理员
+        # 账号实测，写操作直接成功（见 tests/test_datasources_real.py 的连接级只读用例）。
+        # 改成 libpq 连接参数后，GUC 在会话建立时生效，不依赖任何事务残留。
+        # 注意：SQLAlchemy 里显式 connect_args 会**覆盖** URL 查询串里的同名参数
+        # （create_engine 内部做 cparams.union(connect_args)），所以要先看 URL 里
+        # 有什么，别把用户写的 `search_path` / `sslmode` 之类悄悄冲掉。
+        query = dict(make_url(url).query or {})
+        connect_args: dict[str, Any] = {}
 
         if cfg.readonly and dialect == "postgresql":
+            flag = "-c default_transaction_read_only=on"
+            existing = str(query.get("options") or "").strip()
+            connect_args["options"] = existing if flag in existing else f"{existing} {flag}".strip()
+        elif cfg.readonly and dialect == "mysql":
+            # MySQL 没有 PG 那种连接参数；用会话级只读事务起步（5.6.5+）。
+            # init_command 是单条语句，用户自带值时无法安全叠加 —— 此时如实告警，
+            # 不要让人以为只读生效了。
+            flag = "SET SESSION TRANSACTION READ ONLY"
+            existing = str(query.get("init_command") or "").strip()
+            if existing:
+                logger.warning(
+                    "datasource %r: URL 已带 init_command，**未叠加会话级只读** —— "
+                    "MySQL 侧只读只剩「只读账号」一层，请确认账号权限", cfg.name,
+                )
+            else:
+                connect_args["init_command"] = flag
+        if connect_args:
+            common["connect_args"] = connect_args
 
-            @event.listens_for(engine, "connect")
-            def _pg_readonly(dbapi_conn, _rec):  # noqa: ANN001
-                cur = dbapi_conn.cursor()
-                cur.execute("SET default_transaction_read_only=on")
-                cur.close()
-
-        if cfg.readonly and dialect == "mysql":
-            logger.info(
-                "datasource %r is MySQL; connection-level read-only relies on "
-                "a read-only DB account plus the statement whitelist", cfg.name
-            )
-        return engine
+        return create_engine(url, **common)
 
     def close(self) -> None:
         with self._lock:

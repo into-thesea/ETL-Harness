@@ -129,6 +129,51 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
       KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
 
+  # ============================================================
+  # PostgreSQL / MySQL —— C5 多数据源（首期 SQLAlchemy + MySQL/PG）
+  #
+  # 端口故意用非常规值（55432 / 53306）：本机常有别的项目占用 5432/3306，
+  # 撞端口会连到别人的库上，排查起来很贵。
+  # 两个库都只建**只读账号** harness_ro（见 infra/db/*.sql）——
+  # 「写入必须失败」由测试实测，不靠假设。
+  # ============================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: etl-harness-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: harness
+      POSTGRES_USER: harness_admin
+      POSTGRES_PASSWORD: harness_admin_pw
+    ports:
+      - "55432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./db/postgres-init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harness_admin -d harness"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mysql:
+    image: mysql:8
+    container_name: etl-harness-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: harness_root_pw
+      MYSQL_DATABASE: harness
+    ports:
+      - "53306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./db/mysql-init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-pharness_root_pw"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
 volumes:
   redis_data:
   etcd_data:
@@ -137,3 +182,5 @@ volumes:
   zk_data:
   zk_log:
   kafka_data:
+  pg_data:
+  mysql_data:

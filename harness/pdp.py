@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,47 @@ class PDP:
         # 权限表：键是 (角色, 工具名) 元组，值是 "allow" / "deny"
         self._rules: dict[tuple[str, str], str] = {}
         self._default_policy = default_policy
+
+    # ------------------------------------------------------------------
+    # 构建
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_settings(cls, config: Any) -> "PDP":
+        """从 ``PermissionSettings`` 构造。
+
+        默认 ``default_policy="allow"``：本方法用于把此前**根本没接进装配**的
+        PDP 接上 —— 默认必须与"没接"等价（放行），否则一上线就把所有工具调用拦死。
+        要最小权限就配 ``PERMISSION_PDP_DEFAULT_POLICY=deny`` 再显式列白名单。
+
+        Raises:
+            ValueError: ``PERMISSION_PDP_RULES`` 不是合法 JSON 数组。
+        """
+        import json
+
+        default = str(
+            getattr(config, "pdp_default_policy", cls.DENY) or cls.DENY
+        ).strip().lower()
+        if default not in (cls.ALLOW, cls.DENY):
+            # 绝不默认成 allow：写错一个字母就变成"全放行"，而运维以为自己配了最小权限
+            raise ValueError(
+                f"PERMISSION_PDP_DEFAULT_POLICY 取值非法：{default!r}（只支持 allow | deny）"
+            )
+        pdp = cls(default_policy=default)
+
+        raw = str(getattr(config, "pdp_rules", "") or "").strip()
+        if not raw:
+            return pdp
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"PERMISSION_PDP_RULES 不是合法 JSON：{e}") from e
+        if not isinstance(parsed, list):
+            raise ValueError("PERMISSION_PDP_RULES 必须是规则数组（JSON list）")
+        for rule in parsed:
+            if not isinstance(rule, dict) or "role" not in rule or "tool" not in rule:
+                raise ValueError(f"PDP 规则缺少 role/tool 字段：{rule!r}")
+            pdp.add_rule(str(rule["role"]), str(rule["tool"]), str(rule.get("effect", cls.ALLOW)))
+        return pdp
 
     # ------------------------------------------------------------------
     # 规则管理

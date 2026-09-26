@@ -67,6 +67,23 @@ _HAS_LIMIT = re.compile(r"\blimit\s+\d+", re.IGNORECASE)
 # 进程级默认 manager（context 未透传 data_source_manager 时使用，从 settings 加载）
 _default_manager: Optional[DataSourceManager] = None
 
+# 进程级默认行列级权限策略（context 未透传 row_column_policy 时使用）
+_default_policy: Optional[Any] = None
+
+
+def _get_policy(context: dict) -> Any:
+    """取行列级权限策略：context 注入优先，否则从配置懒加载。"""
+    policy = (context or {}).get("row_column_policy")
+    if policy is not None:
+        return policy
+    global _default_policy
+    if _default_policy is None:
+        from harness.config import settings
+        from harness.permissions import RowColumnPolicy
+
+        _default_policy = RowColumnPolicy.from_settings(settings.permission)
+    return _default_policy
+
 
 def _get_manager(context: dict) -> DataSourceManager:
     mgr = (context or {}).get("data_source_manager")
@@ -170,6 +187,23 @@ def handle(args: dict, context: dict):
         return False, f"SQL 查询失败：{e}", {}
     except Exception as e:  # noqa: BLE001
         return False, f"SQL 查询失败：{type(e).__name__}: {e}", {}
+
+    # 行列级权限：**必须在注入 LIMIT 之前改写**（LIMIT 之后再插 WHERE 是语法错误）。
+    # 规则改不了这条 SQL 时直接拒绝（fail closed），不勉强改写。
+    policy = _get_policy(context)
+    if policy.enabled:
+        rewritten, deny = policy.apply(
+            clean_sql,
+            # 与 ToolBroker 的口径保持一致（那边缺省也是 "analyst"）——
+            # 否则同一个"没带角色"的调用，broker 按 analyst 放行、这里却按空串
+            # 命中不了任何规则，出现两处口径不一致的静默差异。
+            role=(context or {}).get("role") or "analyst",
+            data_source=source_name,
+            dialect=dialect,
+        )
+        if deny:
+            return False, f"SQL 查询被拒绝：{deny}", {}
+        clean_sql = rewritten
 
     # 强制 LIMIT（未显式指定时追加；三种方言均支持 LIMIT）
     applied_limit = None

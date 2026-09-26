@@ -249,6 +249,49 @@ class ContextSettings(BaseSettings):
     """确定性降级摘要中，每条旧消息最多保留多少字符。"""
 
 
+class PermissionSettings(BaseSettings):
+    """权限配置：工具级 PDP + 行列级数据权限。
+
+    **默认全部不介入**（``enabled=False``、PDP 默认放行）—— 未配置时的行为与从前
+    完全一致；一旦配置规则，行/列级校验**fail closed**（改不了的 SQL 形状直接拒绝，
+    不勉强改写）。
+
+    ``rules`` 是行列级规则数组（JSON）：
+        [{"role": "analyst", "data_source": "pg_dev", "table": "sales",
+          "allow_columns": ["order_id", "dept_id", "amount"],
+          "row_filter": "dept_id = 7"}]
+    ``role`` 用 ``"*"`` 表示任意角色；``data_source`` 省略表示不限数据源。
+
+    ``pdp_rules`` 是工具级规则数组（JSON）：
+        [{"role": "analyst", "tool": "sql_query", "effect": "allow"}]
+    """
+
+    model_config = SettingsConfigDict(env_prefix="PERMISSION_", extra="ignore")
+
+    enabled: bool = False
+    """是否启用行列级数据权限（数据层强制注入 WHERE / 列白名单）。"""
+
+    rules: str = ""
+    """行列级规则（JSON 数组）。启用却为空会**显式报错**（空规则等于放行一切）。"""
+
+    unmatched_role: str = "deny"
+    """角色在规则表里一条都没命中时的态度：``deny``（默认）| ``allow``。
+
+    默认 ``deny``：规则表一旦启用就是白名单。默认放行会让"只给 analyst 写了规则"
+    静默变成"其他角色（含以 ``senior_analyst`` 运行的子 Agent）不受限"。
+    """
+
+    pdp_rules: str = ""
+    """工具级 PDP 规则（JSON 数组）；为空时工具级检查不做拦截。"""
+
+    pdp_default_policy: str = "allow"
+    """PDP 未命中任何规则时的默认策略：``allow`` | ``deny``。
+
+    默认 ``allow`` 是为了不改变既有行为（此前 PDP 根本没接进装配）；
+    要"默认拒绝"就把这里改成 ``deny`` 并显式列出允许项。
+    """
+
+
 class PIISettings(BaseSettings):
     """PII 脱敏配置（C4：自研中文规则层，不引 Presidio）。
 
@@ -318,9 +361,17 @@ class DataSourceSettings(BaseSettings):
 
     通过环境变量 ``DATASOURCE_SOURCES`` 配置多个命名数据源，值为 JSON 对象：
         {"mysql_prod": "mysql+pymysql://ro:pass@host:3306/db",
-         "pg_dwh": "postgresql+psycopg2://ro:pass@host:5432/dwh"}
+         "pg_dwh": "postgresql+psycopg://ro:pass@host:5432/dwh"}
+
+    注意驱动名：PG 用 **psycopg（v3）**，即 ``postgresql+psycopg://``。
+    写成 ``psycopg2`` 在本项目里连不上 —— 依赖里装的是 psycopg 3，没有 psycopg2
+    （早先此处示例写错，照抄即报 ModuleNotFoundError）。
+
     也支持简单的 ``name=url,name=url`` 形式（密码中的特殊字符请做 URL 编码）。
     SQLite 文件无需在此配置 —— sql_query 的 db_path 会自动注册只读源。
+
+    本地开发可 ``docker compose -f infra/docker-compose.yml up -d postgres mysql``
+    起库（端口 55432 / 53306，只读账号 harness_ro）。
     """
 
     model_config = SettingsConfigDict(env_prefix="DATASOURCE_", extra="ignore")
@@ -355,6 +406,7 @@ class Settings(BaseSettings):
     checkpoint: CheckpointSettings = Field(default_factory=CheckpointSettings)
     quality: QualitySettings = Field(default_factory=QualitySettings)
     pii: PIISettings = Field(default_factory=PIISettings)
+    permission: PermissionSettings = Field(default_factory=PermissionSettings)
     datasource: DataSourceSettings = Field(default_factory=DataSourceSettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
 
