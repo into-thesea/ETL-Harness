@@ -5,6 +5,7 @@
 - QualityGate：子任务交付前的确定性校验 + Critic 语义裁判，输出五种处置。
 """
 
+from harness.planning.data_quality import DataQualityChecker
 from harness.planning.gate import GateDecision, GateVerdict, QualityGate
 from harness.planning.planner import TaskPlanner
 from harness.planning.task_store import PlanValidationError, TaskStore
@@ -16,4 +17,5 @@ __all__ = [
     "QualityGate",
     "GateDecision",
     "GateVerdict",
+    "DataQualityChecker",
 ]

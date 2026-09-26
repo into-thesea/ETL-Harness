@@ -31,6 +31,7 @@ DEFAULT_AGENT_ROLES: dict[str, str] = {
     "chartist": "可视化工程师：依据结论选择图型，产出图表图片",
     "coder": "沙箱执行员：在隔离沙箱中运行自定义 pandas/python，完成复杂变换与临时建模",
     "reporter": "报告撰写员：汇总各步结论与图表，产出最终分析报告",
+    "qa": "QA/质检员：审查分析逻辑与方法论（幸存者偏差、辛普森悖论、数据泄露），只审不改",
     "executor": "通用执行员：当任务无法明确归入上述专业角色时使用",
 }
 
@@ -45,6 +46,8 @@ class TaskPlanner:
         broker: 可选 ToolBroker，用于把当前可用工具清单告诉规划器。
         available_agents: 可分派的子 Agent 名列表，默认用内置数据分析角色。
         default_agent: LLM 给出未知负责人时的回退角色。
+        middleware: 可选 MiddlewareManager；规划提示词里含用户原始目标，
+            出站前必须过 ``before_llm``（PII 脱敏覆盖规划器，不只有推理节点）。
     """
 
     def __init__(
@@ -53,11 +56,23 @@ class TaskPlanner:
         broker: Optional[ToolBroker] = None,
         available_agents: Optional[list[str]] = None,
         default_agent: str = DEFAULT_EXECUTOR,
+        middleware: Optional[Any] = None,
     ) -> None:
         self.llm = llm
         self.broker = broker
         self.roles = available_agents or list(DEFAULT_AGENT_ROLES.keys())
         self.default_agent = default_agent
+        self.middleware = middleware
+
+    def _outbound(self, messages: list[dict], operation: str) -> list[dict]:
+        """LLM 出站前过一遍 before_llm 钩子（无中间件时原样返回）。"""
+        if self.middleware is None:
+            return messages
+        from harness.middleware import MiddlewareContext
+
+        return self.middleware.exec_before_llm(
+            MiddlewareContext(operation=operation), messages
+        )
 
     # ------------------------------------------------------------------
     # Prompt 构造
@@ -192,7 +207,9 @@ class TaskPlanner:
     # ------------------------------------------------------------------
     def plan(self, goal: str, context: str = "") -> TaskPlan:
         """首次规划：目标 → TaskPlan（未持久化，交由 TaskStore.create_plan 校验保存）。"""
-        data = self.llm.chat_json(self._plan_messages(goal, context))
+        data = self.llm.chat_json(
+            self._outbound(self._plan_messages(goal, context), "plan")
+        )
         steps = self._parse_steps(data)
         plan = TaskPlan(goal=goal, tasks=steps)
         plan.current_task_id = steps[0].task_id if steps else None
@@ -202,7 +219,9 @@ class TaskPlanner:
 
     def replan(self, old_plan: TaskPlan, feedback: str = "") -> TaskPlan:
         """重规划：保留已完成步骤，追加 LLM 给出的新步骤，版本 +1。"""
-        data = self.llm.chat_json(self._replan_messages(old_plan, feedback))
+        data = self.llm.chat_json(
+            self._outbound(self._replan_messages(old_plan, feedback), "replan")
+        )
         new_steps = self._parse_steps(data)
 
         done = [

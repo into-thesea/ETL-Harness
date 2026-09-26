@@ -382,6 +382,18 @@ class PlanExecuteNodes:
                 f"原始目标：{plan.goal}\n\n各子任务结论：\n{findings}"
             )},
         ]
+        if self.middleware is not None:
+            from harness.middleware import MiddlewareContext
+
+            messages = self.middleware.exec_before_llm(
+                MiddlewareContext(
+                    operation="synthesize",
+                    trace_id=state.get("trace_id"),
+                    session_id=state.get("session_id"),
+                    role=state.get("role"),
+                ),
+                messages,
+            )
         try:
             final = self.llm.chat(messages)
         except Exception as e:  # noqa: BLE001 - 汇总失败也要把已有结论交付

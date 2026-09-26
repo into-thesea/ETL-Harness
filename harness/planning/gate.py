@@ -66,10 +66,14 @@ class QualityGate:
         llm: Any = None,
         use_critic: bool = False,
         artifact_checker: Optional[ArtifactChecker] = None,
+        data_quality_checker: Optional[Any] = None,
+        middleware: Optional[Any] = None,
     ) -> None:
         self.llm = llm
         self.use_critic = use_critic
         self.artifact_checker = artifact_checker
+        self.data_quality_checker = data_quality_checker
+        self.middleware = middleware
 
     # ------------------------------------------------------------------
     def evaluate(self, task: TaskStep, result: SubAgentResult) -> GateVerdict:
@@ -88,7 +92,17 @@ class QualityGate:
             if not ok:
                 hard_reasons.append(f"产物校验未通过：{msg}")
 
-        # 2) Critic 语义裁判（可选）
+        # 2) 数据质量红线（确定性）：越线直接转人工，且不浪费一次 LLM 裁判
+        if self.data_quality_checker is not None:
+            try:
+                pause_reason = self.data_quality_checker.check(task, result)
+            except Exception as e:  # noqa: BLE001 - 检查器自身异常不能吞掉，升级为人工
+                pause_reason = f"数据质量检查器异常：{type(e).__name__}: {e}"
+            if pause_reason:
+                logger.warning("Gate HUMAN (data quality) for %s: %s", task.title, pause_reason)
+                return GateVerdict(decision=GateDecision.HUMAN, note=pause_reason)
+
+        # 3) Critic 语义裁判（可选）
         critic_passed, critic_note, needs_human, checked = True, "", False, False
         if self.use_critic and self.llm is not None and task.acceptance_criteria:
             critic_passed, critic_note, needs_human, checked = self._critic_judge(task, result)
@@ -139,7 +153,11 @@ class QualityGate:
                 "\"needs_human\": true/false}。\n"
                 "判定原则：逐条对照验收标准，结论必须由给出的证据支撑；证据不足、结论与"
                 "产物矛盾则 passed=false；若涉及高风险操作、结论自相矛盾或无法据现有信息"
-                "判定，置 needs_human=true。不要替执行方编造结果。"
+                "判定，置 needs_human=true。不要替执行方编造结果。\n"
+                "若结论涉及统计分析，还须检查三类常见逻辑缺陷，并在 reason 中点名："
+                "① 幸存者偏差（样本只覆盖了幸存/可见的部分）；② 辛普森悖论（分组趋势与"
+                "整体趋势相反）；③ 数据泄露（目标泄漏：用到了分析时点不可得的信息，"
+                "如结果字段参与了特征或口径）。发现任一项即 passed=false。"
             )},
             {"role": "user", "content": (
                 f"子任务：{task.title}\n任务说明：{task.description}\n"
@@ -147,6 +165,12 @@ class QualityGate:
                 f"子 Agent 结论：\n{result.conclusion}\n\n产物：\n{artifacts}"
             )},
         ]
+        if self.middleware is not None:
+            from harness.middleware import MiddlewareContext
+
+            messages = self.middleware.exec_before_llm(
+                MiddlewareContext(operation="critic"), messages
+            )
         try:
             data = self.llm.chat_json(messages)
             return (

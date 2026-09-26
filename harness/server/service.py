@@ -19,7 +19,7 @@ from harness.agents.registry import AgentRegistry
 from harness.audit import get_audit_logger
 from harness.context import ContextManager
 from harness.orchestrator import build_plan_execute_graph, make_plan_execute_state
-from harness.planning import QualityGate, TaskPlanner, TaskStore
+from harness.planning import DataQualityChecker, QualityGate, TaskPlanner, TaskStore
 from harness.tool_broker import ToolBroker
 from harness.vfs import VirtualFileSystem
 from tools import register_builtin_tools
@@ -86,13 +86,28 @@ class HarnessService:
     # ------------------------------------------------------------------
     def assemble(self) -> Any:
         """构造全部组件并编译图，返回编译后的图。"""
-        broker = ToolBroker(audit_logger=get_audit_logger())
+        from harness.config import settings
+        from harness.middleware import MiddlewareManager, PIIDetectionMiddleware
+
+        # 中间件链：PII 脱敏是**横切管控点**（D: 管控点横切，不侵入业务），
+        # 必须同时挂到两条通路上 —— LLM 钩子走图的 middleware，工具钩子走 broker。
+        middleware = MiddlewareManager()
+        middleware.register(PIIDetectionMiddleware(settings.pii))
+
+        broker = ToolBroker(middleware_manager=middleware, audit_logger=get_audit_logger())
         register_builtin_tools(broker)
         registry = AgentRegistry()
         store = TaskStore(backend="memory")
         llm = self._llm_override or self._select_llm()
-        gate = QualityGate(llm=llm, use_critic=False)  # 关闭语义 Critic，只跑硬校验
-        planner = TaskPlanner(llm, broker=broker, available_agents=registry.names())
+        gate = QualityGate(
+            llm=llm,
+            use_critic=settings.quality.critic_enabled,
+            data_quality_checker=DataQualityChecker(settings.quality),
+            middleware=middleware,
+        )
+        planner = TaskPlanner(
+            llm, broker=broker, available_agents=registry.names(), middleware=middleware
+        )
         context_manager = ContextManager(vfs=VirtualFileSystem())
 
         # Skill 技能系统：加载 harness/skills 下全部 SKILL.md 并透传给图，
@@ -106,12 +121,10 @@ class HarnessService:
         skill_registry.load_directory(skills_dir)
 
         # 多数据源（C5）：从 DATASOURCE_SOURCES 加载命名 MySQL/PostgreSQL 源
-        from harness.config import settings as _settings
-
         from harness.datasources import DataSourceManager
 
         datasources = DataSourceManager()
-        datasources.load_from_settings(_settings.datasource)
+        datasources.load_from_settings(settings.datasource)
         self.datasources = datasources
 
         self.llm = llm
@@ -119,6 +132,7 @@ class HarnessService:
             llm, broker,
             planner=planner, store=store, registry=registry, gate=gate,
             checkpointer=self.checkpointer,
+            middleware=middleware,
             context_manager=context_manager,
             skill_registry=skill_registry,
             datasources=datasources,

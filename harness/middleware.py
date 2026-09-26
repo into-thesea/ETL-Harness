@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from abc import ABC
@@ -189,52 +190,177 @@ class RetryMiddleware(Middleware):
         return result
 
 
-class PIIDetectionMiddleware(Middleware):
-    """PII 检测中间件：识别和脱敏敏感信息（手机号/身份证/邮箱/银行卡等）。
+# ---------------------------------------------------------------------------
+# 中文 PII 规则层（模块级纯函数：可单测，也可被非中间件路径复用）
+# ---------------------------------------------------------------------------
+# GB 11643 身份证校验位
+_ID_WEIGHTS = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
+_ID_CHECK_CODES = "10X98765432"
 
-    在工具调用前检查参数中的 PII，在工具调用后检查结果中的 PII。
+# 前后加 `(?<!\d)/(?!\d)` 边界：不从更长的数字串里切出"手机号/卡号"
+_ID_CARD = re.compile(r"(?<!\d)(\d{17}[\dXx])(?!\d)")
+_PHONE = re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")
+_BANK_CARD = re.compile(r"(?<!\d)(\d{16,19})(?!\d)")
+_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+MASK_PREFIX = "[MASKED_"
+
+
+def valid_id_card(value: str) -> bool:
+    """按 GB 11643 校验 18 位身份证（校验位不符即不是身份证）。"""
+    if len(value) != 18 or not value[:17].isdigit():
+        return False
+    total = sum(int(d) * w for d, w in zip(value[:17], _ID_WEIGHTS))
+    return value[17].upper() == _ID_CHECK_CODES[total % 11]
+
+
+def luhn_ok(value: str) -> bool:
+    """Luhn 校验（银行卡）；纯 16~19 位数字不等于卡号。"""
+    total = 0
+    for index, char in enumerate(reversed(value)):
+        digit = int(char)
+        if index % 2 == 1:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        total += digit
+    return total % 10 == 0
+
+
+def mask_text(text: str, *, validate_checksum: bool = True) -> tuple[str, dict[str, int]]:
+    """脱敏文本中的 PII，返回 ``(脱敏后文本, {类型: 命中数})``。
+
+    顺序有意义：身份证先于银行卡 —— 身份证本身就是 18 位数字，先替换掉才不会
+    被后面的卡号规则重复处理。``validate_checksum=False`` 时只按形态命中。
+    """
+    if not text:
+        return text, {}
+
+    counts: dict[str, int] = {}
+
+    def _replace(pattern, kind: str, validator=None):
+        def _sub(match):  # type: ignore[no-untyped-def]
+            value = match.group(1)
+            if validate_checksum and validator is not None and not validator(value):
+                return value
+            counts[kind] = counts.get(kind, 0) + 1
+            return f"{MASK_PREFIX}{kind.upper()}]"
+
+        return pattern.sub(_sub, text)
+
+    text = _replace(_ID_CARD, "id_card", valid_id_card)
+    text = _replace(_PHONE, "phone")
+    text = _replace(_BANK_CARD, "bank_card", luhn_ok)
+
+    def _sub_email(match):  # type: ignore[no-untyped-def]
+        counts["email"] = counts.get("email", 0) + 1
+        return f"{MASK_PREFIX}EMAIL]"
+
+    text = _EMAIL.sub(_sub_email, text)
+    return text, counts
+
+
+def mask_value(value: Any, *, validate_checksum: bool = True) -> Any:
+    """递归脱敏结构化数据里的字符串（工具产物的真实行数据在这里）。"""
+    if isinstance(value, str):
+        return mask_text(value, validate_checksum=validate_checksum)[0]
+    if isinstance(value, dict):
+        return {
+            key: mask_value(item, validate_checksum=validate_checksum)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return type(value)(
+            mask_value(item, validate_checksum=validate_checksum) for item in value
+        )
+    return value
+
+
+class PIIDetectionMiddleware(Middleware):
+    """PII 检测中间件：识别并脱敏敏感信息（手机号/身份证/邮箱/银行卡）。
+
+    覆盖三个方向：
+    - ``before_llm``：**发给模型的提示词**（隐私的关键出站口）；
+    - ``before_tool``：工具入参（SQL/代码除外，见 ``PII_SKIP_TOOLS``）；
+    - ``after_tool``：工具返回文本**与结构化产物**（真实行数据在 artifacts 里，
+      早期版本只脱敏文本，等于没脱敏）。
+
+    规则层是模块级 :func:`mask_text`，便于单测。
     """
 
-    import re
+    def __init__(self, config: Optional[Any] = None):
+        """Args:
+            config: ``PIISettings`` 配置段；``None`` 时取全局配置。
+        """
+        if config is None:
+            from harness.config import settings
 
-    # 简单的 PII 正则模式
-    _PATTERNS = {
-        "phone": re.compile(r"1[3-9]\d{9}"),
-        "id_card": re.compile(r"\d{17}[\dXx]"),
-        "email": re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"),
-        "bank_card": re.compile(r"\d{16,19}"),
-    }
+            config = settings.pii
+        self.settings = config
+        self.validate_checksum = bool(getattr(config, "validate_checksum", True))
+        self.mask_artifacts = bool(getattr(config, "mask_artifacts", True))
+        self.skip_tools = {
+            name.strip()
+            for name in str(getattr(config, "skip_tools", "") or "").split(",")
+            if name.strip()
+        }
+        super().__init__(
+            MiddlewareConfig(
+                name="pii_detection",
+                enabled=bool(getattr(config, "enabled", True)),
+                priority=90,
+                hook_points=[
+                    HookPoint.BEFORE_LLM,
+                    HookPoint.BEFORE_TOOL,
+                    HookPoint.AFTER_TOOL,
+                ],
+            )
+        )
 
-    def __init__(self, config: Optional[MiddlewareConfig] = None):
-        super().__init__(config or MiddlewareConfig(name="pii_detection", priority=90, hook_points=[HookPoint.BEFORE_TOOL, HookPoint.AFTER_TOOL]))
-
-    def _mask(self, text: str) -> tuple[str, dict[str, int]]:
-        """脱敏文本中的 PII，返回脱敏后文本和各类型计数。"""
-        counts = {}
-        for pii_type, pattern in self._PATTERNS.items():
-            matches = pattern.findall(text)
-            if matches:
-                counts[pii_type] = len(matches)
-                text = pattern.sub(f"[MASKED_{pii_type.upper()}]", text)
-        return text, counts
+    # ---- Hooks -------------------------------------------------------
+    def before_llm(self, ctx, messages: list[dict], **kwargs) -> list[dict]:
+        if not self.enabled:
+            return messages
+        masked_messages: list[dict] = []
+        for message in messages:
+            if isinstance(message, dict) and isinstance(message.get("content"), str):
+                masked, counts = mask_text(
+                    message["content"], validate_checksum=self.validate_checksum
+                )
+                if counts:
+                    logger.warning("[PII] detected in prompt | types=%s", counts)
+                    message = {**message, "content": masked}
+            masked_messages.append(message)
+        return masked_messages
 
     def before_tool(self, ctx, tool_name, args, **kwargs):
-        # 检查字符串参数中的 PII
+        if not self.enabled:
+            return tool_name, args
+        if tool_name in self.skip_tools:
+            # SQL/代码里的号码是查询条件/字面量，脱敏会把语义改坏
+            return tool_name, args
         for key, value in args.items():
             if isinstance(value, str):
-                masked, counts = self._mask(value)
+                masked, counts = mask_text(value, validate_checksum=self.validate_checksum)
                 if counts:
-                    logger.warning("[PII] detected in args | tool=%s | key=%s | types=%s", tool_name, key, counts)
+                    logger.warning(
+                        "[PII] detected in args | tool=%s | key=%s | types=%s",
+                        tool_name, key, counts,
+                    )
                     args[key] = masked
         return tool_name, args
 
     def after_tool(self, ctx, tool_name, result, **kwargs):
+        if not self.enabled:
+            return result
         ok, text, artifacts = result
         if text:
-            masked, counts = self._mask(text)
+            masked, counts = mask_text(text, validate_checksum=self.validate_checksum)
             if counts:
                 logger.warning("[PII] detected in result | tool=%s | types=%s", tool_name, counts)
                 text = masked
+        if self.mask_artifacts and artifacts:
+            artifacts = mask_value(artifacts, validate_checksum=self.validate_checksum)
         return ok, text, artifacts
 
 

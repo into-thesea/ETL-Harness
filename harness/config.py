@@ -249,6 +249,54 @@ class ContextSettings(BaseSettings):
     """确定性降级摘要中，每条旧消息最多保留多少字符。"""
 
 
+class PIISettings(BaseSettings):
+    """PII 脱敏配置（C4：自研中文规则层，不引 Presidio）。
+
+    规则命中即替换为 ``[MASKED_手机号]`` 形式的占位符。校验位/号段/Luhn 校验
+    默认开启：不校验的话，普通 18 位编号会被误当身份证、16 位订单号会被误当卡号。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="PII_", extra="ignore")
+
+    enabled: bool = True
+    """是否启用 PII 脱敏。"""
+
+    validate_checksum: bool = True
+    """是否校验身份证校验位 / 银行卡 Luhn；关闭则只按正则形态命中。"""
+
+    mask_artifacts: bool = True
+    """是否脱敏工具返回的结构化产物（真实行数据在这里，不脱敏等于没脱敏）。"""
+
+    skip_tools: str = "sql_query,code_executor"
+    """入参不脱敏的工具（逗号分隔）。
+
+    SQL 与代码里的号码是**查询条件/字面量**：脱敏会把查询改坏、把程序改错，
+    结果与原始数据不再一致 —— 这不是可选优化，是正确性要求。
+    """
+
+
+class QualitySettings(BaseSettings):
+    """质量门配置：确定性数据质量红线 + Critic 语义裁判。
+
+    数据质量红线是**确定性**的（缺失率/重复率超阈值 → 暂停分析待人工确认）；
+    Critic 是对照验收标准的 LLM 语义裁判（审查分析逻辑缺陷，见 gate.py）。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="QUALITY_", extra="ignore")
+
+    data_check_enabled: bool = True
+    """是否启用确定性数据质量校验（缺失率/重复率红线）。"""
+
+    missing_rate_max: float = 0.3
+    """单列缺失率上限（0..1）；**超过**（不含等于）即暂停分析。"""
+
+    duplicate_rate_max: float = 0.3
+    """整表重复率上限（0..1）；**超过**即暂停分析。"""
+
+    critic_enabled: bool = True
+    """是否启用质量门 Critic（每个子任务一次 LLM 裁判）。关闭可省调用。"""
+
+
 class CheckpointSettings(BaseSettings):
     """图状态检查点配置（审批 interrupt 的持久化）。
 
@@ -305,6 +353,8 @@ class Settings(BaseSettings):
     memory: MemorySettings = Field(default_factory=MemorySettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
     checkpoint: CheckpointSettings = Field(default_factory=CheckpointSettings)
+    quality: QualitySettings = Field(default_factory=QualitySettings)
+    pii: PIISettings = Field(default_factory=PIISettings)
     datasource: DataSourceSettings = Field(default_factory=DataSourceSettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
 

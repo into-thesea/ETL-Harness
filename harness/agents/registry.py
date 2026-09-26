@@ -7,8 +7,10 @@ PDP 角色、步数/超时上限。Orchestrator 在 Dispatch 时按 TaskStep.ass
 
 内置数据分析 / ETL 专家团队：
     inspector 体检 → cleaner 清洗 → analyst 分析 → chartist/coder 图表/沙箱
-    → reporter 报告；executor 为不受限的通用执行员。
-    critic（质量门裁判）与 supervisor（主控）不作为执行子 Agent 注册。
+    → reporter 报告；qa 审查分析逻辑（可按需插入）；executor 为不受限的通用执行员。
+    critic（质量门裁判）与 supervisor（主控）不作为执行子 Agent 注册 ——
+    qa 不同：它是**可被派发的审查子任务**（有自己的工具与步数预算），
+    而 critic 是质量门内部对每个子任务的一次性裁判调用，两者互补而非重复。
 """
 
 from __future__ import annotations
@@ -99,6 +101,28 @@ def build_default_agents() -> dict[str, SubAgentDef]:
             required_role="analyst",
             max_steps=4,
             timeout_seconds=120,
+        ),
+        SubAgentDef(
+            name="qa",
+            description=(
+                "QA/质检员：审查分析逻辑与方法论 —— 幸存者偏差、辛普森悖论、"
+                "数据泄露（目标泄漏），只审不改"
+            ),
+            system_prompt=(
+                "你是 QA/质检员（qa）。你**只审查、不修改**他人的分析，职责是挑出"
+                "方法论与逻辑缺陷：\n"
+                "1) 幸存者偏差：样本是否只覆盖了「幸存」或可见的部分；\n"
+                "2) 辛普森悖论：分组结论与整体结论是否方向相反（按关键维度复核）；\n"
+                "3) 数据泄露（目标泄漏）：是否用到了分析时点不可得的信息，"
+                "例如结果字段参与了特征或口径。\n"
+                "必要时用工具核实（data_inspector 看数据、eda / sql_query 复核数字）；"
+                "所有质疑必须给出证据与具体位置，不得凭感觉否定；"
+                "没有发现问题就明确说没有，不要为了交差编造问题。"
+            ),
+            tools=["data_inspector", "eda", "sql_query"],
+            required_role="analyst",
+            max_steps=8,
+            timeout_seconds=180,
         ),
         SubAgentDef(
             name="executor",
