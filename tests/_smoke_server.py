@@ -99,7 +99,7 @@ class _ApprovalLLM:
 # ----------------------------------------------------------------------
 # 1 & 2：健康检查 + 主流程
 # ----------------------------------------------------------------------
-def test_main_flow() -> str:
+def test_main_flow() -> None:
     service = _offline_service()
     app = create_app(service)
     with TestClient(app) as client:
@@ -122,8 +122,6 @@ def test_main_flow() -> str:
                         json={"approved": True, "comment": ""})
         assert r.status_code == 409, f"expected 409, got {r.status_code}"
         print("[4] 无待审批项提交 → 409 ok")
-
-    return thread_id
 
 
 # ----------------------------------------------------------------------

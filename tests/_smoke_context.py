@@ -164,5 +164,10 @@ def main() -> None:
     print("ALL CONTEXT SMOKE TESTS PASSED")
 
 
+def test_context() -> None:
+    """pytest 入口：运行 main()。"""
+    main()
+
+
 if __name__ == "__main__":
     main()

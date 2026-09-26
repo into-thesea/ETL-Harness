@@ -68,7 +68,13 @@ class DataSourceManager:
             if cfg.name in self._configs:
                 logger.warning("datasource %r re-registered", cfg.name)
             self._configs[cfg.name] = cfg
-            self._engines.pop(cfg.name, None)
+            self._dispose_engine_locked(cfg.name)
+
+    def _dispose_engine_locked(self, name: str) -> None:
+        """丢弃并关闭某源缓存的 Engine，避免连接泄漏（调用方须持锁）。"""
+        old = self._engines.pop(name, None)
+        if old is not None:
+            old.dispose()
 
     def register_sqlite(self, name: str, path: str) -> Engine:
         """注册（或取回）一个 SQLite 文件的只读源，返回其 Engine。
@@ -84,7 +90,7 @@ class DataSourceManager:
         ).render_as_string(hide_password=False)
         with self._lock:
             self._configs[name] = DataSourceConfig(name=name, url=url)
-            self._engines.pop(name, None)
+            self._dispose_engine_locked(name)
             return self._get_or_build(name)
 
     def load_from_settings(self, datasource_settings: Any) -> int:

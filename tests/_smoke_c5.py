@@ -14,6 +14,9 @@ import os
 import sqlite3
 import tempfile
 
+import pytest
+
+import tools.sql_query as sq
 from harness.datasources import DataSourceManager
 from tools.sql_query import handle
 
@@ -31,6 +34,29 @@ def _make_db(d: str, rows: int = 20) -> str:
     return db
 
 
+@pytest.fixture
+def db() -> str:
+    """pytest：每个用例一个独立的临时 SQLite 库。"""
+    return _make_db(tempfile.mkdtemp())
+
+
+@pytest.fixture
+def manager() -> DataSourceManager:
+    """pytest：用例结束自动 dispose，避免 Engine 持有未关闭的 sqlite 连接。"""
+    mgr = DataSourceManager()
+    yield mgr
+    mgr.close()
+
+
+@pytest.fixture(autouse=True)
+def _reset_default_manager() -> None:
+    """db_path 路径会懒建进程级 _default_manager；用例后关闭并复位。"""
+    yield
+    if sq._default_manager is not None:
+        sq._default_manager.close()
+        sq._default_manager = None
+
+
 def test_sqlite_path(db: str) -> None:
     ok, text, arts = handle(
         {"db_path": db,
@@ -45,19 +71,18 @@ def test_sqlite_path(db: str) -> None:
     print("[1] db_path SQLite 只读聚合查询 ok")
 
 
-def test_named_source(db: str) -> None:
-    mgr = DataSourceManager()
-    mgr.register_sqlite("mem", db)
+def test_named_source(db: str, manager: DataSourceManager) -> None:
+    manager.register_sqlite("mem", db)
     ok, text, arts = handle(
         {"data_source": "mem", "sql": "SELECT COUNT(*) AS n FROM sales"},
-        {"data_source_manager": mgr},
+        {"data_source_manager": manager},
     )
     assert ok, text
     assert arts["sql_result"]["rows"][0][0] == 20
 
     # 未注册的数据源 → 失败
     ok2, _, _ = handle({"data_source": "nope", "sql": "SELECT 1"},
-                       {"data_source_manager": mgr})
+                       {"data_source_manager": manager})
     assert not ok2
     print("[2] 命名数据源（经装配点 manager 透传）ok")
 
@@ -109,17 +134,16 @@ def test_params(db: str) -> None:
     print("[5] dict(:name) 与 list(?) 参数化均 ok")
 
 
-def test_settings_load(db: str) -> None:
+def test_settings_load(db: str, manager: DataSourceManager) -> None:
     from types import SimpleNamespace
 
     from sqlalchemy import text
 
-    mgr = DataSourceManager()
     db_url = db.replace("\\", "/")
     sources = json.dumps({"mem": f"sqlite:///file:{db_url}?mode=ro&uri=true"})
-    assert mgr.load_from_settings(SimpleNamespace(sources=sources)) == 1
-    assert mgr.has("mem")
-    with mgr.get_engine("mem").connect() as conn:
+    assert manager.load_from_settings(SimpleNamespace(sources=sources)) == 1
+    assert manager.has("mem")
+    with manager.get_engine("mem").connect() as conn:
         assert conn.execute(text("SELECT COUNT(*) FROM sales")).fetchone()[0] == 20
     print("[6] DATASOURCE_SOURCES(JSON) 加载并可查 ok")
 
@@ -133,14 +157,20 @@ def test_missing_source() -> None:
 def _main() -> None:
     d = tempfile.mkdtemp()
     db = _make_db(d)
-    test_sqlite_path(db)
-    test_named_source(db)
-    test_safety(db)
-    test_forced_limit(db)
-    test_params(db)
-    test_settings_load(db)
-    test_missing_source()
-    print("\n=== C5（SQLAlchemy 多数据源只读）冒烟全部通过 ===")
+    manager = DataSourceManager()
+    try:
+        test_sqlite_path(db)
+        test_named_source(db, manager)
+        test_safety(db)
+        test_forced_limit(db)
+        test_params(db)
+        test_settings_load(db, manager)
+        test_missing_source()
+        print("\n=== C5（SQLAlchemy 多数据源只读）冒烟全部通过 ===")
+    finally:
+        manager.close()
+        if sq._default_manager is not None:
+            sq._default_manager.close()
 
 
 if __name__ == "__main__":

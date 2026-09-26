@@ -22,6 +22,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 from harness.mcp_adapter import MCPClientAdapter
 from harness.tool_broker import ToolBroker
 from tools.common import project_root
@@ -43,6 +45,14 @@ def _connect() -> MCPClientAdapter:
         cwd=project_root(),
         name="test-server",
     )
+
+
+@pytest.fixture(scope="module")
+def adapter() -> MCPClientAdapter:
+    """pytest：模块级共享一个 stdio 连接，全部用例结束后关闭。"""
+    a = _connect()
+    yield a
+    a.close()
 
 
 def test_m1_list_remote_tools(adapter: MCPClientAdapter) -> None:

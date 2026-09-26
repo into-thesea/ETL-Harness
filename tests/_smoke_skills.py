@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 
+import pytest
+
 import harness
 from harness.skills import SkillRegistry
 from harness.tool_broker import ToolBroker
@@ -17,12 +19,23 @@ from harness.graph import build_executor_graph, make_executor_state
 SKILLS_DIR = os.path.join(os.path.dirname(harness.__file__), "skills")
 
 
-def test_load() -> SkillRegistry:
+def _build_registry() -> SkillRegistry:
+    """加载全部 Skill 并断言数量（test / fixture / _main 共用）。"""
     reg = SkillRegistry()
     n = reg.load_directory(SKILLS_DIR)
     assert n == 6, f"应加载 6 个 Skill，实际 {n}"
-    print(f"[1] 加载 {n} 个 Skill ok：", ", ".join(reg.names()))
     return reg
+
+
+def test_load() -> None:
+    reg = _build_registry()
+    print(f"[1] 加载 6 个 Skill ok：", ", ".join(reg.names()))
+
+
+@pytest.fixture(scope="module")
+def reg() -> SkillRegistry:
+    """pytest：模块级共享一个已加载全部 Skill 的注册中心。"""
+    return _build_registry()
 
 
 def test_match(reg: SkillRegistry) -> None:
@@ -94,7 +107,7 @@ def test_injection(reg: SkillRegistry) -> None:
 
 
 def _main() -> None:
-    reg = test_load()
+    reg = _build_registry()
     test_match(reg)
     test_topk_and_whitelist(reg)
     test_render_budget()

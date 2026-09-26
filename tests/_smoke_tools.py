@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 import tempfile
 
+import pytest
+
 import pandas as pd
 
 from harness.tool_broker import ToolBroker
@@ -305,6 +307,12 @@ def test_sql_query() -> None:
     assert not ok
     print("7. sql_query 只读查询 ok（聚合/自动LIMIT/参数化/写操作DDL多语句拦截）")
 
+    # 释放 db_path 懒建的进程级默认 manager 持有的 sqlite 连接
+    import tools.sql_query as _sq
+    if _sq._default_manager is not None:
+        _sq._default_manager.close()
+        _sq._default_manager = None
+
 
 def test_chart_generator() -> None:
     tmp = tempfile.mkdtemp(prefix="etl_chart_")
@@ -340,6 +348,7 @@ def test_chart_generator() -> None:
     print("8. chart_generator 出图 ok（bar/line/hist/pie/heatmap/auto 选型，PNG 落盘）")
 
 
+@pytest.mark.needs_sandbox
 def test_code_executor() -> None:
     """沙箱代码执行：经 OpenSandbox 隔离容器执行，含双层文件平面往返。
 
