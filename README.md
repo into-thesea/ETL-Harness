@@ -2,6 +2,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-1.x-6b72db.svg)](https://github.com/langchain-ai/langgraph)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 一个用于构建、运行和管控 LLM Agent 的框架。用 LangGraph 做编排骨架，围绕它手写了一层管控运行时（工具调度、权限、记忆、审批、沙箱、审计与追踪），并内置一条端到端的数据分析工作流作为首个领域实例。
 
@@ -216,8 +217,7 @@ ETL-Harness/
 - [ ] 沙箱控制面纳入 docker-compose（当前用独立脚本过渡）
 - [ ] 真实 MySQL/PostgreSQL 端到端联调
 - [ ] 补充架构设计文档、提升测试覆盖率
-- [ ] 添加开源协议（LICENSE）
 
 ## License
 
-项目尚未添加 LICENSE 文件，计划在开源准备阶段确定协议（见 Roadmap）。在此之前默认保留所有权利。
+基于 [MIT License](LICENSE) 开源。
