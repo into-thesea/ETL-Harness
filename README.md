@@ -549,25 +549,52 @@ python examples\mock_llm_demo.py
 
 ### 7.4 启动 FastAPI 服务
 
+服务端**默认开启鉴权**：未配置令牌会**直接启动失败**（避免"以为开了、实际没开"）。先配令牌：
+
 ```bash
-python -m uvicorn harness.server.app:app --host 0.0.0.0 --port 8000 --reload
+# .env
+AUTH_ENABLED=true
+AUTH_TOKENS={"<长随机令牌>":{"role":"analyst","name":"张三"},"<另一个令牌>":{"role":"admin","name":"李四"}}
+AUTH_APPROVER_ROLES=admin
 ```
 
-访问 http://localhost:8000/docs 查看 API 文档。
+启动：
+
+```bash
+python -m uvicorn --factory harness.server.app:create_app --host 0.0.0.0 --port 8000
+```
+
+> 注意 `--factory`：应用由 `create_app()` 工厂构造，模块里**没有** `app` 变量。
+> `/docs`、`/openapi.json` 同样需要令牌；只有 `/health` 匿名（给探活用）。
+> 本机开发可设 `AUTH_ENABLED=false`：服务端会打 WARNING，且只有一个身份（admin）。
 
 ### 7.5 调用 Agent API
 
-```bash
-# 同步调用
-curl -X POST http://localhost:8000/api/v1/agent/run \
-  -H "Content-Type: application/json" \
-  -d '{"goal": "分析这份销售数据的趋势", "role": "analyst"}'
+所有业务路由都需要 `Authorization: Bearer <令牌>`；**角色由令牌决定**，请求体里没有 `role` 字段。
 
-# 流式调用（SSE）
-curl -N http://localhost:8000/api/v1/agent/stream \
-  -H "Content-Type: application/json" \
+```bash
+TOKEN=<令牌>
+
+# 创建任务
+curl -X POST http://localhost:8000/api/v1/tasks \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"goal": "分析这份销售数据的趋势"}'
+
+# 查询状态 / 待审批项（THREAD 为上一步返回的 thread_id）
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/tasks/$THREAD
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/tasks/$THREAD/approvals
+
+# 提交审批：需审批角色，且**不能批准自己发起的任务**
+curl -X POST http://localhost:8000/api/v1/tasks/$THREAD/approval \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"approved": false, "comment": "来源不明，不允许"}'
+
+# 流式订阅：浏览器原生 EventSource 不能设请求头，故**这条路由**额外接受 ?token=
+curl -N "http://localhost:8000/api/v1/tasks/$THREAD/stream?token=$TOKEN"
 ```
+
+**迁移提示（2026-09-27 起）**：旧客户端若在请求体里传 `role`，会被忽略（不报错，但也不再生效）；
+请改为在 `AUTH_TOKENS` 里给对应令牌配角色。
 
 ---
 

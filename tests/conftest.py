@@ -24,6 +24,10 @@ import pytest
 # 必须在这里设置 —— harness.config 的配置单例在首次 import 时成型。
 os.environ.setdefault("CHECKPOINT_BACKEND", "memory")
 
+# 服务端鉴权默认在测试里关掉：绝大多数用例测的是业务链路，不该每条都先换令牌。
+# **鉴权本身**由 tests/test_server_auth.py 显式打开后专项覆盖（401/403/角色来源）。
+os.environ.setdefault("AUTH_ENABLED", "false")
+
 
 def pytest_addoption(parser) -> None:
     parser.addoption(

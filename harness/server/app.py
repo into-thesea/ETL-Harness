@@ -8,10 +8,11 @@ import logging
 import time
 from typing import Any, Optional
 
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
 from harness.server import schemas
+from harness.server.auth import build_authenticator, install_auth, principal_of
 from harness.server.service import VERSION, HarnessService
 
 logger = logging.getLogger(__name__)
@@ -26,13 +27,19 @@ def _json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
-def _build_router(service: HarnessService) -> APIRouter:
+def _build_router(service: HarnessService, auth: Any) -> APIRouter:
     router = APIRouter(prefix="/api/v1")
+    _auth = auth
 
     # ---------------- 任务创建 ----------------
     @router.post("/tasks", response_model=schemas.CreateTaskResponse)
-    async def create_task(req: schemas.CreateTaskRequest) -> schemas.CreateTaskResponse:
-        thread_id = await service.create_task(req.goal, req.context, req.role)
+    async def create_task(
+        req: schemas.CreateTaskRequest, request: Request
+    ) -> schemas.CreateTaskResponse:
+        # 角色**只能来自令牌**：请求体里即便带了 role 也不作数（见 auth.py）
+        principal = principal_of(request)
+        thread_id = await service.create_task(req.goal, req.context, principal.role)
+        logger.info("任务创建：%s by %s(%s)", thread_id, principal.name, principal.role)
         return schemas.CreateTaskResponse(thread_id=thread_id, status="running")
 
     # ---------------- 任务状态 ----------------
@@ -54,14 +61,33 @@ def _build_router(service: HarnessService) -> APIRouter:
     # ---------------- 提交审批 ----------------
     @router.post("/tasks/{thread_id}/approval", response_model=schemas.TaskStatusResponse)
     async def submit_approval(
-        thread_id: str, req: schemas.ApprovalRequest
+        thread_id: str, req: schemas.ApprovalRequest, request: Request
     ) -> schemas.TaskStatusResponse:
+        # 审批是风险闸门：先卡"是不是审批人"，再由 service 卡"不能自批"（职责分离）
+        principal = principal_of(request)
+        if not _auth.is_approver(principal):
+            logger.warning("审批被拒（非审批角色）：%s by %s(%s)",
+                           thread_id, principal.name, principal.role)
+            raise HTTPException(
+                status_code=403,
+                detail=f"角色 {principal.role!r} 无权审批（需 {sorted(_auth.approver_roles)}）",
+            )
+        # 开发模式（鉴权关闭）只有一个身份，职责分离无从成立 → 不传 approver_role
         try:
-            status = await service.submit_approval(thread_id, req.approved, req.comment)
+            status = await service.submit_approval(
+                thread_id,
+                req.approved,
+                req.comment,
+                approver_role=principal.role if principal.authenticated else "",
+            )
         except KeyError:
             raise HTTPException(status_code=404, detail=f"任务 {thread_id} 不存在")
+        except PermissionError as e:
+            raise HTTPException(status_code=403, detail=str(e))
         except RuntimeError as e:
             raise HTTPException(status_code=409, detail=str(e))
+        logger.info("审批提交：%s approved=%s by %s(%s)",
+                    thread_id, req.approved, principal.name, principal.role)
         return schemas.TaskStatusResponse(**status)
 
     # ---------------- SSE 流式订阅 ----------------
@@ -133,13 +159,16 @@ def create_app(service: Optional[HarnessService] = None) -> FastAPI:
             落盘 SQLite；LLM 自动选择）。
     """
     svc = service or HarnessService()
+    # 鉴权器先构造：配置缺失/非法时**启动即失败**（不要静默放行）
+    auth = build_authenticator()
     app = FastAPI(
         title="ETL-Harness 数据分析服务",
         version=VERSION,
         description="工业级 Agent Harness 的 HTTP / SSE 服务：任务创建、流式订阅、人工审批。",
     )
+    install_auth(app, auth)
     app.state.service = svc
-    app.include_router(_build_router(svc))
+    app.include_router(_build_router(svc, auth))
 
     @app.get("/health", response_model=schemas.HealthResponse, tags=["meta"])
     async def health() -> schemas.HealthResponse:

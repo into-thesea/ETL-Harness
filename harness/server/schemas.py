@@ -8,11 +8,15 @@ from pydantic import BaseModel, Field
 
 
 class CreateTaskRequest(BaseModel):
-    """创建分析任务的请求体。"""
+    """创建分析任务的请求体。
+
+    **没有 role 字段**（2026-09-27 起移除）：角色只能来自 ``Authorization: Bearer``
+    对应的令牌，由 ``AUTH_TOKENS`` 配置决定。客户端再传 ``role`` 会被忽略
+    （pydantic 默认忽略未知字段，老客户端不会报错，但也不会有任何效果）。
+    """
 
     goal: str = Field(..., min_length=1, description="分析目标（自然语言）")
     context: str = Field("", description="补充背景 / 上下文（可选）")
-    role: str = Field("admin", description="发起角色，用于 PDP 权限判定")
 
 
 class CreateTaskResponse(BaseModel):

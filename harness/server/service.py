@@ -252,13 +252,25 @@ class HarnessService:
             "token_usage": dict(token_usage) if token_usage else None,
         }
 
+    async def _origin_role(self, thread_id: str) -> str:
+        """任务发起时的角色（存在图状态里，**不出现在任何 API 响应中**）。"""
+        snap = await self.graph.aget_state(self._config(thread_id))
+        return str((snap.values or {}).get("role") or "")
+
     async def submit_approval(
-        self, thread_id: str, approved: bool, comment: str = ""
+        self, thread_id: str, approved: bool, comment: str = "", approver_role: str = ""
     ) -> dict:
         """提交审批决策并恢复图，返回提交后的状态快照。
 
         仅当任务处于 awaiting_approval（存在未处理 interrupt）时有效；
         同一 thread 的驱动经锁串行，避免并发恢复。
+
+        Args:
+            approver_role: 提交审批者的角色。与任务**发起角色**相同则拒绝
+                （职责分离：发起人不能自己批准自己触发的高危操作）。
+
+        Raises:
+            PermissionError: 发起人试图审批自己发起的任务。
         """
         from langgraph.types import Command
 
@@ -271,6 +283,12 @@ class HarnessService:
                 raise RuntimeError(
                     f"任务当前无待审批项（状态 {current['status']}），无法提交审批"
                 )
+            if approver_role:
+                origin = await self._origin_role(thread_id)
+                if origin and origin == approver_role:
+                    raise PermissionError(
+                        f"发起角色 {approver_role!r} 不能审批自己发起的任务（职责分离）"
+                    )
 
             resume = {"approved": approved, "comment": comment}
             # 后台驱动恢复（恢复后可能再次 interrupt 或跑完）

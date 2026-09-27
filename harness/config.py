@@ -292,6 +292,30 @@ class PermissionSettings(BaseSettings):
     """
 
 
+class AuthSettings(BaseSettings):
+    """服务端鉴权配置（对内网/对外提供服务的前提）。
+
+    ``tokens`` 是**令牌 → 身份**的映射（JSON 对象），角色只能来自这里：
+
+        {"<长随机令牌>": {"role": "analyst", "name": "张三"},
+         "<另一个令牌>":  {"role": "admin",   "name": "李四"}}
+
+    **不设默认值**：凭据的默认值一旦进仓库就等于没有鉴权。``enabled=true`` 而
+    ``tokens`` 为空时服务端**直接启动失败**——加鉴权最怕的是"以为开了、实际没开"。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="AUTH_", extra="ignore")
+
+    enabled: bool = True
+    """是否启用鉴权。关闭仅供本机开发，服务端会打 WARNING。"""
+
+    tokens: str = ""
+    """令牌表（JSON 对象）。无令牌时启用鉴权会启动失败。"""
+
+    approver_roles: str = "admin"
+    """可执行人工审批的角色（逗号分隔）。"""
+
+
 class PIISettings(BaseSettings):
     """PII 脱敏配置（C4：自研中文规则层，不引 Presidio）。
 
@@ -406,6 +430,7 @@ class Settings(BaseSettings):
     checkpoint: CheckpointSettings = Field(default_factory=CheckpointSettings)
     quality: QualitySettings = Field(default_factory=QualitySettings)
     pii: PIISettings = Field(default_factory=PIISettings)
+    auth: AuthSettings = Field(default_factory=AuthSettings)
     permission: PermissionSettings = Field(default_factory=PermissionSettings)
     datasource: DataSourceSettings = Field(default_factory=DataSourceSettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)

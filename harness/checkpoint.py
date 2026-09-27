@@ -63,8 +63,11 @@ async def build_checkpointer(config: Any = None) -> Any:
 
     if backend == "memory":
         from langgraph.checkpoint.memory import MemorySaver
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
-        return MemorySaver()
+        # 与 sqlite 分支登记同一份状态类型：不登记的话每个类型打一条
+        # "unregistered type" 警告，且库声明未来版本会阻断
+        return MemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=state_types()))
 
     if backend == "sqlite":
         import aiosqlite
