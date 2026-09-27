@@ -442,66 +442,84 @@ pending ──开始──▶ in_progress ──成功──▶ completed
 ETL-Harness/
 ├── README.md
 ├── requirements.txt
-├── .env.example
-├── .gitignore
+├── .env.example                    # 环境变量模板（复制为 .env，后者不进版本库）
+├── pytest.ini  .coveragerc         # 测试与覆盖率配置
 │
-├── infra/                             # 基础设施编排
-│   └── docker-compose.yml             # Redis+Milvus+Kafka+MinIO+Zookeeper
+├── infra/                          # 基础设施
+│   ├── docker-compose.yml          # Redis + Milvus + Kafka + MinIO（+ 可选 MySQL/PG）
+│   ├── Dockerfile.sandbox          # 沙箱内执行用的自建镜像
+│   ├── db/                         # 本地 MySQL/PG 初始化脚本（只读账号）
+│   └── opensandbox-server/         # 沙箱控制面（独立 venv，不在 compose 内）
+│       ├── sandbox.toml.example    # 配置模板（复制为 sandbox.toml，后者不进版本库）
+│       └── start.ps1               # 启动脚本（api_key 由环境变量注入）
 │
-├── harness/                           # 核心框架库
-│   ├── __init__.py
-│   ├── config.py                      # 全局配置
-│   ├── models.py                      # 数据模型
-│   ├── state.py                       # LangGraph State
-│   ├── llm_client.py                  # LLM 客户端
-│   ├── tool_broker.py                 # 工具调度
-│   ├── middleware.py                  # 可插拔中间件
-│   ├── pdp.py                         # 权限决策
-│   ├── audit.py                       # 审计日志
-│   ├── orchestrator.py                # 子 Agent 委派
-│   ├── nodes.py                       # ReAct 节点
-│   ├── graph.py                       # ReAct 图构建
-│   ├── memory/                        # 记忆层
-│   │   ├── short_term.py              # Redis 短期记忆
-│   │   ├── long_term.py               # Milvus 长期向量
-│   │   └── working.py                 # 工作记忆
-│   ├── planning/                      # 任务规划
-│   │   ├── planner.py
-│   │   └── task_store.py
-│   ├── vfs/                           # 虚拟文件系统
-│   │   ├── vfs.py
-│   │   ├── storage.py
-│   │   └── versioning.py
-│   ├── context/                       # 上下文管理
+├── harness/                        # 核心框架库
+│   ├── config.py                   # 全局配置（pydantic-settings，按域分组）
+│   ├── models.py                   # 数据模型（ToolDef / TaskPlan …）
+│   ├── state.py                    # LangGraph State 定义
+│   ├── llm_client.py               # LLM 客户端（含 Token usage 采集）
+│   ├── tool_broker.py              # 工具统一调度（防护 + Hook）
+│   ├── middleware.py               # 中间件基类 + PII/缓存/重试/日志
+│   ├── pdp.py                      # 工具级权限决策点
+│   ├── audit.py                    # 审计日志
+│   ├── checkpoint.py               # 检查点后端（SQLite / Memory）
+│   ├── mcp_adapter.py              # MCP 工具适配
+│   ├── orchestrator.py             # 顶层 Plan-and-Execute 编排
+│   ├── nodes.py                    # ReAct / Plan-Execute 节点
+│   ├── graph.py                    # 图构建（ReAct + Plan-Execute）
+│   │
+│   ├── agents/                     # 子 Agent 注册（8 个角色，见 §四/§八）
+│   │   └── registry.py
+│   ├── context/                    # 上下文管理（大结果沉淀 + 历史压缩）
 │   │   └── manager.py
-│   ├── skills/                        # Skills 系统
-│   │   ├── skill.py
-│   │   ├── registry.py
-│   │   └── loader.py
-│   ├── trace/                         # 链路追踪
-│   │   ├── tracer.py
-│   │   └── kafka_producer.py
-│   ├── sandbox/                       # 安全沙箱
-│   │   ├── executor.py
-│   │   └── isolator.py
-│   └── server/                        # FastAPI 服务
-│       ├── app.py
-│       ├── routes.py
-│       ├── schemas.py
-│       └── deps.py
+│   ├── datasources/                # SQLAlchemy 多数据源连接层
+│   │   └── manager.py
+│   ├── permissions/                # 行列级数据权限（SQL 改写）
+│   │   └── row_column.py
+│   ├── memory/                     # 记忆层
+│   │   ├── working.py              #   工作记忆（内存）
+│   │   ├── short_term.py           #   短期记忆（Redis）
+│   │   └── long_term.py            #   长期记忆（Milvus 向量）
+│   ├── planning/                   # 任务规划与质量门
+│   │   ├── planner.py              #   LLM 任务拆解
+│   │   ├── task_store.py           #   任务状态存储
+│   │   ├── data_quality.py         #   确定性数据质量红线
+│   │   └── gate.py                 #   Critic 语义裁判
+│   ├── vfs/                        # 虚拟文件系统
+│   │   ├── vfs.py                  #   目录抽象
+│   │   ├── storage.py              #   MinIO / 本地后端
+│   │   └── versioning.py           #   版本留痕
+│   ├── skills/                     # Skills 系统
+│   │   ├── loader.py               #   SKILL.md 加载与匹配
+│   │   └── */SKILL.md              #   6 个领域技能（见 §四.6）
+│   ├── trace/                      # 链路追踪
+│   │   ├── tracer.py               #   span 埋点
+│   │   └── kafka_producer.py       #   Kafka 上送 + 本地 spool
+│   ├── sandbox/                    # 沙箱客户端
+│   │   ├── client.py               #   OpenSandbox 连接（fail closed）
+│   │   └── executor.py             #   code_executor 工具执行器
+│   └── server/                     # FastAPI 服务层
+│       ├── app.py                  #   应用工厂 + 路由
+│       ├── auth.py                 #   Bearer 令牌鉴权
+│       ├── service.py              #   任务/审批业务编排
+│       ├── schemas.py              #   请求/响应模型
+│       └── run.py                  #   本地启动入口
 │
-├── tools/                             # 数据分析工具集
-│   ├── data_inspector.py
-│   ├── data_cleaner.py
-│   ├── eda.py
-│   ├── sql_query.py
-│   ├── chart_generator.py
-│   └── code_executor.py
+├── tools/                          # 数据分析工具集（注册到 Broker）
+│   ├── common.py                   # 公共辅助
+│   ├── data_inspector.py           # 数据体检
+│   ├── data_cleaner.py             # 数据清洗
+│   ├── eda.py                      # 探索性分析
+│   ├── sql_query.py                # SQL 查询（多数据源）
+│   ├── chart_generator.py          # 图表生成
+│   └── code_executor.py            # 沙箱代码执行
 │
-├── examples/                          # 可运行示例
-├── tests/                             # 单元测试
-├── docs/                              # 文档
-└── data/                              # 运行时数据
+├── examples/                       # 可运行示例
+│   ├── mock_llm_demo.py            #   无 API Key 的 Mock 演示
+│   └── data_analysis_demo.py       #   真实 LLM 端到端演示
+├── tests/                          # pytest 单元/集成测试
+├── docs/                           # 设计文档、项目计划、问题与阶段存档
+└── data/                           # 运行时数据（VFS/审计/检查点，不进版本库）
 ```
 
 ---
@@ -615,6 +633,22 @@ curl -N "http://localhost:8000/api/v1/tasks/$THREAD/stream?token=$TOKEN"
 
 **迁移提示（2026-09-27 起）**：旧客户端若在请求体里传 `role`，会被忽略（不报错，但也不再生效）；
 请改为在 `AUTH_TOKENS` 里给对应令牌配角色。
+
+### 7.6 可选能力配置
+
+除鉴权（§7.4）外，下列能力均通过 `.env` 配置；默认值遵循「不改变最小部署行为」，按需开启。
+
+| 能力 | 关键配置 | 默认 | 开启后的行为 |
+|---|---|---|---|
+| 工具级权限 | `PERMISSION_PDP_RULES` | 空（放行） | 按角色限定可调用的工具；未命中规则按 `PERMISSION_PDP_DEFAULT_POLICY` 处理 |
+| 行列级数据权限 | `PERMISSION_ENABLED=true` + `PERMISSION_RULES` | 关闭 | 给 SQL 强制注入行过滤 `WHERE` 与列白名单；无法改写的 SQL 形状（子查询/自连接等归属不清时）直接拒绝 |
+| PII 脱敏 | `PII_ENABLED` | `true` | 自研中文规则层识别身份证 / 手机号 / 银行卡并替换为占位符；默认开启校验位，避免普通编号被误命中 |
+| 数据质量门 | `QUALITY_DATA_CHECK_ENABLED`、`QUALITY_CRITIC_ENABLED` | `true` | 缺失率 / 重复率超红线即暂停待人工确认；每个子任务由 Critic 做一次语义质检 |
+| 审批中断持久化 | `CHECKPOINT_BACKEND` | `sqlite` | 中断状态落盘，服务重启后仍可继续审批；改为 `memory` 则重启即丢 |
+| 多数据源 | `DATASOURCE_SOURCES` | 空 | 配置命名 MySQL / PG 源（SQLAlchemy），`sql_query` 按需切换；SQLite 文件无需配置 |
+
+> 各配置项的完整取值见 `.env.example`；规则 JSON 的具体写法见 `harness/config.py` 中对应 Settings 类的 docstring。
+> 安全相关能力（权限 / PII / 质量门）均为 **fail closed**：缺少必要配置时显式报错或暂停，不会静默放行。
 
 ---
 
