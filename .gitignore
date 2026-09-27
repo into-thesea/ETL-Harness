@@ -73,8 +73,5 @@ desktop.ini
 # superpowers SDD 工作区（临时草稿，勿提交）
 .superpowers/
 
-# 个人学习 / 求职资料（仅本地保留，与框架本身无关）
-docs/面试资料.md
-docs/学习笔记.md
-docs/简历项目经历.md
-docs/tool_broker_核心概念学习问答.md
+# docs 全部仅本地保留（设计/计划/学习/求职资料，不进版本库）
+docs/
