@@ -1,8 +1,11 @@
 # ============================================================================
-# OpenSandbox Server 配置 —— ETL-Harness 专用
+# OpenSandbox Server 配置模板 —— ETL-Harness 专用
 #
-# 启动：
-#   infra/opensandbox-server/start.ps1        （或直接跑 .venv\Scripts\opensandbox-server.exe --config 本文件）
+# 用法：
+#   1. 复制本文件为同目录下 sandbox.toml（该文件不进版本库）
+#        Copy-Item sandbox.toml.example sandbox.toml
+#   2. 通过 start.ps1 启动；服务端 api_key 由环境变量注入（见 start.ps1），
+#      本文件里 api_key 留空即可。
 #
 # 说明：服务端是 ETL-Harness 的「沙箱层」基础设施，与 Redis/Kafka/MinIO 同级。
 # 客户端 SDK（项目 .venv 里的 opensandbox）通过 HTTP 连本服务，不直连 Docker。
@@ -12,8 +15,9 @@
 host = "127.0.0.1"
 port = 8080
 max_sandbox_timeout_seconds = 86400
-# 本地开发用固定 key；生产改为从环境变量注入并轮换
-api_key = "etl-harness-local-dev-key"
+# 留空：实际凭据由 start.ps1 通过环境变量 OPENSANDBOX_SERVER_API_KEY 注入并覆盖此处。
+# 生产请使用长随机串并定期轮换；客户端 SANDBOX_API_KEY 必须与之完全一致。
+api_key = ""
 
 [log]
 level = "INFO"
@@ -40,9 +44,11 @@ allowed_host_paths = []
 volume_default_size = "1Gi"
 
 [store]
-# 默认 sqlite，无需 Postgres/Redis。库文件放项目内，不写用户目录。
+# 默认 sqlite，无需 Postgres/Redis。
+# 相对路径：start.ps1 会把工作目录切到本配置所在目录，故解析到本目录 state/ 下，
+# 不写死任何机器绝对路径（state/ 已被 .gitignore 忽略）。
 type = "sqlite"
-path = "D:/ETL-Harness/infra/opensandbox-server/state/opensandbox.db"
+path = "state/opensandbox.db"
 
 [docker]
 network_mode = "bridge"

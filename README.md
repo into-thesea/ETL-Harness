@@ -511,8 +511,8 @@ ETL-Harness/
 ### 7.1 环境准备
 
 ```bash
-# 1. 克隆项目
-cd D:\ETL-Harness
+# 1. 克隆项目后进入目录（目录名以实际克隆为准）
+cd ETL-Harness
 
 # 2. 创建虚拟环境
 python -m venv .venv
@@ -540,6 +540,26 @@ docker-compose ps
 # kafka: 9092
 # minio: 9000 (控制台: 9001)
 ```
+
+> **端口被占用？** 若 6379/9000/19530 提示已绑定（本机可能运行着其他项目的容器），
+> 不要停掉别人的容器；编辑 `infra/docker-compose.yml` 改端口，或只启动当前需要的服务。
+
+**沙箱服务端（`code_executor` 依赖，需单独启动）**：沙箱控制面是独立进程，不在上面的 compose 内。
+
+```powershell
+# 首次：准备服务端独立 venv 与配置（配置文件不进版本库）
+cd infra\opensandbox-server
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install opensandbox-server==0.2.3
+Copy-Item sandbox.toml.example sandbox.toml
+
+# 启动前注入 api_key（长随机串；客户端 .env 的 SANDBOX_API_KEY 必须与之完全一致）
+$env:OPENSANDBOX_SERVER_API_KEY = "your-long-random-key"
+.\start.ps1
+```
+
+> 沙箱服务端未启动、或未配置 `SANDBOX_API_KEY` 时，`code_executor` 会**明确报错并 fail closed**
+> （绝不在本机直接执行代码）；其余工具（数据体检/清洗/EDA/出图/SQL）不依赖沙箱，可正常使用。
 
 ### 7.3 用 Mock LLM 跑通（不需要 API Key）
 

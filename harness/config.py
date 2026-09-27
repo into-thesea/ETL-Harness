@@ -141,7 +141,9 @@ class SandboxSettings(BaseSettings):
 
     # --- OpenSandbox 控制面（对应 infra/opensandbox-server/sandbox.toml）---
     server_url: str = "http://127.0.0.1:8080"
-    api_key: str = "etl-harness-local-dev-key"
+    # 无内置默认凭据：必须在 .env 显式配置 SANDBOX_API_KEY，与服务端
+    # OPENSANDBOX_SERVER_API_KEY 一致；留空时沙箱调用一律 fail closed
+    api_key: str = ""
 
     # --- 沙箱容器（自建镜像见 infra/Dockerfile.sandbox）---
     image: str = "etl-harness-sandbox:latest"

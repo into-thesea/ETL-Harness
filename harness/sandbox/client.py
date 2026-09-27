@@ -102,6 +102,12 @@ class SandboxClient:
         except ImportError as exc:  # pragma: no cover - 取决于环境
             return False, f"未安装 opensandbox 客户端 SDK：{exc}"
 
+        if not self.settings.api_key:
+            return False, (
+                "未配置沙箱访问凭据 SANDBOX_API_KEY；请在 .env 中设置为与 "
+                "OpenSandbox 服务端 OPENSANDBOX_SERVER_API_KEY 一致的值"
+            )
+
         try:
             import httpx
 
