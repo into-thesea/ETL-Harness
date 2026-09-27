@@ -584,7 +584,7 @@ curl -X POST http://localhost:8000/api/v1/tasks \
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/tasks/$THREAD
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/tasks/$THREAD/approvals
 
-# 提交审批：需审批角色，且**不能批准自己发起的任务**
+# 提交审批：需审批角色，且**不能批准自己发起的任务**（按身份判定；同角色的其他人，如另一位管理员，可以正常审批）
 curl -X POST http://localhost:8000/api/v1/tasks/$THREAD/approval \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"approved": false, "comment": "来源不明，不允许"}'

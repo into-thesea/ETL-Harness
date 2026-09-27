@@ -54,6 +54,7 @@ class PlanExecuteState(TypedDict, total=False):
     session_id: str
     agent_id: str
     role: str
+    origin_principal: str
 
     plan: Optional[TaskPlan]
     current_task: Any                 # 当前在执行的 TaskStep
@@ -514,6 +515,7 @@ def make_plan_execute_state(
     session_id: Optional[str] = None,
     agent_id: str = "etl-supervisor",
     role: str = "admin",
+    origin_principal: str = "",
     max_replans: int = 2,
     trace_id: Optional[str] = None,
 ) -> dict:
@@ -525,6 +527,7 @@ def make_plan_execute_state(
         "session_id": session_id or uuid.uuid4().hex,
         "agent_id": agent_id,
         "role": role,
+        "origin_principal": origin_principal,
         "plan": None,
         "current_task": None,
         "last_result": None,

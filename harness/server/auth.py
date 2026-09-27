@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import logging
@@ -34,12 +35,18 @@ ANONYMOUS_PATHS = frozenset({"/health"})
 _WWW_AUTHENTICATE = 'Bearer realm="etl-harness"'
 
 
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
 @dataclass(frozen=True)
 class Principal:
     """一次请求背后的身份（由令牌推导，不接受调用方自称）。"""
 
     role: str
     name: str
+    token_hash: str = ""
+    """令牌指纹（SHA-256 前 16 位），用于身份判定，不存令牌原文。"""
     authenticated: bool = True
     """是否来自真实令牌。``False`` 只出现在"鉴权关闭"的开发模式下 ——
     那种模式只有一个身份，"谁批准谁"的职责分离规则无从成立，故不适用。"""
@@ -117,7 +124,8 @@ def _load_tokens(raw: str) -> dict[str, Principal]:
                 f"AUTH_TOKENS 中令牌 {token[:4]}… 缺少 role —— 没有角色的令牌无法做权限判定"
             )
         table[str(token)] = Principal(
-            role=str(meta["role"]), name=str(meta.get("name") or meta["role"])
+            role=str(meta["role"]), name=str(meta.get("name") or meta["role"]),
+            token_hash=_hash_token(str(token)),
         )
     return table
 

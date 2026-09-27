@@ -38,7 +38,7 @@ def _build_router(service: HarnessService, auth: Any) -> APIRouter:
     ) -> schemas.CreateTaskResponse:
         # 角色**只能来自令牌**：请求体里即便带了 role 也不作数（见 auth.py）
         principal = principal_of(request)
-        thread_id = await service.create_task(req.goal, req.context, principal.role)
+        thread_id = await service.create_task(req.goal, req.context, principal.role, origin_principal=principal.token_hash)
         logger.info("任务创建：%s by %s(%s)", thread_id, principal.name, principal.role)
         return schemas.CreateTaskResponse(thread_id=thread_id, status="running")
 
@@ -72,13 +72,13 @@ def _build_router(service: HarnessService, auth: Any) -> APIRouter:
                 status_code=403,
                 detail=f"角色 {principal.role!r} 无权审批（需 {sorted(_auth.approver_roles)}）",
             )
-        # 开发模式（鉴权关闭）只有一个身份，职责分离无从成立 → 不传 approver_role
+        # 开发模式（鉴权关闭）只有一个身份，职责分离无从成立 → 不传 approver_principal
         try:
             status = await service.submit_approval(
                 thread_id,
                 req.approved,
                 req.comment,
-                approver_role=principal.role if principal.authenticated else "",
+                approver_principal=principal.token_hash if principal.authenticated else "",
             )
         except KeyError:
             raise HTTPException(status_code=404, detail=f"任务 {thread_id} 不存在")

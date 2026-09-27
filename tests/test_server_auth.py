@@ -29,13 +29,16 @@ from tests._smoke_server import ApprovalLLM, _offline_service
 
 ANALYST_TOKEN = "tok-analyst-0123456789"
 ADMIN_TOKEN = "tok-admin-0123456789"
+ADMIN2_TOKEN = "tok-admin2-0123456789"
 TOKENS = {
     ANALYST_TOKEN: {"role": "analyst", "name": "分析员"},
-    ADMIN_TOKEN: {"role": "admin", "name": "管理员"},
+    ADMIN_TOKEN: {"role": "admin", "name": "管理员A"},
+    ADMIN2_TOKEN: {"role": "admin", "name": "管理员B"},
 }
 
 ANALYST = {"Authorization": f"Bearer {ANALYST_TOKEN}"}
 ADMIN = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+ADMIN2 = {"Authorization": f"Bearer {ADMIN2_TOKEN}"}
 
 # 需要鉴权的业务路由（method, path, 是否有请求体）
 PROTECTED = [
@@ -121,7 +124,7 @@ def test_role_comes_from_token_not_request_body(auth_env, monkeypatch) -> None:
     seen: list[str] = []
     service = _offline_service()
 
-    async def _capture(goal: str, context: str = "", role: str = "admin") -> str:
+    async def _capture(goal: str, context: str = "", role: str = "admin", origin_principal: str = "") -> str:
         seen.append(role)
         return "thread-1"
 
@@ -211,6 +214,19 @@ def test_approver_cannot_approve_own_task(auth_env) -> None:
             headers=ADMIN,                                   # 管理员审批
         )
     assert resp.status_code == 403, f"不应允许自批：{resp.status_code} {resp.text}"
+
+
+def test_same_role_different_identity_can_approve(auth_env) -> None:
+    """同角色不同身份可以互批（自批按身份判定，不按角色）。"""
+    service = _service_with_approval_llm()
+    with _client(service) as client:
+        thread_id = _paused_thread(client, ADMIN, service)    # 管理员A发起
+        resp = client.post(
+            f"/api/v1/tasks/{thread_id}/approval",
+            json={"approved": True, "comment": "我是另一个管理员"},
+            headers=ADMIN2,                                    # 管理员B审批
+        )
+    assert resp.status_code == 200, resp.text
 
 
 def test_other_approver_can_approve(auth_env) -> None:

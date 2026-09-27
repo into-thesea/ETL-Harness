@@ -205,12 +205,12 @@ class HarnessService:
     # ------------------------------------------------------------------
     # 任务生命周期
     # ------------------------------------------------------------------
-    async def create_task(self, goal: str, context: str = "", role: str = "admin") -> str:
+    async def create_task(self, goal: str, context: str = "", role: str = "admin", origin_principal: str = "") -> str:
         """创建任务并后台驱动，返回 thread_id。"""
         await self._ensure_ready()
         thread_id = uuid.uuid4().hex
         initial = make_plan_execute_state(
-            goal, context=context, session_id=thread_id, role=role
+            goal, context=context, session_id=thread_id, role=role, origin_principal=origin_principal
         )
         self._spawn(thread_id, self.graph.ainvoke(initial, self._config(thread_id)))
         logger.info("Task created: %s", thread_id)
@@ -252,13 +252,13 @@ class HarnessService:
             "token_usage": dict(token_usage) if token_usage else None,
         }
 
-    async def _origin_role(self, thread_id: str) -> str:
-        """任务发起时的角色（存在图状态里，**不出现在任何 API 响应中**）。"""
+    async def _origin_principal(self, thread_id: str) -> str:
+        """任务发起者的身份指纹（存在图状态里，**不出现在任何 API 响应中**）。"""
         snap = await self.graph.aget_state(self._config(thread_id))
-        return str((snap.values or {}).get("role") or "")
+        return str((snap.values or {}).get("origin_principal") or "")
 
     async def submit_approval(
-        self, thread_id: str, approved: bool, comment: str = "", approver_role: str = ""
+        self, thread_id: str, approved: bool, comment: str = "", approver_principal: str = ""
     ) -> dict:
         """提交审批决策并恢复图，返回提交后的状态快照。
 
@@ -266,8 +266,8 @@ class HarnessService:
         同一 thread 的驱动经锁串行，避免并发恢复。
 
         Args:
-            approver_role: 提交审批者的角色。与任务**发起角色**相同则拒绝
-                （职责分离：发起人不能自己批准自己触发的高危操作）。
+            approver_principal: 提交审批者的身份指纹（令牌 hash）。与任务**发起者身份**
+                相同则拒绝（职责分离：发起人不能自己批准自己触发的高危操作）。
 
         Raises:
             PermissionError: 发起人试图审批自己发起的任务。
@@ -283,11 +283,11 @@ class HarnessService:
                 raise RuntimeError(
                     f"任务当前无待审批项（状态 {current['status']}），无法提交审批"
                 )
-            if approver_role:
-                origin = await self._origin_role(thread_id)
-                if origin and origin == approver_role:
+            if approver_principal:
+                origin = await self._origin_principal(thread_id)
+                if origin and origin == approver_principal:
                     raise PermissionError(
-                        f"发起角色 {approver_role!r} 不能审批自己发起的任务（职责分离）"
+                        "发起者不能审批自己发起的任务（职责分离）"
                     )
 
             resume = {"approved": approved, "comment": comment}
