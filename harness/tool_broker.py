@@ -7,7 +7,7 @@ Broker 的完整调用链路：
     2. 工具存在性检查
     3. PDP 权限检查（如果配置了 PDP）
     4. 参数校验（JSON Schema 基础校验）
-    5. 限流检查（滑动时间窗口）
+    5. 限流准入（滑动时间窗口，判定与记账在同一次加锁内完成）
     6. 调用实现函数（高风险工具走安全沙箱）
     7. 中间件 after_tool Hook（缓存/日志/结果修改）
     8. 结果包装：统一返回 (ok, text, artifacts)
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from typing import Any, Callable, Optional
 
@@ -32,6 +33,10 @@ logger = logging.getLogger(__name__)
 
 # 工具实现函数的类型别名
 ToolHandler = Callable[[dict, dict], tuple[bool, str, dict]]
+
+# 限流滑动窗口长度。字段名是 rate_limit_per_min，窗口因此固定为 60 秒 ——
+# 这不是可调参数，改动它会让字段名与语义脱节。
+_RATE_LIMIT_WINDOW_SECONDS = 60.0
 
 
 def _default_sandbox() -> Optional[Any]:
@@ -98,14 +103,29 @@ class ToolBroker:
             pdp: PDP 策略决策点实例（可选，没有则跳过权限检查）
             sandbox_executor: 安全沙箱执行器。缺省按 sandbox.enabled 自动构造
                 （构造不触碰网络，首次执行才连接）；显式传 None 且沙箱启用时同样
-                走自动构造，传 False 可显式关闭。
+                走自动构造；显式传 False 表示关闭沙箱，会归一为 None，标了
+                run_in_sandbox 的工具因此走 fail-closed 分支而不是裸跑。
             audit_logger: 审计器实例（可选，没有则不记录审计日志）
         """
         self._tools: dict[str, tuple[ToolDef, ToolHandler]] = {}
         self._call_log: dict[str, list[float]] = {}
+        # 限流的判定与记账必须原子完成，否则并发调用会同时通过检查。
+        # ponytail: 全局锁 + 进程内窗口 —— 每个进程各算各的，多副本部署时实际
+        # 放行量是「副本数 × rate_limit_per_min」。要跨副本一致，需把 _call_log
+        # 挪到 Redis（zset + Lua 做滑动窗口），届时代替本锁。
+        self._rate_lock = threading.Lock()
         self.middleware = middleware_manager
         self.pdp = pdp
-        self.sandbox = sandbox_executor if sandbox_executor is not None else _default_sandbox()
+        # 显式传 False = 关闭沙箱，归一成 None。不能把 False 直接存进来：invoke 与
+        # get_stats 判的都是 `is None`，留着 False 会得到"既非有、也非无"的中间态 ——
+        # 标了 run_in_sandbox 的工具会去调 False.execute()，把 fail-closed 提示换成
+        # 一句 AttributeError，sandbox_enabled 也会误报 True。
+        if sandbox_executor is False:
+            self.sandbox = None
+        elif sandbox_executor is None:
+            self.sandbox = _default_sandbox()
+        else:
+            self.sandbox = sandbox_executor
         self.audit = audit_logger
 
     # ------------------------------------------------------------------
@@ -125,7 +145,8 @@ class ToolBroker:
         """注销工具，返回是否成功。"""
         if name in self._tools:
             del self._tools[name]
-            self._call_log.pop(name, None)
+            with self._rate_lock:
+                self._call_log.pop(name, None)
             logger.info("Unregistered tool: %s", name)
             return True
         return False
@@ -262,8 +283,8 @@ class ToolBroker:
             )
             return False, f"参数校验失败：{args_error}", {}
 
-        # ---- 5. 限流检查 ----
-        rate_ok, rate_error = self._check_rate_limit(tool_name, tool_def.rate_limit_per_min)
+        # ---- 5. 限流准入（判定 + 记账原子完成）----
+        rate_ok, rate_error = self._try_acquire(tool_name, tool_def.rate_limit_per_min)
         if not rate_ok:
             self._audit(
                 trace_id=trace_id, session_id=session_id, agent_id=agent_id, role=role,
@@ -312,10 +333,7 @@ class ToolBroker:
         if self.middleware:
             ok, text, artifacts = self.middleware.exec_after_tool(mw_ctx, tool_name, (ok, text, artifacts))
 
-        # ---- 8. 记录调用时间戳（用于限流） ----
-        self._record_call(tool_name)
-
-        # ---- 9. 审计：记录本次调用的最终结果（成功/执行异常） ----
+        # ---- 8. 审计：记录本次调用的最终结果（成功/执行异常） ----
         sandbox_used = bool(tool_def.run_in_sandbox and self.sandbox is not None)
         self._audit(
             trace_id=trace_id, session_id=session_id, agent_id=agent_id, role=role,
@@ -369,37 +387,44 @@ class ToolBroker:
 
         return True, ""
 
-    def _check_rate_limit(self, tool_name: str, max_per_min: int) -> tuple[bool, str]:
-        """限流检查：滑动时间窗口。
+    def _try_acquire(self, tool_name: str, max_per_min: int) -> tuple[bool, str]:
+        """限流准入：滑动时间窗口的「判定 + 记账」在一次加锁内完成。
 
-        清理掉 60 秒前的时间戳，检查剩余数量是否超过限制。
+        旧实现把判定与记账拆成两步、中间隔着工具执行，并发调用会同时通过判定
+        再各自记账（check-then-act 竞态），实际放行量超过阈值。这里合并为一次
+        原子操作，并且记账发生在**准入时**而非执行后：
+
+        - 放行数严格等于 ``max_per_min``，与该工具的耗时无关；
+        - 准入后执行失败的调用同样占用配额。限流管的是"发起频率"而非"成功
+          次数"，否则一个持续失败的工具反而永远不会触发限流。
         """
         now = time.time()
-        window_start = now - 60.0
+        window_start = now - _RATE_LIMIT_WINDOW_SECONDS
 
-        if tool_name not in self._call_log:
-            self._call_log[tool_name] = []
-
-        # 清理过期时间戳
-        self._call_log[tool_name] = [t for t in self._call_log[tool_name] if t > window_start]
-
-        current_count = len(self._call_log[tool_name])
-        if current_count >= max_per_min:
-            return False, f"工具 '{tool_name}' 每分钟最多调用 {max_per_min} 次，当前已调用 {current_count} 次"
-
+        with self._rate_lock:
+            recent = [t for t in self._call_log.get(tool_name, []) if t > window_start]
+            if len(recent) >= max_per_min:
+                # 被拒绝的调用不计入窗口，否则持续重试会把窗口越撑越满。
+                self._call_log[tool_name] = recent
+                return False, (
+                    f"工具 '{tool_name}' 每分钟最多调用 {max_per_min} 次，"
+                    f"当前已调用 {len(recent)} 次"
+                )
+            recent.append(now)
+            self._call_log[tool_name] = recent
         return True, ""
-
-    def _record_call(self, tool_name: str) -> None:
-        """记录一次调用时间戳（用于限流）。"""
-        if tool_name not in self._call_log:
-            self._call_log[tool_name] = []
-        self._call_log[tool_name].append(time.time())
 
     # ------------------------------------------------------------------
     # 统计与调试
     # ------------------------------------------------------------------
     def get_stats(self) -> dict[str, Any]:
         """获取 Broker 统计信息。"""
+        now = time.time()
+        with self._rate_lock:
+            recent_by_tool = {
+                name: len([t for t in stamps if t > now - _RATE_LIMIT_WINDOW_SECONDS])
+                for name, stamps in self._call_log.items()
+            }
         return {
             "total_tools": len(self._tools),
             "tools": [
@@ -409,7 +434,7 @@ class ToolBroker:
                     "rate_limit_per_min": td.rate_limit_per_min,
                     "requires_approval": td.requires_approval,
                     "run_in_sandbox": td.run_in_sandbox,
-                    "recent_calls_1min": len([t for t in self._call_log.get(td.name, []) if t > time.time() - 60]),
+                    "recent_calls_1min": recent_by_tool.get(td.name, 0),
                 }
                 for td in self.list_tools()
             ],
@@ -421,6 +446,9 @@ class ToolBroker:
             "pdp_default_policy": getattr(self.pdp, "default_policy", None),
             "sandbox_enabled": self.sandbox is not None,
             "audit_enabled": self.audit is not None,
+            # 同理：限流窗口是进程内的，多副本时每个副本各算一份。报出来，免得
+            # 看到 rate_limit_per_min 就以为全局总量被卡住了。
+            "rate_limit_scope": "process",
         }
 
     def __len__(self) -> int:
