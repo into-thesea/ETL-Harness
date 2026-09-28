@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import socket
+from typing import Callable
 
 import pytest
 
@@ -44,7 +45,19 @@ def pytest_addoption(parser) -> None:
     )
 
 
-def _sandbox_available() -> tuple[bool, str]:
+# 基础设施探测结果按会话缓存：同一项在一次 pytest 运行里只探一次。
+# 不缓存的话，标了 needs_db 的 13 条用例会把同一个探测各做一遍 —— 端口不可达时
+# 每条都要等满连接超时，光探测就白花掉近一分钟。
+_probe_cache: dict[str, tuple[bool, str]] = {}
+
+
+def _cached(key: str, probe: Callable[[], tuple[bool, str]]) -> tuple[bool, str]:
+    if key not in _probe_cache:
+        _probe_cache[key] = probe()
+    return _probe_cache[key]
+
+
+def _probe_sandbox() -> tuple[bool, str]:
     try:
         from harness.sandbox.client import SandboxClient
 
@@ -53,19 +66,29 @@ def _sandbox_available() -> tuple[bool, str]:
         return False, f"{type(e).__name__}: {e}"
 
 
-def _kafka_available() -> bool:
+def _sandbox_available() -> tuple[bool, str]:
+    return _cached("sandbox", _probe_sandbox)
+
+
+# 一律写 IPv4 字面量：localhost 在 Windows 上先解析到 ::1，而 Docker 只把端口
+# 发布在 IPv4 上，探测会先在 IPv6 上死等约 20 秒才回落。
+def _probe_kafka() -> tuple[bool, str]:
     try:
-        with socket.create_connection(("localhost", 9092), timeout=2):
-            return True
-    except OSError:
-        return False
+        with socket.create_connection(("127.0.0.1", 9092), timeout=2):
+            return True, ""
+    except OSError as e:
+        return False, f"127.0.0.1:9092 不可达（{e}）"
+
+
+def _kafka_available() -> bool:
+    return _cached("kafka", _probe_kafka)[0]
 
 
 # compose 里的开发/测试库（端口故意避开本机常见的 5432/3306）
-_DB_ENDPOINTS = (("localhost", 55432), ("localhost", 53306))
+_DB_ENDPOINTS = (("127.0.0.1", 55432), ("127.0.0.1", 53306))
 
 
-def _db_available() -> tuple[bool, str]:
+def _probe_db() -> tuple[bool, str]:
     for host, port in _DB_ENDPOINTS:
         try:
             with socket.create_connection((host, port), timeout=2):
@@ -73,6 +96,10 @@ def _db_available() -> tuple[bool, str]:
         except OSError as e:
             return False, f"{host}:{port} 不可达（{e}）"
     return True, ""
+
+
+def _db_available() -> tuple[bool, str]:
+    return _cached("db", _probe_db)
 
 
 def pytest_runtest_setup(item) -> None:

@@ -54,11 +54,19 @@ class EmbeddingSettings(BaseSettings):
 
 
 class RedisSettings(BaseSettings):
-    """Redis 配置（短期记忆、任务状态、缓存、分布式锁、限流）。"""
+    """Redis 配置。
+
+    当前**只有短期记忆**（``harness.memory.short_term``）真正连 Redis；任务状态、
+    缓存、限流都是进程内实现，多副本部署时各算各的。原先的 docstring 把这四项
+    一并写成 Redis 用途，与实现不符，已按实际收窄。
+    """
 
     model_config = SettingsConfigDict(env_prefix="REDIS_", extra="ignore")
 
-    host: str = "localhost"
+    # 用 IPv4 字面量，别写 "localhost"：Docker 默认只把端口发布在 IPv4 上，而
+    # "localhost" 在 Windows 上优先解析到 ::1，连接会先在 IPv6 上死等约 20 秒
+    # 才回落到 IPv4。实测 Redis / Milvus / MinIO 三个服务都会中招。
+    host: str = "127.0.0.1"
     port: int = 6379
     db: int = 0
     password: Optional[str] = None
@@ -73,7 +81,10 @@ class MilvusSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="MILVUS_", extra="ignore")
 
-    host: str = "localhost"
+    # 用 IPv4 字面量，别写 "localhost"：Docker 默认只把端口发布在 IPv4 上，而
+    # "localhost" 在 Windows 上优先解析到 ::1，连接会先在 IPv6 上死等约 20 秒
+    # 才回落到 IPv4。实测 Redis / Milvus / MinIO 三个服务都会中招。
+    host: str = "127.0.0.1"
     port: int = 19530
     collection_prefix: str = "etl_harness_"
     index_type: str = "HNSW"
@@ -105,7 +116,14 @@ class MinIOSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="MINIO_", extra="ignore")
 
-    endpoint: str = "localhost:9000"
+    # 默认关闭：VFS 默认落本地磁盘，需要对象存储时显式打开并指向自己的实例。
+    # 理由见 storage.get_storage_backend —— 撞上"别人家的 MinIO"不会报错，
+    # 只会让 VFS 数据悄悄落到别人的对象存储里（9000 这类端口在开发机上常被
+    # 别的项目占着，比如 Milvus 自带的 MinIO）。
+    enabled: bool = False
+    # 同 RedisSettings.host：写 IPv4 字面量。MinIO 每个 VFS 构造都要连一次，
+    # 用 "localhost" 会让每个任务白等 20 秒。
+    endpoint: str = "127.0.0.1:9000"
     access_key: str = "minioadmin"
     secret_key: str = "minioadmin"
     bucket: str = "etl-harness"

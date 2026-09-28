@@ -227,8 +227,18 @@ class MinIOStorageBackend(StorageBackend):
 def get_storage_backend() -> StorageBackend:
     """获取存储后端。
 
-    优先使用 MinIO，MinIO 不可用时自动降级为本地文件系统。
+    默认用本地文件系统；显式打开 ``MINIO_ENABLED`` 才尝试 MinIO，连不上再降级本地。
+
+    默认不开不是保守，是躲一个**静默**事故：配置里的 endpoint 很可能落在别人
+    家的 MinIO 上（9000 这类端口在开发机上常被别的项目占着，例如 Milvus 自带的
+    MinIO）。那种情况下连接是成功的、bucket 也建得出来，VFS 数据就悄悄写进了
+    别人的对象存储 —— 对方一 down，数据跟着走。要对象存储就显式打开并指向
+    自己的实例。
     """
+    if not settings.minio.enabled:
+        logger.info("MinIO 未启用（MINIO_ENABLED=false），VFS 使用本地文件系统")
+        return LocalStorageBackend()
+
     minio_backend = MinIOStorageBackend()
     if minio_backend.is_connected:
         return minio_backend

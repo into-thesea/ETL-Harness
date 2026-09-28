@@ -165,6 +165,7 @@ curl -N "http://localhost:8000/api/v1/tasks/$THREAD/stream?token=$TOKEN"
 | 数据质量门 | `QUALITY_DATA_CHECK_ENABLED` | 开 | 缺失率/重复率超红线即暂停待确认，子任务由 Critic 质检 |
 | 审批持久化 | `CHECKPOINT_BACKEND` | sqlite | 中断状态落盘，重启可续；`memory` 则重启即丢 |
 | 多数据源 | `DATASOURCE_SOURCES` | 空 | 配置命名 MySQL/PG 源，`sql_query` 按需切换 |
+| 对象存储 | `MINIO_ENABLED` | 关 | VFS 大文件落 MinIO；默认落本地磁盘（`VFS_LOCAL_ROOT`） |
 
 完整取值见 [`.env.example`](.env.example)，规则 JSON 写法见 `harness/config.py` 各 Settings 类的 docstring。安全相关能力均为 fail closed。
 
