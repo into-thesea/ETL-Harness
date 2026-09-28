@@ -8,6 +8,7 @@
     /logs        日志目录（执行日志、调试信息、错误日志）
     /policies    策略目录（策略 DSL、规则配置、权限策略）
     /memories    记忆目录（导出的记忆快照、经验文档）
+    /_versions   内部目录（版本影子文件，不进入面向 Agent 的文件视图）
 
 核心能力：
     - 文件读写/编辑/搜索/删除
@@ -54,11 +55,19 @@ class VirtualFileSystem:
     """
 
     DEFAULT_DIRECTORIES = settings.vfs.default_directories
+    # 版本影子文件所在的内部目录，取 VersionManager 的常量保持单一来源。
+    # 它不属于面向 Agent 的文件视图：目录列表里不出现，search 也不命中 ——
+    # 版本要通过 list_versions / diff_versions / rollback 显式访问。
+    INTERNAL_PREFIX = VersionManager.VERSIONS_DIR
 
     def __init__(self, storage: Optional[StorageBackend] = None):
         self.storage = storage or get_storage_backend()
         self.version_manager = VersionManager(self.storage)
         self._ensure_default_directories()
+
+    def _is_internal(self, path: str) -> bool:
+        """判断路径是否落在内部目录（版本影子文件）下。"""
+        return path == self.INTERNAL_PREFIX or path.startswith(self.INTERNAL_PREFIX + "/")
 
     def _ensure_default_directories(self) -> None:
         """确保默认目录存在。"""
@@ -94,6 +103,8 @@ class VirtualFileSystem:
 
         results = []
         for child_path in sorted(children):
+            if self._is_internal(child_path):
+                continue
             is_dir = child_path.endswith("/")
             name = child_path.rstrip("/").split("/")[-1]
             size = 0 if is_dir else self.storage.get_size(child_path)
@@ -203,6 +214,8 @@ class VirtualFileSystem:
         results = []
 
         for file_path in all_files:
+            if self._is_internal(file_path):
+                continue
             name = file_path.split("/")[-1]
             # 文件名匹配
             if query_lower in name.lower():
