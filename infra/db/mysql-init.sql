@@ -1,5 +1,5 @@
 -- ============================================================================
--- ETL-Harness 开发/测试用 MySQL 初始化（compose 首次启动时自动执行）
+-- Governed 开发/测试用 MySQL 初始化（compose 首次启动时自动执行）
 --
 -- MySQL 没有 PG 那样的连接级只读开关（见 harness/datasources/manager.py 的注释），
 -- 只读**完全依赖账号权限**。所以这里的 harness_ro 只授 SELECT —— 这是 MySQL 路径上

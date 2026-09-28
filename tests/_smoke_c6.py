@@ -78,8 +78,8 @@ def test_spool_then_replay() -> None:
     w = _make_wrapper(tempfile.mkdtemp())
 
     # 未连接：两条消息落 spool
-    w.send("etl_harness_audit", {"trace_id": "t1", "n": 1}, key="t1")
-    w.send("etl_harness_audit", {"trace_id": "t2", "n": 2}, key="t2")
+    w.send("governed_audit", {"trace_id": "t1", "n": 1}, key="t1")
+    w.send("governed_audit", {"trace_id": "t2", "n": 2}, key="t2")
     assert w.spool_status()["pending"] == 2
 
     # 连接恢复：补发
@@ -97,7 +97,7 @@ def test_spool_then_replay() -> None:
 
 def test_replay_failure_keeps_spool() -> None:
     w = _make_wrapper(tempfile.mkdtemp())
-    w.send("etl_harness_audit", {"trace_id": "t9"}, key="t9")
+    w.send("governed_audit", {"trace_id": "t9"}, key="t9")
     assert w.spool_status()["pending"] == 1
 
     # broker 写入确认失败：spool 文件必须保留，不能丢
@@ -118,7 +118,7 @@ def test_replay_failure_keeps_spool() -> None:
 def test_corrupt_to_dead_letter() -> None:
     w = _make_wrapper(tempfile.mkdtemp())
     # 一个合法、一个损坏
-    w.send("etl_harness_audit", {"trace_id": "ok"}, key="ok")
+    w.send("governed_audit", {"trace_id": "ok"}, key="ok")
     with open(os.path.join(w._spool_dir, "000_corrupt.json"), "w", encoding="utf-8") as fh:
         fh.write("{not-json")
 

@@ -1,6 +1,6 @@
 """临时验证脚本：VFS 模块测试。"""
 import sys
-sys.path.insert(0, r"D:\ETL-Harness")
+sys.path.insert(0, r"D:\Governed")
 
 from harness.vfs import VirtualFileSystem
 

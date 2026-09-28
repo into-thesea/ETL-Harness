@@ -1,5 +1,5 @@
 # ============================================================================
-# OpenSandbox Server 配置模板 —— ETL-Harness 专用
+# OpenSandbox Server 配置模板 —— Governed 专用
 #
 # 用法：
 #   1. 复制本文件为同目录下 sandbox.toml（该文件不进版本库）
@@ -7,7 +7,7 @@
 #   2. 通过 start.ps1 启动；服务端 api_key 由环境变量注入（见 start.ps1），
 #      本文件里 api_key 留空即可。
 #
-# 说明：服务端是 ETL-Harness 的「沙箱层」基础设施，与 Redis/Kafka/MinIO 同级。
+# 说明：服务端是 Governed 的「沙箱层」基础设施，与 Redis/Kafka/MinIO 同级。
 # 客户端 SDK（项目 .venv 里的 opensandbox）通过 HTTP 连本服务，不直连 Docker。
 # ============================================================================
 
@@ -37,7 +37,7 @@ execd_image = "opensandbox/execd:v1.0.22"
 # 因此这里**禁止一切宿主路径 bind mount**：沙箱进程看不到任何宿主路径，
 # 文件内容经 API 显式搬运，天然带审计点与大小上限，比挂载更严格。
 # 仅在确有「大文件免搬运」需求时才加入白名单，例如：
-#   allowed_host_paths = ["D:/ETL-Harness/data/vfs"]
+#   allowed_host_paths = ["D:/Next-Harness/data/vfs"]
 # ---------------------------------------------------------------------------
 [storage]
 allowed_host_paths = []

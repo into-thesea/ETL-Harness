@@ -1,4 +1,4 @@
-# ETL-Harness
+# Governed
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-1.x-6b72db.svg)](https://github.com/langchain-ai/langgraph)
@@ -8,7 +8,7 @@
 
 ## 这是什么
 
-直接用 LangGraph 搭 Agent，规划、记忆、工具调用、权限这些都要自己拼装。ETL-Harness 把这些围绕模型的"管控工程"收敛成一个可复用的运行时：你注册业务工具、组装图，就能得到一个带权限、审批、审计和断点恢复的 Agent。
+直接用 LangGraph 搭 Agent，规划、记忆、工具调用、权限这些都要自己拼装。Governed 把这些围绕模型的"管控工程"收敛成一个可复用的运行时：你注册业务工具、组装图，就能得到一个带权限、审批、审计和断点恢复的 Agent。
 
 框架本身不绑定业务——换一套工具就是另一个应用。仓库里自带的数据分析工具集（体检、清洗、EDA、SQL、出图、代码执行）是第一个完整示例，跑通"数据获取 → 清洗 → 探查 → 建模 → 可视化 → 报告"这条链路。
 
@@ -59,8 +59,8 @@
 
 ```bash
 # 克隆后进入目录
-git clone https://github.com/into-thesea/ETL-Harness.git
-cd ETL-Harness
+git clone https://github.com/into-thesea/governed.git
+cd governed
 
 # 建议用独立虚拟环境
 python -m venv .venv
@@ -172,7 +172,7 @@ curl -N "http://localhost:8000/api/v1/tasks/$THREAD/stream?token=$TOKEN"
 ## 项目结构
 
 ```
-ETL-Harness/
+governed/
 ├── harness/                # 框架库
 │   ├── config.py           # 配置（pydantic-settings，按域分组）
 │   ├── models.py  state.py # 数据模型 / LangGraph 状态

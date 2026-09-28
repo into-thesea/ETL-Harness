@@ -332,7 +332,7 @@ class TraceSpan(BaseModel):
     trace_id: str                                   # 整条链路唯一标识
     span_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     parent_span_id: Optional[str] = None            # 父 Span（None 表示根 Span）
-    service_name: str = "etl-harness"
+    service_name: str = "governed"
     operation: str                                  # 操作名（如 tool_call/calculator）
     start_time: datetime = Field(default_factory=datetime.now)
     duration_ms: Optional[int] = None

@@ -1,11 +1,11 @@
 # ============================================================================
-# ETL-Harness 沙箱镜像
+# Governed 沙箱镜像
 #
 # 用途：code_executor 工具在 OpenSandbox 中执行 LLM 生成的分析代码时使用的容器镜像。
 # 预装 pandas/numpy/matplotlib/scipy，使沙箱内可离线执行分析代码（首启后无需联网）。
 #
 # 构建：
-#   docker build -f infra/Dockerfile.sandbox -t etl-harness-sandbox:latest infra/
+#   docker build -f infra/Dockerfile.sandbox -t governed-sandbox:latest infra/
 #
 # 与宿主 tools/ 的版本对齐策略：均不锁定版本，让 pip 在构建时解析当期最新，
 # 随宿主 .venv 一同演进，避免沙箱与宿主 pandas 语义漂移（pandas 3.x 有破坏性变更）。

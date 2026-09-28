@@ -162,7 +162,7 @@ def create_app(service: Optional[HarnessService] = None) -> FastAPI:
     # 鉴权器先构造：配置缺失/非法时**启动即失败**（不要静默放行）
     auth = build_authenticator()
     app = FastAPI(
-        title="ETL-Harness 数据分析服务",
+        title="Governed 数据分析服务",
         version=VERSION,
         description="工业级 Agent Harness 的 HTTP / SSE 服务：任务创建、流式订阅、人工审批。",
     )

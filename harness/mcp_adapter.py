@@ -368,7 +368,7 @@ def _make_mcp_tool_fn(
 def build_mcp_server(
     broker: Any,
     *,
-    name: str = "etl-harness",
+    name: str = "governed",
     role: str = "analyst",
     context: Optional[dict] = None,
     tools: Optional[list[str]] = None,

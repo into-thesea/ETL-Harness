@@ -34,7 +34,7 @@ def _select_cases(tags: str | None) -> List[Any]:
 
 def _print_header() -> None:
     print("=" * 78)
-    print("ETL-Harness Agent 评测")
+    print("Governed Agent 评测")
     print("=" * 78)
 
 
@@ -53,7 +53,7 @@ def _print_case_result(result: dict) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ETL-Harness Agent 评测")
+    parser = argparse.ArgumentParser(description="Governed Agent 评测")
     parser.add_argument("--runs", type=int, default=1,
                         help="每个用例独立运行次数 k（默认 1）")
     parser.add_argument("--llm", choices=["scripted", "real"], default="scripted",

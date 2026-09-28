@@ -70,7 +70,7 @@ class RedisSettings(BaseSettings):
     port: int = 6379
     db: int = 0
     password: Optional[str] = None
-    key_prefix: str = "etl_harness:"
+    key_prefix: str = "governed:"
     max_connections: int = 20
     socket_timeout: int = 5
     socket_connect_timeout: int = 5
@@ -86,7 +86,7 @@ class MilvusSettings(BaseSettings):
     # 才回落到 IPv4。实测 Redis / Milvus / MinIO 三个服务都会中招。
     host: str = "127.0.0.1"
     port: int = 19530
-    collection_prefix: str = "etl_harness_"
+    collection_prefix: str = "governed_"
     index_type: str = "HNSW"
     metric_type: str = "COSINE"
     top_k: int = 5
@@ -99,10 +99,10 @@ class KafkaSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="KAFKA_", extra="ignore")
 
     bootstrap_servers: str = "localhost:9092"
-    audit_topic: str = "etl_harness_audit"
-    trace_topic: str = "etl_harness_trace"
-    event_topic: str = "etl_harness_events"
-    consumer_group: str = "etl_harness_consumer"
+    audit_topic: str = "governed_audit"
+    trace_topic: str = "governed_trace"
+    event_topic: str = "governed_events"
+    consumer_group: str = "governed_consumer"
     enable_audit_produce: bool = True
     enable_trace_produce: bool = True
     producer_acks: str = "1"
@@ -126,7 +126,7 @@ class MinIOSettings(BaseSettings):
     endpoint: str = "127.0.0.1:9000"
     access_key: str = "minioadmin"
     secret_key: str = "minioadmin"
-    bucket: str = "etl-harness"
+    bucket: str = "governed"
     secure: bool = False
     region: Optional[str] = None
 
@@ -164,7 +164,7 @@ class SandboxSettings(BaseSettings):
     api_key: str = ""
 
     # --- 沙箱容器（自建镜像见 infra/Dockerfile.sandbox）---
-    image: str = "etl-harness-sandbox:latest"
+    image: str = "governed-sandbox:latest"
     workdir: str = "/home/sandbox"
     cpu_limit: float = 1.0
     memory_limit: str = "512m"
@@ -186,7 +186,7 @@ class TraceSettings(BaseSettings):
 
     enabled: bool = True
     sample_rate: float = 1.0
-    service_name: str = "etl-harness"
+    service_name: str = "governed"
     environment: str = "development"
     max_tags_per_span: int = 50
 

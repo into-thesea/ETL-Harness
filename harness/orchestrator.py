@@ -513,7 +513,7 @@ def make_plan_execute_state(
     *,
     context: str = "",
     session_id: Optional[str] = None,
-    agent_id: str = "etl-supervisor",
+    agent_id: str = "governed-supervisor",
     role: str = "admin",
     origin_principal: str = "",
     max_replans: int = 2,

@@ -69,7 +69,7 @@ def build_test_broker() -> ToolBroker:
 def main() -> None:
     import anyio
 
-    server = build_mcp_server(build_test_broker(), name="etl-harness-test", role="analyst")
+    server = build_mcp_server(build_test_broker(), name="governed-test", role="analyst")
     anyio.run(server.run_stdio_async)
 
 

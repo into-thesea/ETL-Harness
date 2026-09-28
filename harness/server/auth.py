@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 ANONYMOUS_PATHS = frozenset({"/health"})
 
 # 401 响应头：告诉调用方用哪种认证方式
-_WWW_AUTHENTICATE = 'Bearer realm="etl-harness"'
+_WWW_AUTHENTICATE = 'Bearer realm="governed"'
 
 
 def _hash_token(token: str) -> str:

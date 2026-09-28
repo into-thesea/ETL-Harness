@@ -1,6 +1,6 @@
 """临时验证脚本：tool_broker + middleware 集成测试。"""
 import sys
-sys.path.insert(0, r"D:\ETL-Harness")
+sys.path.insert(0, r"D:\Governed")
 
 from harness.tool_broker import ToolBroker
 from harness.models import ToolDef

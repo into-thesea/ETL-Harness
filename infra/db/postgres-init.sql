@@ -1,5 +1,5 @@
 -- ============================================================================
--- ETL-Harness 开发/测试用 PostgreSQL 初始化（compose 首次启动时自动执行）
+-- Governed 开发/测试用 PostgreSQL 初始化（compose 首次启动时自动执行）
 --
 -- 关键点：建一个**只读账号** harness_ro。框架侧（harness/datasources）对 PG 是
 -- 连接级只读（SET default_transaction_read_only=on），但那只防住"框架自己的代码

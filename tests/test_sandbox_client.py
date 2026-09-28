@@ -17,7 +17,7 @@ def _client_with(**overrides) -> SandboxClient:
     base = {
         "server_url": "http://127.0.0.1:8080",
         "api_key": "",
-        "image": "etl-harness-sandbox:latest",
+        "image": "governed-sandbox:latest",
     }
     base.update(overrides)
     return SandboxClient(SimpleNamespace(**base))
