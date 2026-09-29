@@ -2,7 +2,7 @@
 
 与 mock_llm_demo.py（只跑单工具 ReAct）不同，本示例验证【除大模型决策外的整条工程链路】：
     Plan-and-Execute 顶层编排
-      → inspector 体检 → cleaner 清洗 → analyst EDA → chartist 出图 → reporter 汇总
+      → data-explorer 探查清洗 → analyst 分析出图 → reporter 汇总成稿
     全程经过：ScopedBroker 子 Agent 白名单、PDP 权限、参数校验、限流、质量门，
     6 个真实数据分析工具被真实调用，CSV / Markdown / PNG 真实落盘到 VFS。
 
@@ -120,7 +120,7 @@ def _final(text: str) -> str:
 class ScriptedAnalysisLLM:
     """一个 Mock 同时扮演：规划器(chat_json)、各子 Agent 执行体(chat)、汇总者(chat)。
 
-    识别当前角色：读 system 消息里的【全角括号角色标记】，如"（cleaner）"。
+    识别当前角色：读 system 消息里的【全角括号角色标记】，如"（data-explorer）"。
     不能用 'inspector' 子串——因为 cleaner/analyst 的工具清单里也含 data_inspector。
     识别当前进度：数历史里有几条 'Observation'，决定该子 Agent 走到第几步。
     """
@@ -131,16 +131,16 @@ class ScriptedAnalysisLLM:
         self.plan_payload = {
             "tasks": [
                 {"title": "数据体检", "description": f"读取 {raw_file}，给出行列规模、schema、缺失与质量风险",
-                 "assigned_to": "inspector", "depends_on": [],
+                 "assigned_to": "data-explorer", "depends_on": [],
                  "acceptance_criteria": ["给出字段构成与主要质量风险"], "expected_artifacts": []},
                 {"title": "数据清洗", "description": "依据体检结果去重、删全空列、规范类别、金额转数值、填空、截异常",
-                 "assigned_to": "cleaner", "depends_on": [0],
+                 "assigned_to": "data-explorer", "depends_on": [0],
                  "acceptance_criteria": ["产出干净数据集与清洗报告"], "expected_artifacts": []},
                 {"title": "EDA 分析", "description": "对清洗后数据做分布、相关、分组对比与目标关系分析",
                  "assigned_to": "analyst", "depends_on": [1],
                  "acceptance_criteria": ["给出关键统计发现"], "expected_artifacts": []},
                 {"title": "生成图表", "description": "画各类别销售额汇总柱状图",
-                 "assigned_to": "chartist", "depends_on": [2],
+                 "assigned_to": "analyst", "depends_on": [2],
                  "acceptance_criteria": ["产出 PNG 图表"], "expected_artifacts": []},
                 {"title": "撰写报告", "description": "汇总上游结论形成最终报告",
                  "assigned_to": "reporter", "depends_on": [3],
@@ -174,12 +174,20 @@ class ScriptedAnalysisLLM:
             and str(m.get("content", "")).startswith("Observation")
         )
 
-        # inspector：第一步体检，拿到观察后收尾
-        if "（inspector）" in system and n_obs == 0:
+        # 合并后同一个子 Agent 会承担多个步骤（data-explorer 既做体检也做清洗，
+        # analyst 既做 EDA 也出图），角色标记不足以区分当前在哪一步 —— 按
+        # _compose_subtask 写进 user 消息的【子任务标题】分派。
+        task_text = "\n".join(
+            str(m.get("content", "")) for m in messages
+            if isinstance(m, dict) and m.get("role") == "user"
+        )
+
+        # data-explorer：第一步体检，拿到观察后收尾
+        if "子任务：数据体检" in task_text and n_obs == 0:
             return _action("data_inspector", {"file_path": self.raw})
 
-        # cleaner：先看体检画像，再清洗（演示一个子 Agent 内的多步 ReAct）
-        if "（cleaner）" in system:
+        # data-explorer：先看体检画像，再清洗（演示一个子 Agent 内的多步 ReAct）
+        if "子任务：数据清洗" in task_text:
             if n_obs == 0:
                 return _action("data_inspector", {"file_path": self.raw})
             if n_obs == 1:
@@ -196,15 +204,15 @@ class ScriptedAnalysisLLM:
                 })
 
         # analyst：对清洗后数据做 EDA
-        if "（analyst）" in system and n_obs == 0:
+        if "子任务：EDA 分析" in task_text and n_obs == 0:
             return _action("eda", {
                 "file_path": f"{self.clean}.csv",
                 "target": "label", "time_col": "date",
                 "group_by": "category", "value_col": "amount",
             })
 
-        # chartist：各类别销售额柱状图
-        if "（chartist）" in system and n_obs == 0:
+        # analyst：各类别销售额柱状图
+        if "子任务：生成图表" in task_text and n_obs == 0:
             return _action("chart_generator", {
                 "file_path": f"{self.clean}.csv",
                 "chart_type": "bar", "x": "category", "y": "amount", "agg": "sum",
@@ -410,6 +418,6 @@ def main(goal: str | None = None) -> None:
 if __name__ == "__main__":
     import sys
 
-    # 可选传入自定义目标，用于驱动不同深度的分析链路（例如强制走 coder/沙箱）：
+    # 可选传入自定义目标，用于驱动不同深度的分析链路（例如强制走沙箱）：
     #   python -m examples.data_analysis_demo "用 Python 代码计算各品类月度环比与异常值明细"
     main(sys.argv[1] if len(sys.argv) > 1 else None)

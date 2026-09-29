@@ -29,7 +29,7 @@ import pytest
 from harness.config import settings as global_settings
 from harness.server.service import HarnessService
 
-# 复用服务化冒烟里的审批脚本 LLM（规划单个 coder 任务 → 调 code_executor 触发 interrupt）
+# 复用服务化冒烟里的审批脚本 LLM（规划单个 analyst 任务 → 调 code_executor 触发 interrupt）
 from tests._smoke_server import ApprovalLLM
 
 TERMINAL = ("finished", "failed")

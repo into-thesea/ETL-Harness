@@ -38,7 +38,7 @@ def _inspector_result(
         for col, rate in missing_rates.items()
     ]
     return SubAgentResult(
-        sub_agent_name="inspector",
+        sub_agent_name="data-explorer",
         task_id="t-inspect",
         success=True,
         conclusion="数据体检完成：已输出字段画像与质量风险。",
@@ -56,7 +56,7 @@ def _inspect_task() -> TaskStep:
     return TaskStep(
         title="数据体检",
         description="读取数据并输出字段画像",
-        assigned_to="inspector",
+        assigned_to="data-explorer",
         acceptance_criteria=["给出字段缺失率"],
     )
 
@@ -109,7 +109,7 @@ def test_result_without_inspection_artifacts_is_not_blocked() -> None:
 def test_fully_empty_column_is_a_cleaning_target_not_a_pause() -> None:
     """整列全空 = 零信息量的待删列，不该拦住整条分析链路。
 
-    实测撞出来的边界：示例脏数据里的 ``blank_note`` 整列为空（正是 cleaner 要删的），
+    实测撞出来的边界：示例脏数据里的 ``blank_note`` 整列为空（正是 data-explorer 要删的），
     若按"缺失率 100% > 30%"拦截，真实数据几乎永远进不了分析。
     """
     checker = DataQualityChecker()
@@ -145,19 +145,26 @@ def test_gate_without_checker_is_unchanged() -> None:
 
 
 # ----------------------------------------------------------------------
-# QA 质检子 Agent
+# 质检能力（并入 reporter 子 Agent）
 # ----------------------------------------------------------------------
-def test_qa_agent_registered() -> None:
+def test_default_agents_are_three_core_roles() -> None:
+    """内置三个核心子 Agent：角色数由上下文隔离需求决定，不按业务步骤铺开。"""
     from harness.agents.registry import build_default_agents
 
     agents = build_default_agents()
-    assert "qa" in agents, f"QA/质检 子 Agent 未注册（C2 已拍板 8 个）：{sorted(agents)}"
-    qa = agents["qa"]
-    assert qa.required_role == "analyst"
-    assert "data_inspector" in qa.tools, "QA 需要能自己看数据"
+    assert sorted(agents) == ["analyst", "data-explorer", "reporter"], sorted(agents)
 
 
-def test_qa_agent_is_plannable() -> None:
+def test_reporter_agent_covers_qa() -> None:
+    """报告与质检共享一个上下文；质检要能自己核实数字，故带只读查询工具。"""
+    from harness.agents.registry import build_default_agents
+
+    reporter = build_default_agents()["reporter"]
+    assert reporter.required_role == "analyst"
+    assert "data_inspector" in reporter.tools, "质检环节需要能自己核实数据"
+
+
+def test_default_agents_are_all_plannable() -> None:
     """规划器只认 DEFAULT_AGENT_ROLES 里的描述；缺了会渲染成裸名字。"""
     from harness.agents.registry import build_default_agents
     from harness.planning.planner import DEFAULT_AGENT_ROLES
@@ -167,12 +174,12 @@ def test_qa_agent_is_plannable() -> None:
     assert not missing, f"这些子 Agent 未登记角色描述，规划器看不到它们：{sorted(missing)}"
 
 
-def test_qa_agent_prompt_covers_analysis_pitfalls() -> None:
+def test_reporter_prompt_covers_analysis_pitfalls() -> None:
     from harness.agents.registry import build_default_agents
 
-    prompt = build_default_agents()["qa"].system_prompt
+    prompt = build_default_agents()["reporter"].system_prompt
     for term in ("幸存者偏差", "辛普森悖论", "数据泄露"):
-        assert term in prompt, f"QA 提示词缺少审查项：{term}"
+        assert term in prompt, f"质检提示词缺少审查项：{term}"
 
 
 class _CaptureCriticLLM:
@@ -250,7 +257,7 @@ class _InspectorLLM:
         return {
             "tasks": [{
                 "title": "数据体检", "description": "读取数据并输出质量画像",
-                "assigned_to": "inspector", "depends_on": [],
+                "assigned_to": "data-explorer", "depends_on": [],
                 "acceptance_criteria": ["给出字段缺失率"], "expected_artifacts": [],
             }]
         }

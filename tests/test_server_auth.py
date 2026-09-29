@@ -175,7 +175,7 @@ def test_query_token_accepted_on_stream(auth_env) -> None:
 # 4：审批需要审批人角色，且不能自批
 # ----------------------------------------------------------------------
 def _paused_thread(client: TestClient, headers, service) -> str:
-    """造一个进入待审批的任务（coder → code_executor 触发 interrupt）。"""
+    """造一个进入待审批的任务（analyst → code_executor 触发 interrupt）。"""
     thread_id = client.post(
         "/api/v1/tasks", json={"goal": "运行一段代码"}, headers=headers
     ).json()["thread_id"]

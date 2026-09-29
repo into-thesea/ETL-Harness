@@ -54,13 +54,13 @@ def _poll(client: TestClient, thread_id: str, until: tuple[str, ...], timeout: f
 
 
 # ----------------------------------------------------------------------
-# 用于审批测试的最小脚本 LLM：规划单个 coder 任务，coder 调 code_executor
+# 用于审批测试的最小脚本 LLM：规划单个 analyst 任务，analyst 调 code_executor
 # ----------------------------------------------------------------------
 class ApprovalLLM:
     def __init__(self) -> None:
         self.plan = {"tasks": [{
             "title": "运行代码", "description": "在沙箱运行一段代码",
-            "assigned_to": "coder", "depends_on": [],
+            "assigned_to": "analyst", "depends_on": [],
             "acceptance_criteria": ["代码已运行"], "expected_artifacts": [],
         }]}
 
@@ -80,7 +80,8 @@ class ApprovalLLM:
             if isinstance(m, dict) and m.get("role") == "user"
             and str(m.get("content", "")).startswith("Observation")
         )
-        if "沙箱执行员" in system and n_obs == 0:
+        # 角色标记：analyst 的子 Agent 提示词里带"（analyst）"
+        if "（analyst）" in system and n_obs == 0:
             return json.dumps(
                 {"thought": "运行代码", "action": "code_executor",
                  "action_input": {"code": "print('hi')"}},

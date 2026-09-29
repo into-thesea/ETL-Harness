@@ -14,7 +14,7 @@ from harness.planning import PlanValidationError, TaskPlanner, TaskStore
 
 PLAN_PAYLOAD = {
     "tasks": [
-        {"title": "数据体检", "description": "读取数据并画像", "assigned_to": "inspector",
+        {"title": "数据体检", "description": "读取数据并画像", "assigned_to": "data-explorer",
          "depends_on": [], "acceptance_criteria": ["输出 schema 与缺失率"],
          "expected_artifacts": ["/workspace/profile.json"]},
         {"title": "EDA 分析", "description": "做分布与相关性分析", "assigned_to": "analyst",
@@ -28,7 +28,7 @@ PLAN_PAYLOAD = {
 
 REPLAN_PAYLOAD = {
     "tasks": [
-        {"title": "补充图表", "description": "为关键指标补一张图", "assigned_to": "chartist",
+        {"title": "补充图表", "description": "为关键指标补一张图", "assigned_to": "analyst",
          "depends_on": [], "acceptance_criteria": ["产出 PNG"],
          "expected_artifacts": ["/reports/chart.png"]},
         {"title": "更新报告", "description": "把图表纳入报告", "assigned_to": "reporter",
@@ -52,7 +52,7 @@ def test_planner_builds_plan() -> None:
     plan = planner.plan("分析 sales.csv 并出报告")
     tasks = plan.tasks
     assert len(tasks) == 3
-    assert [t.assigned_to for t in tasks] == ["inspector", "analyst", "reporter"]
+    assert [t.assigned_to for t in tasks] == ["data-explorer", "analyst", "reporter"]
     # 序号依赖已映射为稳定 task_id
     assert tasks[1].depends_on == [tasks[0].task_id]
     assert tasks[2].depends_on == [tasks[1].task_id]
@@ -143,7 +143,7 @@ def test_replan_keeps_completed() -> None:
     # 新计划必须仍无环、可被 store 接受
     store.save(new_plan)
     nxt = store.next_runnable_task(new_plan)
-    assert nxt.assigned_to == "chartist"
+    assert nxt.assigned_to == "analyst"
     # 第一个新步骤隐式衔接最后完成的步骤
     assert t1.task_id in nxt.depends_on
     print("5. 重规划 ok（v2，保留 2 个已完成，新增 2 个，衔接无环）")

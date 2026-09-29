@@ -63,9 +63,9 @@ def default_cases() -> List[EvalCase]:
         EvalCase(
             case_id="e2e_sales_analysis",
             goal="对销售数据 sales_demo.csv 做端到端分析：体检 → 清洗 → EDA → 出图 → 报告",
-            description="离线确定性主链路：5 个角色顺序协作，工具真实执行、产物真实落盘",
+            description="离线确定性主链路：3 个角色按 5 个步骤协作，工具真实执行、产物真实落盘",
             expect_status="finished",
-            required_agents=["inspector", "cleaner", "analyst", "chartist", "reporter"],
+            required_agents=["data-explorer", "analyst", "reporter"],
             required_tools=["data_inspector", "data_cleaner", "eda", "chart_generator"],
             forbidden_tools=[],
             required_artifact_kinds=["dataset", "chart", "report"],

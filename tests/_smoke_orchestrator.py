@@ -2,7 +2,7 @@
 
 覆盖：
 1. ScopedBroker 受限视图：子 Agent 越权工具被拦截；
-2. happy path：inspector→analyst→reporter 三个子任务依次执行、过质量门、汇总；
+2. happy path：data-explorer→analyst→reporter 三个子任务依次执行、过质量门、汇总；
 3. Critic 连续否决 → RETRY（重试 2 次）→ REPLAN（重规划补步骤）→ 完成。
 
 运行（项目根目录）：
@@ -24,7 +24,7 @@ from harness.tool_broker import ToolBroker
 
 PLAN_PAYLOAD = {
     "tasks": [
-        {"title": "数据体检", "description": "画像", "assigned_to": "inspector",
+        {"title": "数据体检", "description": "画像", "assigned_to": "data-explorer",
          "depends_on": [], "acceptance_criteria": ["给出 schema"], "expected_artifacts": []},
         {"title": "EDA 分析", "description": "分析", "assigned_to": "analyst",
          "depends_on": [0], "acceptance_criteria": ["有关键指标"], "expected_artifacts": []},
@@ -33,7 +33,7 @@ PLAN_PAYLOAD = {
     ]
 }
 
-# 重规划：原 inspector 路线走不通，改为直接让 reporter 基于已有信息出报告
+# 重规划：原 data-explorer 路线走不通，改为直接让 reporter 基于已有信息出报告
 REPLAN_PAYLOAD = {
     "tasks": [
         {"title": "补写报告", "description": "直接汇总", "assigned_to": "reporter",
@@ -103,13 +103,13 @@ def _build_broker() -> ToolBroker:
 
 def _build_registry() -> AgentRegistry:
     defs = {
-        "inspector": SubAgentDef(name="inspector", description="体检",
+        "data-explorer": SubAgentDef(name="data-explorer", description="体检",
                                  system_prompt="你是体检员。", tools=["mock_step"]),
         "analyst": SubAgentDef(name="analyst", description="分析",
                                system_prompt="你是分析师。", tools=["mock_step"]),
         "reporter": SubAgentDef(name="reporter", description="报告",
                                 system_prompt="你是报告员。", tools=[]),
-        "executor": SubAgentDef(name="executor", description="通用",
+        "analyst": SubAgentDef(name="analyst", description="通用",
                                 system_prompt="你是通用执行员。", tools=["*"]),
     }
     return AgentRegistry(defs)
@@ -117,7 +117,7 @@ def _build_registry() -> AgentRegistry:
 
 def test_scoped_broker_blocks_out_of_scope() -> None:
     registry = _build_registry()
-    view = registry.scoped_broker(_build_broker(), "inspector")
+    view = registry.scoped_broker(_build_broker(), "data-explorer")
 
     ok, _, _ = view.invoke("mock_step", {"q": "x"}, {})
     assert ok, "白名单内工具应可调用"
@@ -150,12 +150,12 @@ def test_happy_path() -> None:
     assert all(r.success for r in state["sub_results"])
     plan = state["plan"]
     assert store.is_complete(plan) and plan.progress == 1.0
-    assert [t.assigned_to for t in plan.tasks] == ["inspector", "analyst", "reporter"]
+    assert [t.assigned_to for t in plan.tasks] == ["data-explorer", "analyst", "reporter"]
     print("2. 三子任务 happy path ok（依次执行、全过门、汇总成报告）")
 
 
 def test_retry_then_replan() -> None:
-    # 前 3 次 Critic 都否决：inspector 重试 2 次后仍不过 → REPLAN；第 4 次（新 reporter）放行
+    # 前 3 次 Critic 都否决：data-explorer 重试 2 次后仍不过 → REPLAN；第 4 次（新 reporter）放行
     llm = MockOrchLLM(critic_deny=3)
     broker = _build_broker()
     registry = _build_registry()
@@ -175,7 +175,7 @@ def test_retry_then_replan() -> None:
     plan = state["plan"]
     assert state["status"] == "finished", state.get("error")
     assert plan.version == 2 and plan.replan_count == 1, "应已重规划一次"
-    # inspector 执行 3 次（首跑 + 2 重试），重规划后 reporter 执行 1 次
+    # data-explorer 执行 3 次（首跑 + 2 重试），重规划后 reporter 执行 1 次
     assert len(state["sub_results"]) == 4, len(state["sub_results"])
     assert store.is_complete(plan)
     finished = [t for t in plan.tasks if t.status.value == "completed"]

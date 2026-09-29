@@ -22,20 +22,25 @@ from harness.tool_broker import ToolBroker
 logger = logging.getLogger(__name__)
 
 
-# 数据分析 / ETL 的专业子 Agent 角色提示（与后续 agents 注册表保持一致）。
+# 数据分析 / ETL 的专业子 Agent 角色提示（与 agents 注册表保持一致）。
 # critic 是质量门裁判、supervisor 是主控，均不参与执行，故不在此列。
 DEFAULT_AGENT_ROLES: dict[str, str] = {
-    "inspector": "数据体检员：读取数据，输出 schema、行数、缺失率、质量风险画像",
-    "cleaner": "数据清洗工程师：处理缺失/重复/类型/异常/文本规范，产出干净数据集与清洗报告",
-    "analyst": "EDA 分析师：分布、统计、相关性、对比、假设检验，可做只读 SQL 查询",
-    "chartist": "可视化工程师：依据结论选择图型，产出图表图片",
-    "coder": "沙箱执行员：在隔离沙箱中运行自定义 pandas/python，完成复杂变换与临时建模",
-    "reporter": "报告撰写员：汇总各步结论与图表，产出最终分析报告",
-    "qa": "QA/质检员：审查分析逻辑与方法论（幸存者偏差、辛普森悖论、数据泄露），只审不改",
-    "executor": "通用执行员：当任务无法明确归入上述专业角色时使用",
+    "data-explorer": (
+        "数据探查与清洗：读取数据输出 schema/行数/缺失率/质量风险画像，"
+        "再处理缺失/重复/类型/异常/文本规范，产出干净数据集与清洗报告"
+    ),
+    "analyst": (
+        "分析建模与可视化：EDA、只读 SQL、复杂计算与临时建模，"
+        "并按结论选出图型产出图表"
+    ),
+    "reporter": (
+        "报告生成与质检：汇总上游结论与图表成稿，"
+        "并审查方法论缺陷（幸存者偏差/辛普森悖论/数据泄露）"
+    ),
 }
 
-DEFAULT_EXECUTOR = "executor"
+# 规划器给出未知负责人时的回退角色：取工具覆盖面最广的一个
+DEFAULT_AGENT = "analyst"
 
 
 class TaskPlanner:
@@ -55,7 +60,7 @@ class TaskPlanner:
         llm: Any,
         broker: Optional[ToolBroker] = None,
         available_agents: Optional[list[str]] = None,
-        default_agent: str = DEFAULT_EXECUTOR,
+        default_agent: str = DEFAULT_AGENT,
         middleware: Optional[Any] = None,
     ) -> None:
         self.llm = llm

@@ -35,10 +35,10 @@ def test_token_usage() -> None:
     assert client.usage_by_agent["supervisor"]["calls"] == 1
 
     # 子 Agent 调用（绑定归因）
-    tok = bind_usage_context(agent_id="etl-agent:inspector", session_id="s", trace_id="t")
+    tok = bind_usage_context(agent_id="agent:data-explorer", session_id="s", trace_id="t")
     client._record_usage(_resp(5, 5, 10))
     reset_usage_context(tok)
-    assert client.usage_by_agent["etl-agent:inspector"]["total_tokens"] == 10
+    assert client.usage_by_agent["agent:data-explorer"]["total_tokens"] == 10
     assert client.usage_total["total_tokens"] == 130
 
     # 无 usage 字段 → 忽略
