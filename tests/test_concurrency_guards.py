@@ -121,6 +121,105 @@ class TestSandboxConcurrency:
 
 
 # ======================================================================
+# 并行调度：就绪集并发执行
+# ======================================================================
+class _ConcurrencyProbeLLM:
+    """记录同时有多少个子 Agent 在跑，并回放固定的计划。"""
+
+    def __init__(self, plan: dict) -> None:
+        self.plan = plan
+        self.running = 0
+        self.peak = 0
+        self.lock = threading.Lock()
+
+    def chat_json(self, messages) -> dict:
+        if "质量门裁判" in messages[0]["content"]:
+            return {"passed": True, "reason": "ok", "needs_human": False}
+        return self.plan
+
+    def chat(self, messages, temperature=None) -> str:
+        system = messages[0]["content"] if messages else ""
+        if "报告汇总者" in system:
+            return "最终报告"
+        with self.lock:
+            self.running += 1
+            self.peak = max(self.peak, self.running)
+        try:
+            time.sleep(0.05)          # 拉长窗口，让并发与否看得出来
+            return json.dumps({"final_answer": "完成"}, ensure_ascii=False)
+        finally:
+            with self.lock:
+                self.running -= 1
+
+
+def _step(title: str, deps: list[int]) -> dict:
+    return {"title": title, "description": "d", "assigned_to": "reporter",
+            "depends_on": deps, "acceptance_criteria": [], "expected_artifacts": []}
+
+
+def _run_plan(plan: dict, thread_id: str):
+    from harness.agents.registry import AgentRegistry
+    from harness.models import ToolDef
+    from harness.orchestrator import build_plan_execute_graph, make_plan_execute_state
+    from harness.planning import QualityGate, TaskPlanner
+    from harness.tool_broker import ToolBroker
+
+    llm = _ConcurrencyProbeLLM(plan)
+    broker = ToolBroker()
+    broker.register(ToolDef(name="noop", description="d", parameters={}),
+                    lambda a, c: (True, "ok", {}))
+    graph = build_plan_execute_graph(
+        llm, broker, registry=AgentRegistry(),
+        planner=TaskPlanner(llm, available_agents=["reporter"]),
+        gate=QualityGate(llm=llm),
+    )
+    final = graph.invoke(make_plan_execute_state("目标"), {"configurable": {"thread_id": thread_id}})
+    return llm, final
+
+
+class TestParallelDispatch:
+    def test_independent_tasks_run_concurrently(self) -> None:
+        """depends_on 为空的多条任务本就无先后关系，应该并发跑而不是白等。"""
+        llm, final = _run_plan(
+            {"tasks": [_step("A", []), _step("B", []), _step("C", [])]}, "par-1",
+        )
+        assert final["status"] == "finished"
+        assert len(final["sub_results"]) == 3, "三个子任务的结果都要留下"
+        assert llm.peak > 1, f"没有并发（峰值 {llm.peak}）—— 就绪集被串行执行了"
+
+    def test_dependent_tasks_stay_sequential(self) -> None:
+        """有依赖的必须串行：0 → 1 → 2，任一步都不该和另一步同时跑。"""
+        llm, final = _run_plan(
+            {"tasks": [_step("A", []), _step("B", [0]), _step("C", [1])]}, "par-2",
+        )
+        assert final["status"] == "finished"
+        assert len(final["sub_results"]) == 3
+        assert llm.peak == 1, f"有依赖的任务被并发了（峰值 {llm.peak}）"
+
+    def test_mixed_plan_parallelizes_only_the_ready_set(self) -> None:
+        """扇出 + 汇聚：A/B 并发，C 依赖两者只能等。"""
+        llm, final = _run_plan(
+            {"tasks": [_step("A", []), _step("B", []), _step("C", [0, 1])]}, "par-3",
+        )
+        assert final["status"] == "finished"
+        assert len(final["sub_results"]) == 3
+        assert llm.peak > 1, "扇出的两条没有并发"
+
+    def test_max_parallel_caps_the_batch(self, monkeypatch) -> None:
+        """显式收窄并发度时，一批里最多只跑那么多个。"""
+        from harness.config import settings
+
+        monkeypatch.setattr(settings.runtime, "max_parallel_subtasks", 2)
+        llm, final = _run_plan(
+            {"tasks": [_step("A", []), _step("B", []), _step("C", []), _step("D", [])]},
+            "par-4",
+        )
+        assert final["status"] == "finished"
+        assert len(final["sub_results"]) == 4, "收窄并发不该丢任务，只是分批跑"
+        assert llm.peak <= 2, f"并发峰值 {llm.peak} 超过上限 2"
+
+
+# ======================================================================
 # sub_results 的累加语义
 # ======================================================================
 class TestSubResultsAccumulate:

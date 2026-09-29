@@ -281,6 +281,13 @@ class RuntimeSettings(BaseSettings):
     checkpoint_dir: str = "data/checkpoints"
     audit_dir: str = "data/audit"
     max_workers: int = 10
+    # 单个调度批次里**并发执行**的子任务数上限。
+    #   0  = 按就绪集大小，不额外限制（默认）
+    #   >0 = 显式指定
+    # 不额外限制的理由：并发度天然受"就绪集大小"约束（计划里同时无依赖的任务数），
+    # 而真正稀缺的资源（沙箱）已由 SANDBOX_MAX_CONCURRENCY 单独限流，其余开销是
+    # LLM 网络等待。若实测出现线程/限流压力，再显式收窄。
+    max_parallel_subtasks: int = 0
     default_max_steps: int = 20
     default_timeout_seconds: int = 300
 

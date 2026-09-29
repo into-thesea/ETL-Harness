@@ -273,12 +273,24 @@ class TaskStore:
                 return False
         return True
 
+    def runnable_tasks(self, plan: TaskPlan, limit: int = 0) -> list[TaskStep]:
+        """按声明顺序返回**全部**依赖已满足的待处理任务（就绪集）。
+
+        返回一批而不是一个，是为了让互不依赖的子任务能并发执行 —— 计划里
+        ``depends_on`` 为空的多条任务本来就没有先后关系，串着跑是白等。
+
+        ``limit`` > 0 时按声明顺序截断；并发度由调用方按资源决定，不由数据结构决定。
+        """
+        ready = [
+            step for step in plan.tasks
+            if step.status == TaskStatus.PENDING and self._deps_ready(plan, step)
+        ]
+        return ready[:limit] if limit > 0 else ready
+
     def next_runnable_task(self, plan: TaskPlan) -> Optional[TaskStep]:
         """按声明顺序返回第一个【待处理且依赖已满足】的任务；没有则 None。"""
-        for step in plan.tasks:
-            if step.status == TaskStatus.PENDING and self._deps_ready(plan, step):
-                return step
-        return None
+        ready = self.runnable_tasks(plan, limit=1)
+        return ready[0] if ready else None
 
     def is_complete(self, plan: TaskPlan) -> bool:
         """全部任务 completed 或 skipped 才算完成。"""

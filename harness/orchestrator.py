@@ -25,6 +25,7 @@ import logging
 import operator
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from typing import Annotated, Any, Callable, Optional
 
@@ -66,7 +67,10 @@ class PlanExecuteState(TypedDict, total=False):
     origin_principal: str
 
     plan: Optional[TaskPlan]
-    current_task: Any                 # 当前在执行的 TaskStep
+    current_task: Any                 # 本轮「焦点」任务（gate/human/replan 据此处理）
+    current_tasks: list[Any]          # 本轮并发执行的就绪任务集合
+    # 本轮执行产出的结果。覆盖语义：每次 execute 重置，供 gate 逐个判定
+    batch_results: list[SubAgentResult]
     last_result: Optional[SubAgentResult]
     # 累加语义：节点只回传**本次新增的**结果，由 reducer 合并。
     # 不加 reducer 的话这里是「读-改-写」，两个子任务并发执行时后写的会覆盖先写的，
@@ -105,6 +109,7 @@ class PlanExecuteNodes:
         skill_registry: Any = None,
         datasources: Any = None,
         long_term_memory: Any = None,
+        max_parallel: Optional[int] = None,
     ) -> None:
         self.llm = llm
         self.broker = broker
@@ -138,6 +143,10 @@ class PlanExecuteNodes:
         # None 表示不启用长期记忆 —— 与技能/上下文管理一样是可插拔的增强项，
         # 任一环节失败都不影响任务本身。
         self.long_term_memory = long_term_memory
+        # 单批并发的子任务数上限（0 = 按就绪集大小，见 RuntimeSettings 的说明）
+        self.max_parallel = (
+            settings.runtime.max_parallel_subtasks if max_parallel is None else max_parallel
+        )
         self._subgraph_cache: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -219,27 +228,32 @@ class PlanExecuteNodes:
     # ------------------------------------------------------------------
     def dispatch_node(self, state: PlanExecuteState) -> dict:
         plan = state["plan"]
-        task = self.store.next_runnable_task(plan)
-        if task is None:
-            return {"plan": plan, "current_task": None}
-        self.store.mark_in_progress(plan, task.task_id)
-        logger.info("Dispatch → %s (%s)", task.title, task.assigned_to)
-        return {"plan": plan, "current_task": task}
+        # 一次取**全部**就绪任务：depends_on 为空的多条任务本来就没有先后关系，
+        # 串着跑是白等。互不依赖才可并发，所以直接按依赖图取就绪集。
+        tasks = self.store.runnable_tasks(plan, limit=self.max_parallel)
+        if not tasks:
+            return {"plan": plan, "current_task": None, "current_tasks": [],
+                    "batch_results": []}
+        for task in tasks:
+            self.store.mark_in_progress(plan, task.task_id)
+        if len(tasks) > 1:
+            logger.info("Dispatch → %d 个就绪任务并发执行：%s",
+                        len(tasks), [t.title for t in tasks])
+        else:
+            logger.info("Dispatch → %s (%s)", tasks[0].title, tasks[0].assigned_to)
+        return {"plan": plan, "current_task": tasks[0], "current_tasks": tasks,
+                "batch_results": []}
 
     # ------------------------------------------------------------------
     # 节点：执行（命令式调用专业子 Agent 的执行子图，独立上下文）
     # ------------------------------------------------------------------
-    def execute_node(self, state: PlanExecuteState) -> dict:
-        plan = state["plan"]
-        task = state["current_task"]
+    def _prepare_subtask(self, plan: TaskPlan, task: Any, state: PlanExecuteState):
+        """备好一个子任务的执行子图、初始状态与 config。"""
         agent_def = self.registry.get(task.assigned_to)
-
         subgraph = self._executor_for(agent_def.name)
         feedback = state.get("feedback", "") if task.retry_count > 0 else ""
-        desc = self._compose_subtask(task, plan, feedback)
-
         sub_state = make_executor_state(
-            desc,
+            self._compose_subtask(task, plan, feedback),
             session_id=state.get("session_id"),
             agent_id=f"{state.get('agent_id', 'etl-agent')}:{agent_def.name}",
             role=agent_def.required_role,
@@ -248,45 +262,42 @@ class PlanExecuteNodes:
             # 长期记忆随任务下传到每个子任务：由执行体的历史压缩环节前插进 prompt
             long_term_context=state.get("long_term_context") or "",
         )
-
         # 子任务独立 thread_id：同一子任务重试 / 审批恢复时复用，从断点续跑而非重跑
-        sub_thread_id = f"{state.get('session_id', 'default')}:{task.task_id}"
-        sub_config = {"configurable": {"thread_id": sub_thread_id}}
+        sub_config = {"configurable": {
+            "thread_id": f"{state.get('session_id', 'default')}:{task.task_id}"
+        }}
+        return agent_def, subgraph, sub_state, sub_config
 
-        start = time.time()
-        # 只包住首次 invoke：下面的 interrupt() 是**控制流**（挂起等人审批）而非
-        # 失败，包进去会被记成 ERROR，反而误导排查。
-        with _span(state, "delegate", agent_def.name):
-            out = subgraph.invoke(sub_state, sub_config)
+    def _resume_with_approval(self, subgraph, sub_config, out, task, agent_def):
+        """把子图的中断冒泡给上层图，拿到人工决策后恢复子图。
 
-        # 子图在工具审批 interrupt 处暂停：冒泡到顶层图等待人工决策
-        pending_interrupts = out.get("__interrupt__")
-        if pending_interrupts:
-            request = pending_interrupts[0].value
-            if isinstance(request, dict):
-                request = dict(request)
-                request.setdefault("task_id", task.task_id)
-                request.setdefault("task_title", task.title)
-                request.setdefault("sub_agent", agent_def.name)
-            # resume 后本节点重新执行：子图同 thread_id 幂等返回同一中断，
-            # 此处 interrupt 立即返回审批值，再用 Command 恢复子图。
-            decision = interrupt(request)
-            out = subgraph.invoke(Command(resume=decision), sub_config)
+        **必须在节点自己的线程里调用**：``interrupt()`` 靠抛异常把控制权交回
+        graph runner，worker 线程里调会被线程池吞掉。
+        """
+        request = out["__interrupt__"][0].value
+        if isinstance(request, dict):
+            request = dict(request)
+            request.setdefault("task_id", task.task_id)
+            request.setdefault("task_title", task.title)
+            request.setdefault("sub_agent", agent_def.name)
+        # resume 后本节点重新执行：子图同 thread_id 幂等返回同一中断，
+        # 此处 interrupt 立即返回审批值，再用 Command 恢复子图。
+        decision = interrupt(request)
+        return subgraph.invoke(Command(resume=decision), sub_config)
 
-        duration_ms = int((time.time() - start) * 1000)
-
+    def _to_result(self, task: Any, agent_def: Any, out: dict, duration_ms: int,
+                   error: Optional[str] = None) -> SubAgentResult:
+        """把子图输出整理成 SubAgentResult。"""
         success = out.get("status") == "finished" and bool(out.get("final_answer"))
         conclusion = out.get("final_answer") or ""
         if not success and not conclusion:
             conclusion = out.get("last_observation") or ""
-
         # 汇总执行期各工具沉淀的结构化产物
         artifacts: dict[str, Any] = {}
         for key, value in (out.get("working_memory") or {}).items():
             if key.startswith("result_") and isinstance(value, dict):
                 artifacts.update(value)
-
-        result = SubAgentResult(
+        return SubAgentResult(
             sub_agent_name=agent_def.name,
             task_id=task.task_id,
             success=success,
@@ -294,50 +305,165 @@ class PlanExecuteNodes:
             artifacts=artifacts,
             steps_taken=out.get("current_step", 0),
             duration_ms=duration_ms,
-            error=None if success else "执行子图未在最大步数内产出结论",
+            error=None if success else (error or "执行子图未在最大步数内产出结论"),
         )
-        logger.info("Executed %s for %s: success=%s steps=%d %dms",
-                    agent_def.name, task.title, success, result.steps_taken, duration_ms)
-        # 只回传增量：reducer 负责累加，节点不做读-改-写
-        return {"plan": plan, "current_task": task, "last_result": result,
-                "sub_results": [result]}
+
+    def _run_one(self, plan: TaskPlan, task: Any, state: PlanExecuteState) -> SubAgentResult:
+        """执行单个子任务（含审批中断）。"""
+        agent_def, subgraph, sub_state, sub_config = self._prepare_subtask(plan, task, state)
+        start = time.time()
+        # 只包住首次 invoke：下面的 interrupt() 是**控制流**（挂起等人审批）而非
+        # 失败，包进去会被记成 ERROR，反而误导排查。
+        with _span(state, "delegate", agent_def.name):
+            out = subgraph.invoke(sub_state, sub_config)
+        if out.get("__interrupt__"):
+            out = self._resume_with_approval(subgraph, sub_config, out, task, agent_def)
+        return self._to_result(task, agent_def, out, int((time.time() - start) * 1000))
+
+    def _run_batch(self, plan: TaskPlan, tasks: list[Any],
+                   state: PlanExecuteState) -> list[SubAgentResult]:
+        """并发执行多个互不依赖的子任务。
+
+        分工是刻意的：**worker 只负责把子图跑到中断点，中断由本节点在自己线程里
+        逐个处理** —— 见 :meth:`_resume_with_approval`。代价是多个任务同时要审批时
+        排队逐个呈现，而不是并行弹多个；这在有人的环节里反而更合适。
+
+        单个子任务失败不牵连其他：worker 里的异常收成一条 failed 结果。
+        """
+        prepared = [(t,) + self._prepare_subtask(plan, t, state) for t in tasks]
+        outcomes: dict[str, tuple[dict, int]] = {}
+        errors: dict[str, str] = {}
+
+        def work(item) -> None:
+            task, agent_def, subgraph, sub_state, sub_config = item
+            started = time.time()
+            try:
+                with _span(state, "delegate", agent_def.name):
+                    out = subgraph.invoke(sub_state, sub_config)
+                outcomes[task.task_id] = (out, int((time.time() - started) * 1000))
+            except Exception as e:  # noqa: BLE001 - 一个子任务失败不该拖垮整批
+                logger.error("并发子任务 %s 异常：%s", task.title, e, exc_info=True)
+                errors[task.task_id] = f"{type(e).__name__}: {e}"
+
+        with ThreadPoolExecutor(max_workers=len(prepared),
+                                thread_name_prefix="subtask") as pool:
+            futures = [pool.submit(work, item) for item in prepared]
+            for future in futures:
+                future.result()  # work 内部已兜底，这里只等它结束
+
+        results: list[SubAgentResult] = []
+        for task, agent_def, subgraph, sub_state, sub_config in prepared:
+            if task.task_id in errors:
+                results.append(self._to_result(task, agent_def, {}, 0, error=errors[task.task_id]))
+                continue
+            out, duration_ms = outcomes[task.task_id]
+            if out.get("__interrupt__"):
+                # 中断逐个处理：interrupt() 只能在本节点的线程里调
+                began = time.time()
+                out = self._resume_with_approval(subgraph, sub_config, out, task, agent_def)
+                duration_ms += int((time.time() - began) * 1000)
+            results.append(self._to_result(task, agent_def, out, duration_ms))
+        return results
+
+    def execute_node(self, state: PlanExecuteState) -> dict:
+        plan = state["plan"]
+        tasks = list(state.get("current_tasks") or [])
+        if not tasks and state.get("current_task") is not None:
+            tasks = [state["current_task"]]      # 兼容没有 current_tasks 的历史状态
+        if not tasks:
+            return {"plan": plan, "batch_results": [], "last_result": None}
+
+        results = ([self._run_one(plan, tasks[0], state)] if len(tasks) == 1
+                   else self._run_batch(plan, tasks, state))
+
+        for r in results:
+            logger.info("Executed %s for task %s: success=%s steps=%d %dms",
+                        r.sub_agent_name, r.task_id[:8], r.success, r.steps_taken, r.duration_ms)
+        # sub_results 走累加 reducer，这里只回传本轮增量
+        return {"plan": plan, "current_task": tasks[0], "batch_results": results,
+                "last_result": results[0], "sub_results": results}
 
     # ------------------------------------------------------------------
     # 节点：质量门
     # ------------------------------------------------------------------
+    #: 一批里多个子任务给出不同处置时，取「最需要动作」的那个决定整批怎么走。
+    #  FAIL 终止；HUMAN 要等人，优先级高于自动处置（别绕过人继续跑）；
+    #  REPLAN 比 RETRY 动得大，优先；都通过才继续 dispatch。
+    _GATE_PRIORITY = (
+        GateDecision.FAIL, GateDecision.HUMAN, GateDecision.REPLAN,
+        GateDecision.RETRY, GateDecision.PASS,
+    )
+
     def gate_node(self, state: PlanExecuteState) -> dict:
         plan = state["plan"]
-        task = state["current_task"]
-        result = state["last_result"]
+        results = list(state.get("batch_results") or [])
+        if not results and state.get("last_result") is not None:
+            results = [state["last_result"]]      # 兼容没有 batch_results 的历史状态
 
-        # gate.evaluate 可能调 Critic（真实 LLM 调用），是耗时点，值得一条 Span
-        with _span(state, "gate", "quality_check") as sp:
-            verdict = self.gate.evaluate(task, result)
-            sp.tags["decision"] = getattr(verdict.decision, "value", str(verdict.decision))
-        self.store.record_gate(plan, task.task_id, verdict.decision, verdict.note)
+        # 结果 → 任务的配对（按 task_id）；本轮任务集合来自 current_tasks
+        by_id = {t.task_id: t for t in (state.get("current_tasks") or [])}
+        focus_task = state.get("current_task")
+        if focus_task is not None:
+            by_id.setdefault(focus_task.task_id, focus_task)
 
-        if verdict.decision == GateDecision.PASS:
-            self.store.mark_completed(
-                plan, task.task_id, result=result.conclusion, artifacts=result.artifacts
-            )
-        elif verdict.decision == GateDecision.RETRY:
-            self.store.incr_retry(plan, task.task_id)
-            self.store.reset_for_retry(plan, task.task_id)
-        elif verdict.decision == GateDecision.REPLAN:
-            self.store.mark_failed(plan, task.task_id, error=verdict.note)
-        elif verdict.decision == GateDecision.HUMAN:
-            self.store.mark_awaiting_approval(plan, task.task_id, verdict.note)
-        elif verdict.decision == GateDecision.FAIL:
-            self.store.mark_failed(plan, task.task_id, error=verdict.note)
+        # 每个子任务各判一次：并行批次里它们的处置可能不同，不能只看一个
+        worst: Optional[GateDecision] = None
+        focus: tuple[Any, Any] = (None, None)
+        feedback = ""
+        failed_error: Optional[str] = None
 
-        update = {
+        for result in results:
+            task = by_id.get(getattr(result, "task_id", None))
+            if task is None:
+                logger.warning("质量门收到未知任务的执行结果，跳过：%s",
+                               getattr(result, "task_id", "?"))
+                continue
+            # gate.evaluate 可能调 Critic（真实 LLM 调用），是耗时点，值得一条 Span
+            with _span(state, "gate", "quality_check") as sp:
+                verdict = self.gate.evaluate(task, result)
+                sp.tags["decision"] = getattr(verdict.decision, "value", str(verdict.decision))
+                sp.tags["task"] = task.title
+            self.store.record_gate(plan, task.task_id, verdict.decision, verdict.note)
+
+            if verdict.decision == GateDecision.PASS:
+                self.store.mark_completed(
+                    plan, task.task_id, result=result.conclusion, artifacts=result.artifacts
+                )
+            elif verdict.decision == GateDecision.RETRY:
+                self.store.incr_retry(plan, task.task_id)
+                self.store.reset_for_retry(plan, task.task_id)
+            elif verdict.decision == GateDecision.REPLAN:
+                self.store.mark_failed(plan, task.task_id, error=verdict.note)
+            elif verdict.decision == GateDecision.HUMAN:
+                self.store.mark_awaiting_approval(plan, task.task_id, verdict.note)
+            elif verdict.decision == GateDecision.FAIL:
+                self.store.mark_failed(plan, task.task_id, error=verdict.note)
+
+            # 记下"最需要动作"的那一个作为整批的路由依据与后续节点的处理对象
+            rank = self._GATE_PRIORITY.index(verdict.decision)
+            if worst is None or rank < self._GATE_PRIORITY.index(worst):
+                worst = verdict.decision
+                focus = (task, result)
+                feedback = verdict.retry_feedback
+                if verdict.decision == GateDecision.FAIL:
+                    failed_error = (
+                        f"子任务 {task.title} 质量门判定不可恢复失败：{verdict.note}"
+                    )
+
+        if worst is None:      # 没有可判定的结果（理论上不会走到）
+            worst = GateDecision.PASS
+
+        update: dict[str, Any] = {
             "plan": plan,
-            "last_decision": verdict.decision,
-            "feedback": verdict.retry_feedback,
+            "last_decision": worst,
+            "feedback": feedback,
+            # 后续 human/replan 节点只处理一个任务，把焦点指向最需要动作的那个
+            "current_task": focus[0] if focus[0] is not None else state.get("current_task"),
+            "last_result": focus[1] if focus[1] is not None else state.get("last_result"),
         }
-        if verdict.decision == GateDecision.FAIL:
+        if failed_error:
             update["status"] = "failed"
-            update["error"] = f"子任务 {task.title} 质量门判定不可恢复失败：{verdict.note}"
+            update["error"] = failed_error
         return update
 
     # ------------------------------------------------------------------
@@ -509,6 +635,7 @@ def build_plan_execute_graph(
     skill_registry: Any = None,
     datasources: Any = None,
     long_term_memory: Any = None,
+    max_parallel: Optional[int] = None,
 ):
     """编译顶层 Plan-and-Execute 图并返回（compiled graph）。
 
@@ -538,6 +665,7 @@ def build_plan_execute_graph(
         skill_registry=skill_registry,
         datasources=datasources,
         long_term_memory=long_term_memory,
+        max_parallel=max_parallel,
     )
 
     g = StateGraph(PlanExecuteState)
@@ -594,6 +722,8 @@ def make_plan_execute_state(
         "origin_principal": origin_principal,
         "plan": None,
         "current_task": None,
+        "current_tasks": [],
+        "batch_results": [],
         "last_result": None,
         "sub_results": [],
         "last_decision": "",
