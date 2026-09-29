@@ -17,6 +17,7 @@ from typing import Any, Optional
 
 from harness.agents.registry import AgentRegistry
 from harness.audit import get_audit_logger
+from harness.trace import cleanup_tracer, get_tracer
 from harness.context import ContextManager
 from harness.orchestrator import build_plan_execute_graph, make_plan_execute_state
 from harness.planning import DataQualityChecker, QualityGate, TaskPlanner, TaskStore
@@ -207,12 +208,16 @@ class HarnessService:
     def _lock(self, thread_id: str) -> asyncio.Lock:
         return self._locks.setdefault(thread_id, asyncio.Lock())
 
-    def _spawn(self, thread_id: str, coro) -> asyncio.Task:
+    def _spawn(self, thread_id: str, coro, trace_id: str = "") -> asyncio.Task:
         """在后台驱动图，并记录任务（异常仅记录，不静默成功）。"""
         task = asyncio.create_task(coro)
         self._bg_tasks[thread_id] = task
 
         def _done(t: asyncio.Task) -> None:
+            # 任务结束就释放该链路的 Tracer。不释放的话它持有的 Span 会在进程内
+            # 永久驻留 —— 这是接埋点时最容易漏的一步。
+            if trace_id:
+                cleanup_tracer(trace_id)
             if t.cancelled():
                 return
             if t.exception():
@@ -231,8 +236,15 @@ class HarnessService:
         initial = make_plan_execute_state(
             goal, context=context, session_id=thread_id, role=role, origin_principal=origin_principal
         )
-        self._spawn(thread_id, self.graph.ainvoke(initial, self._config(thread_id)))
-        logger.info("Task created: %s", thread_id)
+        trace_id = str(initial.get("trace_id") or "")
+
+        async def _drive():
+            # 根 Span 覆盖整个请求；各节点在同一 Trace 上嵌套，构成一棵调用树
+            with get_tracer(trace_id).span("request", operation="run_task"):
+                return await self.graph.ainvoke(initial, self._config(thread_id))
+
+        self._spawn(thread_id, _drive(), trace_id)
+        logger.info("Task created: %s (trace=%s)", thread_id, trace_id)
         return thread_id
 
     async def get_status(self, thread_id: str) -> Optional[dict]:

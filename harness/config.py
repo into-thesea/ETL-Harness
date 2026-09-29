@@ -196,10 +196,22 @@ class TraceSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="TRACE_", extra="ignore")
 
     enabled: bool = True
+    # 采样率：按 **trace** 判定（不是按 span），否则同一条链路的调用树会残缺
     sample_rate: float = 1.0
     service_name: str = "governed"
     environment: str = "development"
+    # 单条 Span 的标签数上限，超出丢弃（防止某处循环 add_tag 把内存撑爆）
     max_tags_per_span: int = 50
+
+    # Span 出口：local（落 JSONL，单机默认）| kafka（上送，供链路可视化消费）| none
+    sink: str = "local"
+    # local 出口：落盘目录、单文件上限、保留份数（按大小轮转，留最近几份）
+    local_dir: str = "data/trace"
+    max_file_bytes: int = 33554432
+    backup_count: int = 3
+    # 单条 trace 在内存里保留的 Span 上限：超出后仍写出口，只是不再留内存供
+    # get_trace_tree 查询 —— 否则长任务的内存占用无上限
+    max_spans_per_trace: int = 2000
 
 
 class VFSSettings(BaseSettings):

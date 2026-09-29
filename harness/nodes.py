@@ -31,6 +31,7 @@ from harness.middleware import MiddlewareContext, MiddlewareManager
 from harness.models import ThoughtStep
 from harness.state import AgentState
 from harness.tool_broker import ToolBroker
+from harness.trace import span_for as _span
 
 logger = logging.getLogger(__name__)
 
@@ -481,9 +482,10 @@ class ReActNodes:
 
         _usage_tok = self._bind_usage(state)
         try:
-            result = self.llm.chat_with_tools(
-                messages, self.broker.list_tools_openai_format()
-            )
+            with _span(state, "llm_call", "think_native"):
+                result = self.llm.chat_with_tools(
+                    messages, self.broker.list_tools_openai_format()
+                )
         finally:
             self._unbind_usage(_usage_tok)
         new_messages = [result.raw_message]
@@ -593,7 +595,8 @@ class ReActNodes:
         if raw is None:
             _usage_tok = self._bind_usage(state)
             try:
-                raw = self.llm.chat(messages)
+                with _span(state, "llm_call", "think"):
+                    raw = self.llm.chat(messages)
             finally:
                 self._unbind_usage(_usage_tok)
             if self.middleware is not None:
@@ -731,7 +734,8 @@ class ReActNodes:
                 continue
 
             # Broker 内部跑中间件、PDP、校验、限流、沙箱、审计
-            ok, text, artifacts = self.broker.invoke(name, args, invoke_context)
+            with _span(state, "tool_call", name):
+                ok, text, artifacts = self.broker.invoke(name, args, invoke_context)
             observation = text if ok else f"工具调用失败：{text}"
             observation = self._settle_observation(name, observation, state)
             observations.append(f"[{name}] {observation}")
@@ -792,7 +796,8 @@ class ReActNodes:
             }
 
         # Broker 内部会跑工具中间件、PDP、校验、限流、沙箱、审计
-        ok, text, artifacts = self.broker.invoke(tool_name, tool_args, invoke_context)
+        with _span(state, "tool_call", tool_name):
+            ok, text, artifacts = self.broker.invoke(tool_name, tool_args, invoke_context)
         observation = text if ok else f"工具调用失败：{text}"
         observation = self._settle_observation(tool_name, observation, state)
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from contextlib import nullcontext
 from typing import Any, Callable, Optional
 
 from langgraph.graph import END, START, StateGraph
@@ -31,6 +32,7 @@ from langgraph.types import Command, interrupt
 from typing import TypedDict
 
 from harness.agents.registry import AgentRegistry
+from harness.config import settings
 from harness.graph import build_executor_graph, make_executor_state
 from harness.models import SubAgentResult, TaskPlan, TaskStatus
 from harness.nodes import ReActNodes
@@ -38,11 +40,17 @@ from harness.planning.gate import GateDecision, QualityGate
 from harness.planning.planner import TaskPlanner
 from harness.planning.task_store import TaskStore
 from harness.tool_broker import ToolBroker
+from harness.trace import span_for
 
 logger = logging.getLogger(__name__)
 
 # 人工审批回调：(task, result) -> 是否批准
 ApprovalCallback = Callable[[Any, SubAgentResult], bool]
+
+
+def _span(state: Any, name: str, operation: Optional[str] = None):
+    """取当前链路的 Span 上下文；埋点未启用时空上下文（见 harness.trace.span_for）。"""
+    return span_for(state, name, operation)
 
 
 class PlanExecuteState(TypedDict, total=False):
@@ -185,10 +193,11 @@ class PlanExecuteNodes:
     def plan_node(self, state: PlanExecuteState) -> dict:
         if state.get("plan") is not None:
             return {}
-        long_term_context = self._recall_experience(state)
-        plan = self.planner.plan(state["goal"], state.get("context", ""))
-        self.store.create_plan(plan.goal, plan.tasks, plan_id=plan.plan_id)
-        logger.info("Plan created: %s (%d tasks)", plan.plan_id, len(plan.tasks))
+        with _span(state, "plan", "plan_tasks"):
+            long_term_context = self._recall_experience(state)
+            plan = self.planner.plan(state["goal"], state.get("context", ""))
+            self.store.create_plan(plan.goal, plan.tasks, plan_id=plan.plan_id)
+            logger.info("Plan created: %s (%d tasks)", plan.plan_id, len(plan.tasks))
         return {"plan": plan, "status": "running", "long_term_context": long_term_context}
 
     def _recall_experience(self, state: PlanExecuteState) -> str:
@@ -241,7 +250,10 @@ class PlanExecuteNodes:
         sub_config = {"configurable": {"thread_id": sub_thread_id}}
 
         start = time.time()
-        out = subgraph.invoke(sub_state, sub_config)
+        # 只包住首次 invoke：下面的 interrupt() 是**控制流**（挂起等人审批）而非
+        # 失败，包进去会被记成 ERROR，反而误导排查。
+        with _span(state, "delegate", agent_def.name):
+            out = subgraph.invoke(sub_state, sub_config)
 
         # 子图在工具审批 interrupt 处暂停：冒泡到顶层图等待人工决策
         pending_interrupts = out.get("__interrupt__")
@@ -294,7 +306,10 @@ class PlanExecuteNodes:
         task = state["current_task"]
         result = state["last_result"]
 
-        verdict = self.gate.evaluate(task, result)
+        # gate.evaluate 可能调 Critic（真实 LLM 调用），是耗时点，值得一条 Span
+        with _span(state, "gate", "quality_check") as sp:
+            verdict = self.gate.evaluate(task, result)
+            sp.tags["decision"] = getattr(verdict.decision, "value", str(verdict.decision))
         self.store.record_gate(plan, task.task_id, verdict.decision, verdict.note)
 
         if verdict.decision == GateDecision.PASS:
@@ -416,7 +431,8 @@ class PlanExecuteNodes:
                 messages,
             )
         try:
-            final = self.llm.chat(messages)
+            with _span(state, "synthesize", "final_report"):
+                final = self.llm.chat(messages)
         except Exception as e:  # noqa: BLE001 - 汇总失败也要把已有结论交付
             logger.warning("Synthesize LLM failed: %s", e)
             final = f"（汇总模型调用失败：{e}）\n\n各子任务结论：\n{findings}"
