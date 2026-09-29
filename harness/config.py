@@ -185,6 +185,12 @@ class SandboxSettings(BaseSettings):
     cpu_limit: float = 1.0
     memory_limit: str = "512m"
     ready_timeout_seconds: int = 180
+    # 同时运行的沙箱数上限。每个沙箱要起一个容器、按 cpu_limit / memory_limit
+    # 占资源，不限并发时一批并行子任务能瞬间把宿主压垮。
+    #   0  = 按 CPU 核数 / 单沙箱核数推导（默认，跟着机器走，不拍数字）
+    #   >0 = 显式指定
+    #   <0 = 不限制（不建议）
+    max_concurrency: int = 0
 
     # --- 单次执行（信任边界，勿放宽）---
     timeout_seconds: int = 30

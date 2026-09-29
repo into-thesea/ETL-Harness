@@ -22,10 +22,11 @@
 from __future__ import annotations
 
 import logging
+import operator
 import time
 import uuid
 from contextlib import nullcontext
-from typing import Any, Callable, Optional
+from typing import Annotated, Any, Callable, Optional
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
@@ -67,7 +68,10 @@ class PlanExecuteState(TypedDict, total=False):
     plan: Optional[TaskPlan]
     current_task: Any                 # 当前在执行的 TaskStep
     last_result: Optional[SubAgentResult]
-    sub_results: list[SubAgentResult]
+    # 累加语义：节点只回传**本次新增的**结果，由 reducer 合并。
+    # 不加 reducer 的话这里是「读-改-写」，两个子任务并发执行时后写的会覆盖先写的，
+    # 静默丢掉一条结果 —— 而 evals / examples 都读它，丢了会直接影响评测计分。
+    sub_results: Annotated[list[SubAgentResult], operator.add]
 
     last_decision: str                # 最近一次 Gate 处置
     feedback: str                     # 回灌给重跑/重规划的反馈
@@ -292,11 +296,11 @@ class PlanExecuteNodes:
             duration_ms=duration_ms,
             error=None if success else "执行子图未在最大步数内产出结论",
         )
-        sub_results = list(state.get("sub_results", [])) + [result]
         logger.info("Executed %s for %s: success=%s steps=%d %dms",
                     agent_def.name, task.title, success, result.steps_taken, duration_ms)
+        # 只回传增量：reducer 负责累加，节点不做读-改-写
         return {"plan": plan, "current_task": task, "last_result": result,
-                "sub_results": sub_results}
+                "sub_results": [result]}
 
     # ------------------------------------------------------------------
     # 节点：质量门

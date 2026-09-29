@@ -20,8 +20,11 @@ from __future__ import annotations
 import ast
 import logging
 import os
+import threading
 from datetime import datetime
 from typing import Any, Callable
+
+from harness.config import settings
 
 from harness.sandbox.client import (
     SANDBOX_IN,
@@ -31,6 +34,23 @@ from harness.sandbox.client import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_concurrency_limit() -> int:
+    """解析「同时运行的沙箱数」上限。
+
+    显式配了就用配置；否则按 **CPU 核数 / 单沙箱核数** 推导 —— 每个沙箱会申请
+    ``cpu_limit`` 个核与 ``memory_limit`` 内存，上限本该由宿主容量决定，而不是
+    凭空拍一个数。返回 0 表示不限制。
+    """
+    configured = settings.sandbox.max_concurrency
+    if configured > 0:
+        return configured
+    if configured < 0:
+        return 0
+    cores = os.cpu_count() or 2
+    per_sandbox = max(int(settings.sandbox.cpu_limit or 1), 1)
+    return max(cores // per_sandbox, 1)
 
 OUTPUT_CAP = 4000
 
@@ -100,6 +120,17 @@ class SandboxExecutor:
         self._tasks: dict[str, Callable[..., tuple[bool, str, dict]]] = {
             "code_executor": self._run_python_code,
         }
+        # 并发闸门：沙箱是不可无限扩张的资源，一次并行子任务能瞬间把宿主压垮。
+        self._limit = resolve_concurrency_limit()
+        self._slots = threading.Semaphore(self._limit) if self._limit > 0 else None
+        self._in_use = 0
+        self._in_use_lock = threading.Lock()
+
+    def stats(self) -> dict[str, int]:
+        """并发闸门的运行状态（供运维观察是否长期排队）。"""
+        with self._in_use_lock:
+            in_use = self._in_use
+        return {"limit": self._limit, "in_use": in_use}
 
     # ------------------------------------------------------------------
     # ToolBroker 契约
@@ -126,14 +157,30 @@ class SandboxExecutor:
                 {},
             )
 
+        acquired = False
+        if self._slots is not None:
+            if self._in_use >= self._limit:
+                logger.info("沙箱并发已满（%d/%d），工具 %s 排队等待槽位",
+                            self._in_use, self._limit, name)
+            # 满了就排队而不是拒绝：拒绝只会让上层原样重试，排队才是正确的背压
+            self._slots.acquire()
+            acquired = True
         try:
-            return task(tool_def, args, context or {}, sandbox_config or {})
-        except SandboxUnavailable as exc:
-            # 基础设施不可用 —— fail closed，绝不退化为宿主进程执行
-            return False, f"沙箱不可用，已拒绝执行：{exc}", {}
-        except Exception as exc:  # noqa: BLE001 - 沙箱层兜底，避免拖垮 broker
-            logger.error("沙箱任务 %s 异常：%s", name, exc, exc_info=True)
-            return False, f"沙箱执行异常：{type(exc).__name__}: {exc}", {}
+            with self._in_use_lock:
+                self._in_use += 1
+            try:
+                return task(tool_def, args, context or {}, sandbox_config or {})
+            except SandboxUnavailable as exc:
+                # 基础设施不可用 —— fail closed，绝不退化为宿主进程执行
+                return False, f"沙箱不可用，已拒绝执行：{exc}", {}
+            except Exception as exc:  # noqa: BLE001 - 沙箱层兜底，避免拖垮 broker
+                logger.error("沙箱任务 %s 异常：%s", name, exc, exc_info=True)
+                return False, f"沙箱执行异常：{type(exc).__name__}: {exc}", {}
+        finally:
+            with self._in_use_lock:
+                self._in_use -= 1
+            if acquired:
+                self._slots.release()
 
     # ------------------------------------------------------------------
     # code_executor

@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from typing import Any, Optional
 
 from .config import settings
@@ -56,6 +57,12 @@ class AuditLogger:
         # Kafka 生产者懒加载（开发环境没有 Kafka 时不应在导入阶段阻塞）
         self._producer: Optional[Any] = None
         self._producer_loaded = False
+        # 保证「一行一次写入」。多线程不加锁时，带缓冲的写可能被拆成多次系统
+        # 调用，两个线程的行会交错，产出无法解析的审计文件 —— 而审计是存证，
+        # 读不出来等于没有。
+        # ponytail: 进程内锁。多进程写同一文件需要 O_APPEND 语义或文件锁，
+        # 当前部署是单进程；要多副本写同一份审计文件时再换。
+        self._write_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # 参数哈希
@@ -87,11 +94,20 @@ class AuditLogger:
     # 落地：本地 JSON Lines（始终）+ Kafka（尽力）
     # ------------------------------------------------------------------
     def _write_local(self, record: dict[str, Any]) -> None:
-        """把审计记录追加写入本地 JSON Lines 文件。"""
+        """把审计记录追加写入本地 JSON Lines 文件。
+
+        序列化放在锁外（CPU 活不占锁），只把**写入那一下**锁住。
+        """
+        try:
+            line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+        except Exception as e:  # noqa: BLE001
+            logger.error("Audit record serialize failed: %s", e)
+            return
         try:
             os.makedirs(self.local_dir, exist_ok=True)
-            with open(self.local_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            with self._write_lock:
+                with open(self.local_file, "a", encoding="utf-8") as f:
+                    f.write(line)
         except Exception as e:
             # 审计本地写入失败也不能影响主流程，仅记录错误日志
             logger.error("Audit local write failed: %s", e)
