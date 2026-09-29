@@ -138,7 +138,9 @@ services:
   # 「写入必须失败」由测试实测，不靠假设。
   # ============================================================
   postgres:
-    image: postgres:16-alpine
+    # pgvector 官方镜像：长期记忆的默认向量后端需要 vector 扩展，
+    # 官方 postgres 镜像不含它。
+    image: pgvector/pgvector:pg16
     container_name: governed-postgres
     restart: unless-stopped
     environment:

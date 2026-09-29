@@ -7,6 +7,10 @@
 -- 效果（见 tests/test_datasources_real.py）。
 -- ============================================================================
 
+-- 长期记忆的默认向量后端（harness.memory.PgVectorStore）需要 vector 扩展。
+-- 在这里建、而不是等运行时建：运行时账号就不必具备 superuser 权限。
+CREATE EXTENSION IF NOT EXISTS vector;
+
 CREATE ROLE harness_ro LOGIN PASSWORD 'harness_ro_pw';
 
 CREATE TABLE sales (

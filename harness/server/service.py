@@ -135,6 +135,24 @@ class HarnessService:
         datasources.load_from_settings(settings.datasource)
         self.datasources = datasources
 
+        # 长期记忆：跨会话经验沉淀。后端按 MEMORY_VECTOR_BACKEND 选（默认
+        # pgvector），不可用时自动降级为本地实现 —— 降级是显式的，可从
+        # long_term_memory.backend_name 看到实际生效的是谁。
+        from harness.memory import LongTermMemory
+
+        long_term_memory = LongTermMemory(agent_id="default")
+        self.long_term_memory = long_term_memory
+        if long_term_memory.probe():
+            logger.info("长期记忆就绪：%s", long_term_memory.stats())
+        else:
+            # 记忆是增强项，不可用不阻断启动；但必须**响亮**，否则表现为
+            # "接了线却永远没内容"，排查起来很费时。
+            logger.warning(
+                "长期记忆不可用，本次运行不会沉淀/检索任何经验。原因：%s。"
+                "检查 MEMORY_VECTOR_BACKEND / MEMORY_PG_DSN 与 EMBEDDING_* 配置。",
+                long_term_memory.degraded_reason or "未知（后端探活失败）",
+            )
+
         self.llm = llm
         self.graph = build_plan_execute_graph(
             llm, broker,
@@ -144,6 +162,7 @@ class HarnessService:
             context_manager=context_manager,
             skill_registry=skill_registry,
             datasources=datasources,
+            long_term_memory=long_term_memory,
         )
         self._ready = True
         logger.info("HarnessService assembled (checkpointer=%s)", type(self.checkpointer).__name__)

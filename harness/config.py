@@ -214,6 +214,22 @@ class MemorySettings(BaseSettings):
     working_memory_max_items: int = 100
     local_dir: str = "data/memory"
 
+    # ---- 长期向量记忆 ----
+    # 后端：pgvector（默认）/ milvus / local。首选不可用时自动降级为 local，
+    # 降级是显式的（见 LongTermMemory.backend_name），不会静默换个后端。
+    vector_backend: str = "pgvector"
+    # pgvector 连接串。注意它需要**写权限**，与只读的数据源账号不同；
+    # 留空即判定后端不可用。生产用环境变量注入，别写进版本库。
+    pg_dsn: str = ""
+    # pgvector 索引类型：hnsw / ivfflat / none
+    pg_index: str = "hnsw"
+    # 单条记忆的内容上限：超出截断，避免把整篇报告灌进向量库
+    long_term_max_content_chars: int = 2000
+    # 每个主体（agent_id）保留的条数上限，超出按时间淘汰最旧的
+    long_term_max_items: int = 500
+    # 查询短于这个长度就不检索：避免"分析""报告"这类泛词命中一堆无关记忆
+    long_term_min_query_chars: int = 8
+
 
 class RuntimeSettings(BaseSettings):
     """运行时通用配置。"""

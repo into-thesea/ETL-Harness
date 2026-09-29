@@ -69,6 +69,8 @@ class PlanExecuteState(TypedDict, total=False):
     error: Optional[str]
     max_replans: int
 
+    long_term_context: str            # 规划前检索到的长期记忆，注入下游子任务
+
 
 class PlanExecuteNodes:
     """顶层图的全部节点，持有规划器、存储、注册表、质量门、Broker 等依赖。"""
@@ -90,6 +92,7 @@ class PlanExecuteNodes:
         subgraph_checkpointer: Any = None,
         skill_registry: Any = None,
         datasources: Any = None,
+        long_term_memory: Any = None,
     ) -> None:
         self.llm = llm
         self.broker = broker
@@ -119,6 +122,10 @@ class PlanExecuteNodes:
         # 经执行子图的节点构造注入（不进 state、不被 checkpointer 序列化）；
         # None 时 sql_query 用进程默认单例。
         self.datasources = datasources
+        # 长期记忆（harness.memory.LongTermMemory）：规划前检索注入、收尾后沉淀经验。
+        # None 表示不启用长期记忆 —— 与技能/上下文管理一样是可插拔的增强项，
+        # 任一环节失败都不影响任务本身。
+        self.long_term_memory = long_term_memory
         self._subgraph_cache: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -178,10 +185,21 @@ class PlanExecuteNodes:
     def plan_node(self, state: PlanExecuteState) -> dict:
         if state.get("plan") is not None:
             return {}
+        long_term_context = self._recall_experience(state)
         plan = self.planner.plan(state["goal"], state.get("context", ""))
         self.store.create_plan(plan.goal, plan.tasks, plan_id=plan.plan_id)
         logger.info("Plan created: %s (%d tasks)", plan.plan_id, len(plan.tasks))
-        return {"plan": plan, "status": "running"}
+        return {"plan": plan, "status": "running", "long_term_context": long_term_context}
+
+    def _recall_experience(self, state: PlanExecuteState) -> str:
+        """规划前检索长期记忆，渲染为可注入的文本；未启用/不可用时返回空串。"""
+        if self.long_term_memory is None:
+            return ""
+        try:
+            return self.long_term_memory.build_context_text(state.get("goal", ""))
+        except Exception as e:  # noqa: BLE001 - 记忆是增强项，不得影响任务
+            logger.warning("长期记忆检索失败（忽略，继续规划）：%s", e)
+            return ""
 
     # ------------------------------------------------------------------
     # 节点：调度（取下一个依赖已满足的子任务）
@@ -214,6 +232,8 @@ class PlanExecuteNodes:
             role=agent_def.required_role,
             max_steps=agent_def.max_steps,
             trace_id=state.get("trace_id"),
+            # 长期记忆随任务下传到每个子任务：由执行体的历史压缩环节前插进 prompt
+            long_term_context=state.get("long_term_context") or "",
         )
 
         # 子任务独立 thread_id：同一子任务重试 / 审批恢复时复用，从断点续跑而非重跑
@@ -400,7 +420,26 @@ class PlanExecuteNodes:
         except Exception as e:  # noqa: BLE001 - 汇总失败也要把已有结论交付
             logger.warning("Synthesize LLM failed: %s", e)
             final = f"（汇总模型调用失败：{e}）\n\n各子任务结论：\n{findings}"
+        self._remember_experience(state, plan, final)
         return {"plan": plan, "final_answer": final, "status": "finished"}
+
+    def _remember_experience(self, state: PlanExecuteState, plan: Any, final_answer: str) -> None:
+        """任务成功收尾后沉淀经验；未启用/不可用时静默跳过。
+
+        只在**成功收尾**这条路径上调用：失败任务的结论没有复用价值，沉淀进去
+        只会污染后续检索。
+        """
+        if self.long_term_memory is None:
+            return
+        try:
+            self.long_term_memory.remember_experience(
+                goal=plan.goal,
+                final_answer=final_answer,
+                session_id=state.get("session_id"),
+                trace_id=state.get("trace_id"),
+            )
+        except Exception as e:  # noqa: BLE001 - 记忆是增强项，不得影响交付
+            logger.warning("长期记忆写入失败（忽略，任务照常交付）：%s", e)
 
     # ------------------------------------------------------------------
     # 条件边路由
@@ -449,6 +488,7 @@ def build_plan_execute_graph(
     subgraph_checkpointer: Any = None,
     skill_registry: Any = None,
     datasources: Any = None,
+    long_term_memory: Any = None,
 ):
     """编译顶层 Plan-and-Execute 图并返回（compiled graph）。
 
@@ -463,6 +503,9 @@ def build_plan_execute_graph(
             透传给每个子任务执行子图；None 表示不启用上下文管理。
         skill_registry: Skill 注册中心（``harness.skills.SkillRegistry``），
             透传给每个子任务子图；None 表示不注入技能指引。
+        long_term_memory: 长期记忆（``harness.memory.LongTermMemory``）。规划前
+            检索注入 ``state["long_term_context"]``，任务成功收尾后沉淀经验。
+            None 表示不启用。
     """
     nodes = PlanExecuteNodes(
         llm=llm, broker=broker, planner=planner, store=store, registry=registry,
@@ -474,6 +517,7 @@ def build_plan_execute_graph(
         ),
         skill_registry=skill_registry,
         datasources=datasources,
+        long_term_memory=long_term_memory,
     )
 
     g = StateGraph(PlanExecuteState)
