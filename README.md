@@ -17,7 +17,7 @@
 **规划与编排**
 - 顶层 Plan-and-Execute：模型先把目标拆成子任务，再逐个执行；每个子任务内部走 ReAct 循环
 - 子 Agent 委派：专业子任务交给独立上下文、独立工具集的子 Agent，只回结构化结论，不污染主上下文
-- 8 个内置角色（数据体检 / 清洗 / 分析 / 出图 / 代码 / 报告 / 质检 / 执行）
+- 3 个核心子 Agent（数据探查与清洗 / 分析建模与可视化 / 报告生成与质检）—— 角色数量由**上下文隔离需求**决定而非业务步骤，每个都有独立上下文、专属工具白名单与迭代预算
 
 **上下文与记忆**
 - 虚拟文件系统（VFS）：大结果落盘，prompt 里只留摘要和文件引用，需要时再读全文
@@ -50,10 +50,10 @@
 编排层        LangGraph：顶层 Plan-and-Execute，子任务内 ReAct（think → action → final）
 管控运行时    Tool Broker · 中间件 · PDP / 行列权限 · 审批 · 上下文管理 · Skills · 沙箱
 状态与记忆    VFS · Redis 短期 · Milvus 长期 · 工作记忆 · Checkpoint
-基础设施      Docker Compose：Redis / Milvus / Kafka / MinIO（+ 可选 MySQL/PG）
+基础设施      Docker Compose：Redis / Milvus / Kafka（+ 可选 MinIO / MySQL / PG）
 ```
 
-一次请求的完整调用链、各模块的详细设计见 [`docs/项目计划.md`](docs/项目计划.md)；更完整的架构设计文档仍在整理中。
+一次请求的完整调用链与各模块详细设计见架构设计文档（整理中）。
 
 ## 安装
 
@@ -84,7 +84,7 @@ cd infra
 docker-compose up -d
 ```
 
-默认端口：Redis 6379、Milvus 19530、Kafka 9092、MinIO 9000（控制台 9001）。
+默认端口：Redis 6379、Milvus 19530、Kafka 9092。MinIO（9000 / 控制台 9001）**默认不启用**，VFS 落本地磁盘；需要对象存储时再开，见「配置」。
 
 > 端口被占用（本机可能跑着其他项目的容器）时，不要停别人的容器，改 `infra/docker-compose.yml` 里的端口映射，或只起当前需要的服务。
 
@@ -106,11 +106,13 @@ $env:OPENSANDBOX_SERVER_API_KEY = "your-long-random-key"   # 与客户端 .env �
 
 ```bash
 # 不需要 API Key，用 mock LLM 跑通整条链路
-python examples\mock_llm_demo.py
+python -m examples.mock_llm_demo
 
-# 配好真实 LLM 后跑端到端分析
-python examples\data_analysis_demo.py
+# 配好真实 LLM 后跑端到端分析（未配 Key 时自动回落到脚本化决策）
+python -m examples.data_analysis_demo
 ```
+
+> 用 `-m` 模块方式运行：这些示例要 `import harness`，直接当脚本跑（`python examples\x.py`）不会把项目根加进 `sys.path`。
 
 ### 3. 起 API 服务
 
@@ -194,23 +196,15 @@ governed/
 ├── tools/                  # 内置数据分析工具集
 ├── infra/                  # docker-compose、沙箱镜像、opensandbox-server
 ├── examples/               # mock 与真实 LLM 示例
-├── tests/                  # pytest 测试
-└── docs/                   # 设计文档、计划、问题与阶段存档
+└── tests/                  # pytest 测试
 ```
 
 ## 扩展
 
 - **加工具**：定义 `ToolDef`，写 `handler(args, context) -> (ok, text, artifacts)`，`broker.register(...)`
 - **加中间件**：继承 `Middleware`，实现需要的 hook，注册到 manager
-- **加 Skill**：按约定写 `SKILL.md` 放到技能目录，loader 自动发现
+- **加 Skill**：按约定写 `SKILL.md` 放到技能目录，loader 自动发现；技能目录下的 `references/` 是**按需附件**，正文指到时才经 `skill_reference` 读取，不占默认上下文
 - **加子 Agent**：定义其工具集与系统提示，在 Orchestrator 注册后用 `delegate(...)` 委派
-
-## 文档
-
-- [`docs/项目计划.md`](docs/项目计划.md)：总体计划、架构决策与最新进展
-- [`docs/遇到的问题.md`](docs/遇到的问题.md)：踩坑记录与收口情况
-- [`docs/阶段存档_20260926.md`](docs/阶段存档_20260926.md)、[`阶段存档_20260927.md`](docs/阶段存档_20260927.md)：阶段交付存档
-- [`docs/学习笔记.md`](docs/学习笔记.md)：模块学习地图与面试复习（个人学习用）
 
 ## Roadmap
 
