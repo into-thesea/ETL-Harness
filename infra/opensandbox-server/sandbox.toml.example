@@ -51,19 +51,35 @@ type = "sqlite"
 path = "state/opensandbox.db"
 
 [docker]
+# 沙箱容器的隔离由本段配置，配合沙箱镜像里的非 root 运行、以及「禁止一切宿主
+# 路径 bind mount」（文件经 Filesystem API 显式搬运）共同构成防护面。
 network_mode = "bridge"
 # 每个沙箱占 2~3 个宿主端口（带 egress sidecar 时 3 个）
 port_range_min = 40000
 port_range_max = 60000
+# 排除一切用不到的 CAP：改网络配置 / 抓包、挂载、加载内核模块、ptrace、
+# 改系统时间、写审计日志等。列表外的一律保留，即 Python 分析栈真正需要的那些。
 drop_capabilities = [
     "AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW",
     "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG",
 ]
+# 阻断容器内提权：setuid 类二进制失效
 no_new_privileges = true
-apparmor_profile = ""
 # 限制进程数，降低 fork 炸弹对宿主的冲击
 pids_limit = 4096
+# 留空 = 用 Docker 官方默认 seccomp profile。该 profile 已阻断 ptrace / bpf /
+# kexec / mount / pivot_root / reboot 等危险系统调用，覆盖面经官方跨版本验证。
+# 自建白名单（SCMP_ACT_ALLOW 枚举）的失败模式更差：漏一个 syscall 就在运行时
+# EPERM 崩，且往往只在特定数据下暴露。确需收紧也应基于官方 profile 做减法
+# （追加 SCMP_ACT_ERRNO 阻断项），而不是从零做加法。
 seccomp_profile = ""
+# 留空 = 不启用。AppArmor 是 Linux 特有机制，Windows / macOS 开发机上无法验证；
+# 需要时在 Linux 宿主机上填 profile 名或路径即可。
+apparmor_profile = ""
+
+# 注：容器根文件系统只读（docker --read-only）不在服务端可配项内，故未启用；
+# 沙箱内的写入被限制在容器私有文件系统（/home/sandbox 与 /tmp）里，
+# 与宿主之间只经 Filesystem API 显式搬运。
 
 [ingress]
 mode = "direct"

@@ -34,7 +34,7 @@
 - 服务端 Bearer 令牌鉴权，角色由令牌决定；审批按身份判定，不能自批
 - 高风险操作走 LangGraph interrupt，暂停等人审批后再继续
 - 中文 PII 识别（身份证 / 手机号 / 银行卡，校验位防误报）与数据质量红线
-- 代码执行进隔离沙箱；沙箱不可用或凭据缺失时 fail closed，绝不在本机直接跑
+- 代码执行进隔离沙箱：非 root 运行 + Capability 剥离（9 项）+ `no_new_privileges` + seccomp（Docker 官方默认 profile）+ 进程数上限，文件只经 Filesystem API 与宿主显式交换（禁止宿主路径 bind mount）；沙箱不可用或凭据缺失时 fail closed，绝不在本机直接跑
 
 **服务化与可观测**
 - FastAPI 提供同步与 SSE 流式接口，审批中断状态落盘、重启可续
