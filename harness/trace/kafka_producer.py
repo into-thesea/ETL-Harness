@@ -54,6 +54,11 @@ class KafkaProducerWrapper:
         # spool 写/删与文件名序号的锁（send 线程 vs 补发线程）
         self._spool_lock = threading.RLock()
         self._spool_counter = 0
+        # spool 的近似条数与累计丢弃数。近似值只用于判断"要不要去校准"，
+        # 真正删之前会用一次 listdir 校准，所以不会因为漂移而误删或漏删。
+        self._spool_size = 0
+        self._spool_dropped = 0
+        self._calibrate_spool_size()
         # 同一时刻只允许一个补发循环
         self._drain_lock = threading.Lock()
 
@@ -68,6 +73,21 @@ class KafkaProducerWrapper:
     def _ensure_local_dir(self) -> None:
         os.makedirs(self._local_fallback_dir, exist_ok=True)
         os.makedirs(self._spool_dir, exist_ok=True)
+
+    def _calibrate_spool_size(self) -> None:
+        """启动时按磁盘实际情况校准计数，并立即执行一次上限检查。
+
+        上次进程退出时 spool 里可能已经堆了文件 —— 不对齐的话要等写满一轮
+        才会发现超限。
+        """
+        try:
+            with self._spool_lock:
+                self._spool_size = len(
+                    [n for n in os.listdir(self._spool_dir) if n.endswith(".json")]
+                )
+        except OSError:
+            self._spool_size = 0
+        self._enforce_spool_cap()
         os.makedirs(self._dead_letter_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -143,8 +163,44 @@ class KafkaProducerWrapper:
                 with open(tmp, "w", encoding="utf-8") as fh:
                     fh.write(json.dumps(payload, default=self._json_default, ensure_ascii=False))
                 os.replace(tmp, path)
+                self._spool_size += 1
             except OSError as e:
                 logger.error("spool write error: %s", e)
+        self._enforce_spool_cap()
+
+    def _enforce_spool_cap(self) -> None:
+        """spool 封顶：Kafka 长期不可达时丢最旧的，避免写满磁盘。
+
+        只在**计数超限**时才真正 listdir 校准，所以正常路径上几乎没有额外开销。
+        """
+        max_files = settings.kafka.spool_max_files
+        if max_files <= 0 or self._spool_size <= max_files:
+            return
+        with self._spool_lock:
+            try:
+                names = sorted(n for n in os.listdir(self._spool_dir) if n.endswith(".json"))
+            except OSError:
+                return
+            self._spool_size = len(names)
+            excess = len(names) - max_files
+            if excess <= 0:
+                return
+            dropped = 0
+            for name in names[:excess]:
+                try:
+                    os.remove(os.path.join(self._spool_dir, name))
+                    dropped += 1
+                except OSError:
+                    pass
+            self._spool_size -= dropped
+            self._spool_dropped += dropped
+        if dropped:
+            logger.warning(
+                "spool 已达上限 %d，丢弃最旧的 %d 条（累计 %d）。spool 是投递缓冲："
+                "这些消息未上送，审计的本地留档 audit.jsonl 不受影响。",
+                max_files, dropped, self._spool_dropped,
+            )
+
 
     # ------------------------------------------------------------------
     # 恢复后补发
@@ -194,6 +250,7 @@ class KafkaProducerWrapper:
                     future.get(timeout=_DRAIN_GET_TIMEOUT)  # 同步确认后再删，至少一次
                     with self._spool_lock:
                         os.remove(path)
+                        self._spool_size = max(self._spool_size - 1, 0)
                     sent += 1
                 except Exception as e:  # noqa: BLE001 - 补发失败：连接可能已断
                     logger.warning("drain replay failed at %s: %s; 剩余留 spool", name, e)
@@ -267,13 +324,21 @@ class KafkaProducerWrapper:
         return self._connected
 
     def spool_status(self) -> dict[str, int]:
-        """返回 spool 当前待补发条数（按 topic 粗分用总条数即可）。"""
+        """spool 运行状态：待补发条数、累计丢弃数、上限。
+
+        待补发条数**以磁盘为准**，不信任内存里的近似计数 —— 它是给运维看
+        "缓冲是否在堆积"的，报错数字比不报更糟。
+        """
         with self._spool_lock:
             try:
-                pending = [n for n in os.listdir(self._spool_dir) if n.endswith(".json")]
+                pending = len([n for n in os.listdir(self._spool_dir) if n.endswith(".json")])
             except OSError:
-                pending = []
-        return {"pending": len(pending)}
+                pending = 0
+        return {
+            "pending": pending,
+            "dropped": self._spool_dropped,
+            "max_files": settings.kafka.spool_max_files,
+        }
 
 
 def get_producer() -> KafkaProducerWrapper:

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import threading
@@ -26,6 +27,8 @@ def _make_wrapper(tmpdir: str) -> KafkaProducerWrapper:
     os.makedirs(w._dead_letter_dir, exist_ok=True)
     w._spool_lock = threading.RLock()
     w._spool_counter = 0
+    w._spool_size = 0
+    w._spool_dropped = 0
     w._drain_lock = threading.Lock()
     return w
 
@@ -131,10 +134,41 @@ def test_corrupt_to_dead_letter() -> None:
     print("[3] 损坏 spool 文件进 dead-letter、不阻断补发 ok")
 
 
+def test_spool_cap_drops_oldest() -> None:
+    """spool 必须有上限。
+
+    Kafka 长期不可达时 spool 只进不出 —— 没有上限就是一条写满磁盘的慢路径。
+    上限只丢**未上送**的消息，审计的本地留档由 audit.jsonl 独立保证。
+    """
+    from harness.config import settings
+
+    original = settings.kafka.spool_max_files
+    settings.kafka.spool_max_files = 5
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            w = _make_wrapper(tmp)
+            for i in range(20):
+                w._spool_message("governed_audit", {"i": i}, key=str(i))
+
+            names = sorted(n for n in os.listdir(tmp) if n.endswith(".json"))
+            assert len(names) == 5, f"应保留上限条数，实际 {len(names)}"
+
+            status = w.spool_status()
+            assert status["pending"] == 5
+            assert status["dropped"] == 15, status
+
+            newest = json.loads(open(os.path.join(tmp, names[-1]), encoding="utf-8").read())
+            assert newest["message"]["i"] == 19, "丢的必须是最旧的，最新的要留着"
+    finally:
+        settings.kafka.spool_max_files = original
+    print("[4] spool 达上限丢最旧的、保留最新 ok")
+
+
 def _main() -> None:
     test_spool_then_replay()
     test_replay_failure_keeps_spool()
     test_corrupt_to_dead_letter()
+    test_spool_cap_drops_oldest()
     print("\n=== C6（Kafka spool 缓冲 + 恢复后补发）冒烟全部通过 ===")
 
 

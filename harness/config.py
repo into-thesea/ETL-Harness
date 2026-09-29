@@ -116,6 +116,11 @@ class KafkaSettings(BaseSettings):
     consumer_group: str = "governed_consumer"
     enable_audit_produce: bool = True
     enable_trace_produce: bool = True
+    # spool（投递缓冲）的文件数上限。Kafka 长期不可达时 spool 会只进不出，
+    # 没有上限就会写满磁盘。超出时丢最旧的并告警 —— spool 是**投递缓冲**不是
+    # 存储，被丢的消息只是没上送，审计的本地留档（audit.jsonl）不受影响。
+    # 0 表示不限制（不建议）。
+    spool_max_files: int = 5000
     producer_acks: str = "1"
     retries: int = 3
     linger_ms: int = 5
