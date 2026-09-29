@@ -56,9 +56,8 @@ class EmbeddingSettings(BaseSettings):
 class RedisSettings(BaseSettings):
     """Redis 配置。
 
-    当前**只有短期记忆**（``harness.memory.short_term``）真正连 Redis；任务状态、
-    缓存、限流都是进程内实现，多副本部署时各算各的。原先的 docstring 把这四项
-    一并写成 Redis 用途，与实现不符，已按实际收窄。
+    使用方**只有短期记忆**（``harness.memory.short_term``）；任务状态、缓存、限流
+    都是进程内实现，多副本部署时各算各的。
     """
 
     model_config = SettingsConfigDict(env_prefix="REDIS_", extra="ignore")

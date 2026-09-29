@@ -1,14 +1,14 @@
 """tests.test_rate_limit —— Tool Broker 限流准入的原子性与窗口语义。
 
-背景：旧实现把「判定」与「记账」拆成两步，中间隔着工具执行，并发调用会同时
-通过判定再各自记账（check-then-act 竞态），实际放行量超过 ``rate_limit_per_min``。
-本文件锁住修复后的两条不变式：
+限流把「判定」与「记账」放在同一次加锁内完成。若拆成两步、中间隔着工具执行，
+并发调用会同时通过判定再各自记账（check-then-act 竞态），实际放行量会超过
+``rate_limit_per_min``。本文件锁住两条不变式：
 
 1. 并发下放行数**严格等于**上限，与该工具耗时无关；
 2. 窗口按 60 秒滑动，被拒绝的调用不占用配额。
 
-限流窗口是进程内的（见 ``ToolBroker._rate_lock`` 上的 ponytail 说明），
-因此全部用例离线可跑，不需要 Redis。
+限流窗口是进程内的（见 ``ToolBroker._rate_lock`` 上的说明），因此全部用例
+离线可跑，不需要 Redis。
 """
 
 from __future__ import annotations
@@ -68,9 +68,9 @@ class TestRateLimitAtomicity:
     def test_concurrent_calls_never_exceed_limit(self) -> None:
         """并发调用放行的数量恰好等于上限。
 
-        这个用例是对 check-then-act 竞态的回归守卫：旧实现下，超出判定的调用会
-        在工具执行完之后才记账，放行数会大于 limit。为了让竞态窗口稳定复现，
-        handler 里加了 5ms 的等待 —— 修复后这 5ms 只影响耗时，不影响放行数。
+        这个用例是对 check-then-act 竞态的回归守卫：判定与记账一旦被拆开、记账
+        落在工具执行之后，超出判定的调用就会一起放行，放行数大于 limit。为了让
+        竞态窗口稳定复现，handler 里加了 5ms 的等待——它只影响耗时，不影响放行数。
         """
         limit, callers = 5, 20
         broker = _make_broker(limit, handler=_slow_handler)

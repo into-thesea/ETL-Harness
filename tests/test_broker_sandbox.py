@@ -1,15 +1,13 @@
 """tests.test_broker_sandbox —— ToolBroker 的沙箱开关语义。
 
-``ToolBroker(sandbox_executor=False)`` 是 docstring 承诺的"显式关闭沙箱"开关。
-旧实现把 False 原样存进 ``self.sandbox``，而 ``invoke`` 与 ``get_stats`` 判的都是
-``is None``，于是留下了一个"既非有、也非无"的中间态：
+``ToolBroker(sandbox_executor=False)`` 是"显式关闭沙箱"开关，内部归一为 ``None``，
+所有判断只看"有没有沙箱"这一件事，不留"既非有、也非无"的中间态。这里锁住这个
+不变式，以及它连带保证的三件事：
 
-- 标了 ``run_in_sandbox`` 的工具会走到 ``False.execute(...)`` 抛 AttributeError，
-  被兜底 except 吞成一句含糊报错 —— 安全上仍然没跑（fail-closed 没破），但那条
-  写好的"沙箱已禁用"提示拿不到；
-- ``get_stats()["sandbox_enabled"]`` 误报 True，``sandbox_used`` 审计字段同样误报。
-
-这里锁住归一化后的行为：False → None，所有判断只看"有没有沙箱"这一件事。
+- 标了 ``run_in_sandbox`` 的工具走 fail-closed 分支，给出明确的"沙箱已禁用"提示，
+  而不是让执行器调用炸成一句含糊报错；
+- ``get_stats()["sandbox_enabled"]`` 如实报 False；
+- 审计的 ``sandbox_used`` 如实报 False。
 """
 
 from __future__ import annotations
@@ -86,7 +84,7 @@ class TestSandboxDisabled:
 # ======================================================================
 class TestSandboxProvided:
     def test_executor_is_used(self) -> None:
-        """给了执行器就走执行器，不会因为归一化改动而绕开。"""
+        """给了执行器就走执行器。"""
         sandbox = _RecordingSandbox()
         broker = ToolBroker(sandbox_executor=sandbox)
         broker.register(_sandbox_tool(), _unreachable_handler)
