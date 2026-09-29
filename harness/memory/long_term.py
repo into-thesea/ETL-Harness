@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 from ..config import settings
 from ..models import MemoryItem, MemoryType
+from .embedding import EmbeddingProvider, build_embedding_provider
 from .vector_store import VectorRecord, VectorStore, build_vector_store
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ class LongTermMemory:
         agent_id: str = "default",
         *,
         store: Optional[VectorStore] = None,
-        embedding_client: Optional[Any] = None,
+        embedding_provider: Optional[EmbeddingProvider] = None,
     ) -> None:
         self.agent_id = agent_id
         self.top_k = settings.memory.long_term_top_k
@@ -60,15 +61,31 @@ class LongTermMemory:
         self.max_content_chars = settings.memory.long_term_max_content_chars
         self.max_items = settings.memory.long_term_max_items
         self.min_query_chars = settings.memory.long_term_min_query_chars
-        self.embedding_dim = settings.embedding.dim
+
+        # 顺序不能反：pgvector 的建表语句需要维度，而维度只有模型加载后才知道 ——
+        # 所以先建 Embedding 提供方、再按它的实际维度建后端。维度以**提供方返回的
+        # 向量**为准，EMBEDDING_DIM 只作参考（两者不符会在探活时被拦下）。
+        self._provider = embedding_provider or self._build_provider()
+        self.embedding_dim = self._provider.dim or settings.embedding.dim
 
         self._store = store or self._build_store()
-        self._embedding = embedding_client
         self._degraded_reason: Optional[str] = None
         # Embedding 当前是否确定不可用。由探活或调用失败置位，成功调用会复位 ——
         # 这样临时故障能自愈，而不用重启进程。
         self._embedding_unusable = False
-        self._init_embedding()
+
+        # 构造期就把"哪一环不可用"记下来。否则降级原因要等第一次调用失败才出现，
+        # 而"提供方没加载起来"这种情况下连调用都不会发生，表现为一声不吭地空转。
+        if not self._provider.is_available:
+            self._degraded_reason = (
+                f"Embedding 提供方不可用（{self._provider.name}）："
+                f"{getattr(self._provider, 'last_error', None) or '未知原因'}"
+            )
+        elif not self._store.is_available():
+            self._degraded_reason = (
+                f"向量后端不可用（{self._store.backend_name}）："
+                f"{getattr(self._store, 'last_error', None) or '未知原因'}"
+            )
 
     # ------------------------------------------------------------------
     # 组装
@@ -88,23 +105,17 @@ class LongTermMemory:
             milvus_metric=settings.milvus.metric_type,
         )
 
-    def _init_embedding(self) -> None:
-        if self._embedding is not None:
-            return
-        try:
-            from openai import OpenAI
-
-            self._embedding = OpenAI(
-                api_key=settings.embedding.api_key or settings.llm.api_key,
-                base_url=settings.embedding.base_url,
-                timeout=30,
-            )
-            logger.info("Embedding 客户端就绪：model=%s dim=%d",
-                        settings.embedding.model, self.embedding_dim)
-        except Exception as e:  # noqa: BLE001
-            self._embedding = None
-            self._degraded_reason = f"Embedding 客户端不可用：{e}"
-            logger.warning("Embedding 客户端初始化失败，长期记忆降级：%s", e)
+    def _build_provider(self) -> EmbeddingProvider:
+        e = settings.embedding
+        return build_embedding_provider(
+            provider=e.provider,
+            model=e.model,
+            api_key=e.api_key or settings.llm.api_key,
+            base_url=e.base_url,
+            device=e.device,
+            cache_dir=e.cache_dir,
+            query_prefix=e.query_prefix,
+        )
 
     def probe(self) -> bool:
         """真实探活一次 Embedding，确认「配了但调不通」能被当场发现。
@@ -115,9 +126,9 @@ class LongTermMemory:
 
         结果按 (base_url, model, key) 在**进程内缓存**，多个实例只探一次。
         """
-        if self._embedding is None:
+        if not self._provider.is_available:
             return False
-        key = f"{settings.embedding.base_url}|{settings.embedding.model}"
+        key = f"{settings.embedding.provider}|{settings.embedding.model}"
         cached = _PROBE_CACHE.get(key)
         if cached is not None:
             ok, reason, ts = cached
@@ -152,13 +163,22 @@ class LongTermMemory:
                     settings.embedding.model, len(vector))
         return True
 
-    def _compute_embedding(self, text: str) -> Optional[list[float]]:
-        if self._embedding is None or self._embedding_unusable:
+    def _compute_embedding(self, text: str, *, is_query: bool = False) -> Optional[list[float]]:
+        if self._embedding_unusable or not self._provider.is_available:
             return None
         try:
-            resp = self._embedding.embeddings.create(model=settings.embedding.model, input=text)
+            vectors = self._provider.embed([text], is_query=is_query)
             self._embedding_unusable = False
-            return list(resp.data[0].embedding)
+            if vectors and len(vectors[0]) != self.embedding_dim:
+                # 维度变了说明换过模型：已写入的向量与之不在同一空间，必须停下来
+                self._embedding_unusable = True
+                self._degraded_reason = (
+                    f"Embedding 维度变了：期望 {self.embedding_dim}，实际 {len(vectors[0])}"
+                    "（换模型后旧向量不再可比，需重建记忆库）"
+                )
+                logger.warning("%s", self._degraded_reason)
+                return None
+            return vectors[0] if vectors else None
         except Exception as e:  # noqa: BLE001
             self._embedding_unusable = True
             self._degraded_reason = f"Embedding 调用失败：{type(e).__name__}: {e}"
@@ -185,7 +205,7 @@ class LongTermMemory:
         可用 —— 用 :meth:`probe` 拿确定结论。
         """
         return (
-            self._embedding is not None
+            self._provider.is_available
             and not self._embedding_unusable
             and self._store.is_available()
         )
@@ -198,6 +218,8 @@ class LongTermMemory:
             count = -1
         return {
             "backend": self.backend_name,
+            "embedding": f"{self._provider.name}:{settings.embedding.model}",
+            "dim": self.embedding_dim,
             "ready": self.is_ready(),
             "degraded_reason": self._degraded_reason,
             "items": count,
@@ -322,7 +344,8 @@ class LongTermMemory:
         """
         if not self.is_ready():
             return []
-        vector = self._compute_embedding(query)
+        # is_query=True：BGE 这类模型对查询与文档采用不同处理，检索侧要用查询口径
+        vector = self._compute_embedding(query, is_query=True)
         if vector is None:
             return []
 

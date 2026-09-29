@@ -11,6 +11,12 @@
 长期记忆的读写分别接在编排的规划前与收尾后，见 ``harness.orchestrator``。
 """
 
+from .embedding import (
+    EmbeddingProvider,
+    LocalEmbedding,
+    OpenAIEmbedding,
+    build_embedding_provider,
+)
 from .long_term import LongTermMemory
 from .short_term import ShortTermMemory
 from .vector_store import (
@@ -28,6 +34,10 @@ __all__ = [
     "ShortTermMemory",
     "WorkingMemory",
     "LongTermMemory",
+    "EmbeddingProvider",
+    "OpenAIEmbedding",
+    "LocalEmbedding",
+    "build_embedding_provider",
     "VectorStore",
     "VectorRecord",
     "VectorHit",

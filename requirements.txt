@@ -47,7 +47,12 @@ PyMySQL>=1.1.0
 redis>=5.0.0
 # 长期向量记忆：默认后端是 pgvector，只需 psycopg（见上方）+ PG 侧的 vector 扩展，
 # 不需要额外的 Python 包；单机可用 local 后端（进程内实现，零依赖）。
-# 要改用 Milvus 作为后端时再装：
+#
+# Embedding 默认走**本地模型**（EMBEDDING_PROVIDER=local），需要：
+#     pip install sentence-transformers
+# 不需要本地模型时（改用远程 embeddings 端点）可以完全不装。
+#
+# 要改用 Milvus 作为向量后端时再装：
 #     pip install "pymilvus>=2.3.0"
 # 向量计算
 numpy>=1.24.0

@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -30,30 +29,45 @@ def _vec(*components: float) -> list[float]:
     return list(components) + [0.0] * max(DIM - len(components), 0)
 
 
-class _FakeEmbeddingClient:
-    """按文本内容解析向量的假 Embedding。
+class _FakeEmbeddingProvider:
+    """按文本内容解析向量的假 Embedding 提供方。
 
-    真实 Embedding 的向量取决于远端模型，无法精确断言排序与阈值；这里让测试用
-    一个**解析函数**决定每段文本对应哪个方向，从而能对"相似度排序""阈值过滤"
-    下确定断言。注意解析函数的入参是**实际被嵌入的文本**（写入时是拼接好的
-    content，检索时是查询串），两者要按同一规则映射才有一致的相似度。
+    真实 Embedding 的向量取决于模型，无法精确断言排序与阈值；这里让测试用一个
+    **解析函数**决定每段文本对应哪个方向，从而能对"相似度排序""阈值过滤"下确定
+    断言。解析函数的入参是**实际被嵌入的文本**（写入时是拼接好的 content，检索
+    时是查询串），两者按同一规则映射才有一致的相似度。
     """
 
-    def __init__(self, resolve=None, fail: bool = False):
-        self.resolve = resolve or (lambda text: (0.0, 0.0, 1.0))
-        self.fail = fail
-        self.calls: list[str] = []
-        self.embeddings = SimpleNamespace(create=self._create)
+    name = "fake"
 
-    def _create(self, model: str, input: str):  # noqa: A002 - 对齐 SDK 形参名
-        self.calls.append(input)
-        if self.fail:
+    def __init__(self, resolve=None, fail: bool = False, raise_on_call: bool = False,
+                 dim: int = DIM):
+        self.resolve = resolve or (lambda text: (0.0, 0.0, 1.0))
+        self.fail = fail                  # 构造期就不可用（模型没加载起来）
+        self.raise_on_call = raise_on_call  # 可用，但调用时报错（端点挂了/key 失效）
+        self._dim = dim
+        self.calls: list[tuple[str, bool]] = []
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    @property
+    def is_available(self) -> bool:
+        return not self.fail
+
+    def embed(self, texts: list[str], *, is_query: bool = False) -> list[list[float]]:
+        if self.fail or self.raise_on_call:
             raise RuntimeError("embedding 服务不可用")
-        return SimpleNamespace(data=[SimpleNamespace(embedding=_vec(*self.resolve(input)))])
+        out: list[list[float]] = []
+        for text in texts:
+            self.calls.append((text, is_query))
+            out.append(_vec(*self.resolve(text)))
+        return out
 
 
 def _record(rid: str, vector: tuple[float, ...], *, agent: str = "t1", ts: float = 0.0) -> VectorRecord:
-    """构造一条 1536 维（配置维度）的记录，供本地后端用。"""
+    """构造一条配置维度（见 DIM）的记录，供本地后端用。"""
     return VectorRecord(
         id=rid, content=f"记忆 {rid}", vector=_vec(*vector),
         metadata={"agent_id": agent, "type": EXPERIENCE}, timestamp=ts,
@@ -83,7 +97,7 @@ def ltm(tmp_path) -> LongTermMemory:
     return LongTermMemory(
         agent_id="t1",
         store=LocalVectorStore(str(tmp_path / "ltm.json")),
-        embedding_client=_FakeEmbeddingClient(),
+        embedding_provider=_FakeEmbeddingProvider(),
     )
 
 
@@ -193,30 +207,42 @@ class TestMemoryPolicy:
         ltm = LongTermMemory(
             agent_id="t1",
             store=LocalVectorStore(str(tmp_path / "v.json")),
-            embedding_client=_FakeEmbeddingClient(_by_keyword("销售数据")),
+            embedding_provider=_FakeEmbeddingProvider(_by_keyword("销售数据")),
         )
         ltm.remember_experience(goal="第一次分析销售数据", final_answer="结论")
         assert ltm.recall_for_goal("再分析一次销售数据")           # 同方向 → 相似度 1.0
         assert ltm.recall_for_goal("完全无关的查询内容在这里") == []  # 正交 → 0.0 < 阈值
 
-    def test_embedding_failure_degrades_without_raising(self, tmp_path) -> None:
-        """Embedding 挂掉时读写都退化为空操作，绝不把异常抛给任务。"""
+    def test_call_failure_degrades_without_raising(self, tmp_path) -> None:
+        """端点/key 在调用时才失败：读写都退化为空操作，异常不抛给任务。"""
         ltm = LongTermMemory(
             agent_id="t1",
             store=LocalVectorStore(str(tmp_path / "v.json")),
-            embedding_client=_FakeEmbeddingClient(fail=True),
+            embedding_provider=_FakeEmbeddingProvider(raise_on_call=True),
         )
         assert ltm.remember_experience(goal="分析数据", final_answer="结论") is None
         assert ltm.search("分析数据") == []
         assert ltm.build_context_text("分析数据的趋势") == ""
         assert ltm.is_ready() is False
-        assert ltm.degraded_reason and "RuntimeError" in ltm.degraded_reason
+        assert "RuntimeError" in (ltm.degraded_reason or "")
+
+    def test_provider_not_loaded_at_construction_records_reason(self, tmp_path) -> None:
+        """提供方**没加载起来**时连调用都不会发生 —— 降级原因必须在构造期就记下，
+        否则表现是一声不吭地空转，排查时无从下手。"""
+        ltm = LongTermMemory(
+            agent_id="t1",
+            store=LocalVectorStore(str(tmp_path / "v.json")),
+            embedding_provider=_FakeEmbeddingProvider(fail=True),
+        )
+        assert ltm.is_ready() is False
+        assert ltm.degraded_reason, "构造期不可用也必须留下原因"
+        assert "fake" in ltm.degraded_reason
 
     def test_build_context_text_renders_hits(self, tmp_path) -> None:
         ltm = LongTermMemory(
             agent_id="t1",
             store=LocalVectorStore(str(tmp_path / "v.json")),
-            embedding_client=_FakeEmbeddingClient(_by_keyword("销售数据")),
+            embedding_provider=_FakeEmbeddingProvider(_by_keyword("销售数据")),
         )
         ltm.remember_experience(goal="分析销售数据的趋势", final_answer="环比上升 12%")
         text = ltm.build_context_text("再分析一次销售数据")
@@ -281,7 +307,7 @@ class TestWiringIntoOrchestration:
         ltm = LongTermMemory(
             agent_id="default",
             store=LocalVectorStore(str(tmp_path / "v.json")),
-            embedding_client=_FakeEmbeddingClient(_by_keyword("销售数据")),
+            embedding_provider=_FakeEmbeddingProvider(_by_keyword("销售数据")),
         )
         graph = self._graph(ltm)
 
@@ -309,7 +335,7 @@ class TestWiringIntoOrchestration:
         ltm = LongTermMemory(
             agent_id="default",
             store=LocalVectorStore(str(tmp_path / "v.json")),
-            embedding_client=_FakeEmbeddingClient(fail=True),
+            embedding_provider=_FakeEmbeddingProvider(fail=True),
         )
         graph = self._graph(ltm)
         out = graph.invoke(
@@ -352,3 +378,55 @@ class TestPgVectorStoreIntegration:
         store.clear()
         assert store.count() == 0
         store.close()
+
+
+# ======================================================================
+# 真模型 + 真向量库的完整链路
+# ======================================================================
+@pytest.mark.needs_db
+class TestRealModelEndToEnd:
+    """真 Embedding 模型 + 真 pgvector 走一遍写入 → 检索。
+
+    其余用例用的是假 Embedding 或进程内后端，验的是策略与协议是否成立；这一条
+    验的是**模型与向量库是否真的对得上** —— 维度、相似度分布、阈值是否合适，
+    只有跑真模型才知道。本地模型未装或 pgvector 不可用时跳过。
+    """
+
+    @pytest.fixture
+    def real_ltm(self):
+        pytest.importorskip("sentence_transformers", reason="本地 Embedding 运行时未安装")
+        from harness.memory.embedding import LocalEmbedding
+
+        provider = LocalEmbedding(model=settings.embedding.model)
+        if not provider.is_available:
+            pytest.skip(f"本地 Embedding 模型不可用：{provider.last_error}")
+
+        store = PgVectorStore(PG_DSN, "governed_test_long_term", provider.dim)
+        if not store.is_available():
+            pytest.skip(f"pgvector 不可用：{store.last_error}")
+
+        ltm = LongTermMemory(agent_id="e2e", store=store, embedding_provider=provider)
+        yield ltm
+        ltm.clear()
+        ltm.close()
+
+    def test_write_then_recall_and_reject_unrelated(self, real_ltm: LongTermMemory) -> None:
+        real_ltm.clear()
+        assert real_ltm.is_ready(), real_ltm.degraded_reason
+
+        assert real_ltm.remember_experience(
+            goal="分析销售数据的季度趋势",
+            final_answer="Q3 环比上升 12%，主要由华东区拉动",
+        )
+        assert real_ltm.count() == 1
+
+        # 相关目标能召回刚写入的经验
+        hits = real_ltm.recall_for_goal("再分析一次销售数据")
+        assert hits, "相关目标应召回刚写入的经验（阈值是否适配该模型？）"
+        assert "环比上升 12%" in hits[0].content
+
+        # 无关目标不召回 —— 证明阈值真的在区分，而不是把什么都捞回来
+        assert real_ltm.recall_for_goal("今天午饭吃什么比较好") == []
+
+        context = real_ltm.build_context_text("再分析一次销售数据")
+        assert "长期记忆" in context and "华东区" in context

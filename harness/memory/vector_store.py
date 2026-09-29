@@ -307,6 +307,22 @@ class PgVectorStore(VectorStore):
                 )
                 """
             )
+            # 表可能早就存在。核对它的向量维度与当前配置是否一致：换过 Embedding
+            # 模型的话，库里的旧向量与新查询不在同一空间，继续用只会得到毫无意义
+            # 的相似度 —— 与其静默给错结果，不如当场判定不可用。
+            cur.execute(
+                "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+                "WHERE attrelid = %s::regclass AND attname = 'embedding'",
+                (self.table,),
+            )
+            row = cur.fetchone()
+            if row and row[0] and "vector" in row[0]:
+                existing = int(row[0].split("(")[-1].rstrip(")"))
+                if existing != self.dim:
+                    raise ValueError(
+                        f"表 {self.table} 的向量维度是 {existing}，当前配置是 {self.dim}；"
+                        "换过 Embedding 模型时需先重建该表（旧向量与新模型不可比）"
+                    )
             if self.index == "hnsw":
                 cur.execute(
                     f"CREATE INDEX IF NOT EXISTS {self.table}_emb_hnsw "

@@ -46,8 +46,20 @@ class EmbeddingSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="EMBEDDING_", extra="ignore")
 
-    model: str = "text-embedding-3-small"
-    dim: int = 1536
+    # 提供方：local（本地 sentence-transformers 模型，无需外部服务与凭据）| openai（OpenAI 兼容端点）
+    provider: str = "local"
+    # 模型。provider=local 时接受 HF 模型名、本地模型目录，或 HF 缓存目录
+    # （models--<org>--<name> 形式会自动解开到 snapshots/<rev>）；
+    # provider=openai 时是端点上的模型名。
+    model: str = "models--BAAI--bge-base-zh-v1.5"
+    # 向量维度。**仅供参考**：实际维度以提供方返回的为准（local 从模型配置读，
+    # openai 从首次响应读），两者不符会在探活时被拦下。
+    dim: int = 768
+    # provider=local：推理设备（cpu / cuda）与 HF 缓存根目录（含 models--* 的目录）
+    device: str = "cpu"
+    cache_dir: str = ""
+    # 检索查询的前缀。BGE 中文系列按官方用法需要指令前缀；留空则按模型名自动判定
+    query_prefix: str = ""
     api_key: str = ""
     base_url: str = "https://api.openai.com/v1"
     batch_size: int = 32
@@ -210,7 +222,12 @@ class MemorySettings(BaseSettings):
 
     short_term_max_turns: int = 20
     long_term_top_k: int = 5
-    long_term_similarity_threshold: float = 0.5
+    # 检索相似度阈值。**这个值取决于 Embedding 模型**，换模型要重新标定：
+    # BGE 中文系列在"相关/无关"两档上整体比 OpenAI 系偏低（实测 bge-base-zh-v1.5：
+    # 相关对 0.44~0.53，无关对 0.24~0.34），沿用 0.5 会把大部分相关记忆滤掉。
+    # 阈值取在两档之间，宁松勿紧 —— 多注入一条无关记忆只是噪声，漏掉相关记忆
+    # 则等于这层能力不存在。
+    long_term_similarity_threshold: float = 0.38
     working_memory_max_items: int = 100
     local_dir: str = "data/memory"
 

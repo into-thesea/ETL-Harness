@@ -75,3 +75,7 @@ desktop.ini
 
 # docs 全部仅本地保留（设计/计划/学习/求职资料，不进版本库）
 docs/
+
+# HuggingFace 模型缓存（本地 embedding 模型，体积以 GB 计）
+models--*/
+*.safetensors
