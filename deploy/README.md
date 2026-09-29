@@ -1,0 +1,124 @@
+# 部署模式
+
+框架的外部依赖都是**可插拔**的：每一层都有可用的本地实现，所以同一份代码能覆盖
+从"一台笔记本"到"生产集群"的跨度。这里把三种典型组合列出来，按需取用。
+
+模式之间不是代码分支，**只是配置组合** —— 切换靠 `.env`，不靠改代码。
+
+---
+
+## 一张表看差别
+
+| 层 | Dev | Standard | Scale |
+|---|---|---|---|
+| 部署形态 | 单进程，**零外部容器** | 单机 + PostgreSQL | 多副本 + 完整中间件栈 |
+| Checkpoint | SQLite（默认） | SQLite 或 PG | PG / Redis |
+| VFS | 本地文件系统（默认） | 本地文件系统 | MinIO |
+| 长期记忆后端 | `local`（进程内，数据落 JSON） | `pgvector` | `pgvector` 或 `milvus` |
+| Embedding | `local`（sentence-transformers） | 同左，或任意 OpenAI 兼容端点 | 同左 |
+| Redis | 不启用 | 可选 | 启用 |
+| Kafka | 不启用（审计落 `audit.jsonl`） | 不启用 | 启用（审计 + trace 上送） |
+| Trace 出口 | `local`（JSONL + 轮转） | `local` | `kafka` |
+| Milvus / MinIO | 不启用 | 不启用 | 启用 |
+| 适用 | 开发、演示、单机交付 | 小规模生产 | 多租户 / 大规模 |
+
+---
+
+## Dev：零外部依赖
+
+**这是默认配置**，开箱即用，不需要起任何容器：
+
+```bash
+pip install -r requirements.txt
+pip install sentence-transformers      # 本地 Embedding 模型（见下）
+python -m examples.data_analysis_demo  # 端到端跑一条链路
+```
+
+关键配置（都是默认值，不用显式写）：
+
+```bash
+CHECKPOINT_BACKEND=sqlite        # 或 memory（重启即丢）
+MEMORY_VECTOR_BACKEND=local      # 进程内向量库，真实余弦相似度
+EMBEDDING_PROVIDER=local         # 本地模型，无需 API Key
+MINIO_ENABLED=false              # VFS 落本地磁盘
+TRACE_SINK=local                 # Span 落 data/trace/spans.jsonl
+```
+
+**已实测**：不起任何容器，5 个子任务全链路跑通、图表与报告真实落盘、Span 正常写出。
+
+> 本地 Embedding 需要一个模型。默认指向仓库里的 HF 缓存目录
+> （`models--BAAI--bge-base-zh-v1.5`），换模型改 `EMBEDDING_MODEL` 即可 ——
+> 它接受 HF 模型名、本地模型目录，或 HF 缓存目录。
+> **换模型后要重新标定 `MEMORY_LONG_TERM_SIMILARITY_THRESHOLD`**（见下）。
+
+---
+
+## Standard：单机 + PostgreSQL
+
+比 Dev 多一个 PG，用于向量检索与（可选的）checkpoint 持久化。**不需要** Kafka、
+Milvus、MinIO。
+
+```bash
+docker compose -f infra/docker-compose.yml up -d postgres
+```
+
+```bash
+CHECKPOINT_BACKEND=sqlite
+MEMORY_VECTOR_BACKEND=pgvector
+MEMORY_PG_DSN=postgresql://harness_admin:harness_admin_pw@127.0.0.1:55432/harness
+EMBEDDING_PROVIDER=local
+MINIO_ENABLED=false
+TRACE_SINK=local
+```
+
+要点：
+
+- compose 里的 PG 镜像是 **`pgvector/pgvector:pg16`**，扩展由
+  `infra/db/postgres-init.sql` 建好，所以运行时账号不必有 superuser 权限。
+- `MEMORY_PG_DSN` 需要**写权限**（要建表与索引），与只读的数据源账号不同。
+- 表由 `PgVectorStore` 首次连接时创建（含 HNSW 索引）。**已存在但维度与当前模型
+  不符时会直接判定不可用** —— 换过 Embedding 模型时旧向量与新查询不在同一空间，
+  静默给错相似度比报错更糟，需先重建该表。
+- 不想用 PG 时留空 `MEMORY_PG_DSN` 即可，会自动降级到 `local` 并记一条 warning。
+
+---
+
+## Scale：完整栈
+
+```bash
+docker compose -f infra/docker-compose.yml up -d
+```
+
+```bash
+CHECKPOINT_BACKEND=sqlite          # 多副本时改 PG/Redis
+MEMORY_VECTOR_BACKEND=pgvector     # 或 milvus（需 pip install pymilvus）
+EMBEDDING_PROVIDER=local           # 或指向任意 OpenAI 兼容端点
+MINIO_ENABLED=true                 # VFS 落对象存储
+TRACE_SINK=kafka                   # Span 上送，供链路可视化消费
+KAFKA_SPOOL_MAX_FILES=5000         # 投递缓冲上限
+```
+
+多副本时注意：
+
+- **限流是进程内的**（见 `ToolBroker._rate_lock` 的说明）：多副本时实际放行量
+  是「副本数 × `rate_limit_per_min`」。要全局一致需把窗口状态挪到 Redis。
+- **checkpoint 要换成共享后端**，否则中断恢复只在单副本内有效。
+- `TRACE_SINK=kafka` 时 Span 只有上送、没有本地留档；要两者都有就另存一份，
+  或保持 `local` 由外部采集。
+
+---
+
+## 换 Embedding 模型时要一起改的
+
+Embedding 与向量库必须**同进同退**，否则向量不在同一空间、相似度毫无意义：
+
+1. `EMBEDDING_MODEL` / `EMBEDDING_PROVIDER` —— 维度由提供方实际返回决定，
+   `EMBEDDING_DIM` 只作参考，不符会在启动探活时被拦下；
+2. **`MEMORY_LONG_TERM_SIMILARITY_THRESHOLD` 需要重新标定**。这个阈值跟模型绑定：
+   实测 `bge-base-zh-v1.5` 的相关对落在 0.44~0.53、无关对 0.24~0.34，取两者之间
+   的 0.38；沿用 OpenAI 系手感定的 0.5 会把大部分相关记忆直接滤掉，表现为
+   "这层能力好像不存在"；
+3. pgvector 的表维度不一致时需重建（见上）。
+
+标定方法：拿几组"相关/无关"文本对，分别算余弦相似度，阈值取两档之间且偏向召回
+——多注入一条无关记忆只是噪声，漏掉相关记忆则等于这层能力不存在。

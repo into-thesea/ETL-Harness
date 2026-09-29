@@ -171,6 +171,8 @@ curl -N "http://localhost:8000/api/v1/tasks/$THREAD/stream?token=$TOKEN"
 
 完整取值见 [`.env.example`](.env.example)，规则 JSON 写法见 `harness/config.py` 各 Settings 类的 docstring。安全相关能力均为 fail closed。
 
+部署形态分三档，切换只靠配置、不改代码：**Dev**（零外部容器，开箱即用）/ **Standard**（单机 + PostgreSQL/pgvector）/ **Scale**（完整中间件栈）。每档的关键配置与已实测结论见 [`deploy/README.md`](deploy/README.md)。
+
 ## 项目结构
 
 ```
