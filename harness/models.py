@@ -299,6 +299,7 @@ class SkillDef(BaseModel):
     skill_type: SkillType
     trigger_keywords: list[str] = Field(default_factory=list)  # 触发关键词
     content: str                                    # Skill 内容（模板/SOP/Prompt/SQL/脚本）
+    source_path: str = ""                           # 来源文件路径（附件按需读取时的基准目录）
     priority: int = 0                               # 加载优先级（越大越优先）
     version: str = "1.0.0"
     metadata: dict[str, Any] = Field(default_factory=dict)

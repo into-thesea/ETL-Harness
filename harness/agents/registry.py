@@ -32,7 +32,7 @@ def build_default_agents() -> dict[str, SubAgentDef]:
                 "字段、类型、行数、缺失情况、明显异常与风险。不要臆测业务结论，"
                 "所有判断必须基于工具返回的真实数据。产出一份结构化数据画像。"
             ),
-            tools=["data_inspector"],
+            tools=["data_inspector", "skill_reference"],
             required_role="analyst",
             max_steps=8,
             timeout_seconds=120,
@@ -45,7 +45,7 @@ def build_default_agents() -> dict[str, SubAgentDef]:
                 "缺失值、重复行、类型错误、异常值与不规范文本。每一步都要可解释，"
                 "最终给出干净数据集以及'改了什么、为什么、行数如何变化'的清洗报告。"
             ),
-            tools=["data_inspector", "data_cleaner"],
+            tools=["data_inspector", "data_cleaner", "skill_reference"],
             required_role="analyst",
             max_steps=12,
             timeout_seconds=180,
@@ -58,7 +58,7 @@ def build_default_agents() -> dict[str, SubAgentDef]:
                 "数值分析回答'数据里有什么规律/差异/关系'。区分事实与推测，给出关键指标、"
                 "对比、相关性，并指出样本量与局限。只读查询，不修改原始数据。"
             ),
-            tools=["data_inspector", "eda", "sql_query"],
+            tools=["data_inspector", "eda", "sql_query", "skill_reference"],
             required_role="analyst",
             max_steps=14,
             timeout_seconds=240,
@@ -71,7 +71,7 @@ def build_default_agents() -> dict[str, SubAgentDef]:
                 "（比较用柱状、趋势用折线、构成用饼图/堆叠、关系用散点、分布用直方）。"
                 "每张图必须有明确标题与坐标轴含义，不为画图而画图。"
             ),
-            tools=["chart_generator"],
+            tools=["chart_generator", "skill_reference"],
             required_role="analyst",
             max_steps=8,
             timeout_seconds=120,
@@ -84,7 +84,7 @@ def build_default_agents() -> dict[str, SubAgentDef]:
                 "在隔离沙箱中编写并运行 pandas/python 代码。代码要小步、可验证，"
                 "禁止访问网络与系统敏感资源，返回计算结果与关键中间产物。"
             ),
-            tools=["code_executor"],
+            tools=["code_executor", "skill_reference"],
             required_role="senior_analyst",
             max_steps=8,
             timeout_seconds=300,
@@ -119,7 +119,7 @@ def build_default_agents() -> dict[str, SubAgentDef]:
                 "所有质疑必须给出证据与具体位置，不得凭感觉否定；"
                 "没有发现问题就明确说没有，不要为了交差编造问题。"
             ),
-            tools=["data_inspector", "eda", "sql_query"],
+            tools=["data_inspector", "eda", "sql_query", "skill_reference"],
             required_role="analyst",
             max_steps=8,
             timeout_seconds=180,

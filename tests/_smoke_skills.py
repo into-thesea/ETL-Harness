@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -18,18 +19,27 @@ from harness.graph import build_executor_graph, make_executor_state
 
 SKILLS_DIR = os.path.join(os.path.dirname(harness.__file__), "skills")
 
+# 注入用例的目标：一个典型的数据探查子任务描述
+SKILL_INJECTION_GOAL = "子任务：数据体检，检查缺失值"
+
 
 def _build_registry() -> SkillRegistry:
-    """加载全部 Skill 并断言数量（test / fixture / _main 共用）。"""
+    """加载全部 Skill，并断言磁盘上的每个技能都加载成功（test / fixture / _main 共用）。
+
+    基准对照磁盘动态取，不写死数量。加载器对单个文件是 try/except 跳过，所以
+    "数量对不对"是发现**静默漏载**的唯一手段；但写死数字会让每次增删技能都要改
+    测试。改成对照 ``*/SKILL.md`` 的个数，两个目的同时成立。
+    """
     reg = SkillRegistry()
     n = reg.load_directory(SKILLS_DIR)
-    assert n == 6, f"应加载 6 个 Skill，实际 {n}"
+    expected = len(list(Path(SKILLS_DIR).glob("*/SKILL.md")))
+    assert n == expected, f"应加载 {expected} 个 Skill，实际 {n}"
     return reg
 
 
 def test_load() -> None:
     reg = _build_registry()
-    print(f"[1] 加载 6 个 Skill ok：", ", ".join(reg.names()))
+    print(f"[1] 加载 {len(reg)} 个 Skill ok：", ", ".join(reg.names()))
 
 
 @pytest.fixture(scope="module")
@@ -95,14 +105,19 @@ def test_injection(reg: SkillRegistry) -> None:
     graph = build_executor_graph(
         capture, ToolBroker(), skill_registry=reg, tool_mode="react"
     )
-    state = make_executor_state("子任务：数据体检，检查缺失值", session_id="skill-inj")
+    state = make_executor_state(SKILL_INJECTION_GOAL, session_id="skill-inj")
     graph.invoke(state)
 
     assert capture.captured, "LLM 未被调用"
     system_texts = [m["content"] for m in capture.captured[0] if m["role"] == "system"]
     blob = "\n".join(system_texts)
     assert "相关技能指引" in blob, "未注入技能指引"
-    assert "data-profiling" in blob, "未包含 data-profiling"
+
+    # 断言的是**接线**而不是"某个特定技能必须胜出"：匹配排序第一的技能必须出现在
+    # prompt 里。这样技能库增删不会让用例变红，但注入链路断了会。
+    matched = reg.match(goal=SKILL_INJECTION_GOAL)
+    assert matched, "该目标应当命中至少一个技能"
+    assert matched[0].name in blob, f"命中排序第一的 {matched[0].name!r} 未注入"
     print("[5] Skill 经执行子图注入 LLM 视野 ok")
 
 

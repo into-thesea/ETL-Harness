@@ -694,6 +694,7 @@ class ReActNodes:
             "role": state.get("role", "analyst"),
             "working_memory": state.get("working_memory", {}),
             "data_source_manager": self.datasources,
+            "skill_registry": self.skill_registry,
             "step": state.get("current_step"),
         }
 
@@ -766,6 +767,7 @@ class ReActNodes:
             "role": state.get("role", "analyst"),
             "working_memory": state.get("working_memory", {}),
             "data_source_manager": self.datasources,
+            "skill_registry": self.skill_registry,
             "step": state.get("current_step"),
         }
 

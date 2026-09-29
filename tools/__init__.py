@@ -21,6 +21,8 @@ from tools.data_inspector import TOOL_DEF as INSPECTOR_DEF
 from tools.data_inspector import handle as inspector_handler
 from tools.eda import TOOL_DEF as EDA_DEF
 from tools.eda import handle as eda_handler
+from tools.skill_reference import TOOL_DEF as SKILL_REF_DEF
+from tools.skill_reference import handle as skill_ref_handler
 from tools.sql_query import TOOL_DEF as SQL_DEF
 from tools.sql_query import handle as sql_handler
 
@@ -32,6 +34,7 @@ BUILTIN_TOOLS = {
     "sql_query": (SQL_DEF, sql_handler),
     "chart_generator": (CHART_DEF, chart_handler),
     "code_executor": (CODE_DEF, code_handler),
+    "skill_reference": (SKILL_REF_DEF, skill_ref_handler),
 }
 
 
