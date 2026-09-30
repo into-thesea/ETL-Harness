@@ -93,6 +93,21 @@ class Tracer:
         except Exception:  # noqa: BLE001 - 埋点失败不得影响主流程
             logger.exception("Span 出口异常（忽略）")
 
+    def _notify(self, kind: str, span: TraceSpan) -> None:
+        """把 Span 的进出通知给事件总线（控制台看的就是这条流）。
+
+        **不受 `TRACE_ENABLED` 与采样影响**：埋点可以停，实时视图不该跟着停 —— 采样若
+        随机吃掉事件，控制台会随机空白，那是最难查的一类 bug。成本由总线把关：
+        **未绑定的 trace（没有任务在跑）连事件对象都不构造**；绑定期间则一律记录
+        （即使当下没人订阅，也要给晚连上的控制台留一段最近历史）。
+        """
+        try:
+            from harness.events import build_event_bus
+
+            build_event_bus().publish_span(kind, span)
+        except Exception:  # noqa: BLE001 - 与埋点同一条纪律：观测失败不得影响主流程
+            logger.exception("事件通知异常（忽略）")
+
     @contextmanager
     def span(self, name: str, operation: Optional[str] = None, tags: Optional[dict[str, Any]] = None):
         """创建一个 Span 上下文管理器。
@@ -108,13 +123,18 @@ class Tracer:
         with self._lock:
             parent_span_id = self._span_stack[-1] if self._span_stack else None
 
+        # `operation` 是**具体**那一件事（哪个工具 / 哪个子 Agent / plan_tasks），
+        # 而 `name` 是这一段的**种类**（tool_call / delegate / plan / gate）。此前只留
+        # operation，种类就丢了 —— 于是渲染时间线时分不清"一次工具调用"和"一个规划步"，
+        # 只能靠猜 operation 的取值，而那正是领域耦合。把种类并进 tags 保下来。
+        merged_tags = {"name": name, **(tags or {})}
         span = TraceSpan(
             trace_id=self.trace_id,
             span_id=span_id,
             parent_span_id=parent_span_id,
             service_name=self.service_name,
             operation=operation or name,
-            tags=tags or {},
+            tags=merged_tags,
         )
 
         with self._lock:
@@ -130,6 +150,9 @@ class Tracer:
         start_time = time.time()
         error_message: Optional[str] = None
         status = SpanStatus.OK
+        # 进入时通知一次：这是"进行中"唯一的表达方式 —— 只在退出时写出口的话，
+        # 长耗时的工具/子 Agent 在界面上永远只是"还没出现"。
+        self._notify("start", span)
 
         try:
             yield span
@@ -149,6 +172,7 @@ class Tracer:
                 elif span_id in self._span_stack:
                     self._span_stack.remove(span_id)
             self._emit(span)
+            self._notify("end", span)
 
     def add_tag(self, key: str, value: Any) -> None:
         """给当前活跃的 Span 添加标签；超过单 Span 标签上限则丢弃。"""

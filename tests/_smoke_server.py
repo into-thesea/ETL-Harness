@@ -183,6 +183,13 @@ def test_sse() -> None:
         assert "event: open" in blob, "缺少 open 事件"
         assert "event: status" in blob, "缺少 status 事件"
         assert "event: done" in blob, "缺少 done 事件"
+
+        # 真实进展必须真的上到线：这三类事件此前在界面上完全不可见
+        assert "event: RUN_STARTED" in blob, "缺少根 Span 事件（事件层没接进运行链路）"
+        assert "event: TOOL_CALL_START" in blob, "缺少工具调用事件"
+        assert "event: SUBAGENT_STARTED" in blob, "缺少子 Agent 事件"
+        # 事件 payload 要能支撑界面分组（工具名 / 子 Agent 名）
+        assert '"tool":' in blob and '"agent":' in blob, "事件缺少归因字段"
         print("[8] SSE 流式订阅 ok（事件行数", len(lines), "）")
 
 

@@ -11,14 +11,18 @@ from typing import Any, Optional
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
+from harness.events import build_event_bus
 from harness.server import schemas
 from harness.server.auth import build_authenticator, install_auth, principal_of
 from harness.server.service import VERSION, HarnessService
 
 logger = logging.getLogger(__name__)
 
-# SSE 订阅的轮询间隔与最长连接时间
+# SSE 的轮询间隔、心跳间隔与最长连接时间。
+# 轮询间隔决定事件到达界面的延迟上限（事件层是"缓冲 + drain"而不是跨线程唤醒，
+# 见 harness/events.py 的说明）；心跳让长任务在无事件期间也不被代理掐断。
 SSE_POLL_SECONDS = 0.5
+SSE_HEARTBEAT_SECONDS = 15.0
 SSE_MAX_SECONDS = 900.0
 
 
@@ -113,52 +117,82 @@ def _build_router(service: HarnessService, auth: Any) -> APIRouter:
 
 
 async def _event_stream(service: HarnessService, thread_id: str):
-    """SSE 事件生成器：订阅 checkpointer 状态变化并推送。
+    """SSE 事件生成器：**事件流 + 状态快照**两条腿。
 
-    这是"状态订阅"而非"驱动图"：图由创建 / 审批接口在后台驱动，
-    SSE 仅周期性读取快照并在变化时推送，避免与后台驱动并发冲突。
+    两条腿各有各的职责，缺一不可：
+
+    - **事件流**（`harness.events` 的总线）：工具调用、子 Agent 进出的**真实进展**。
+      这些数据一直由 Span 埋点产生，此前没有任何出口，界面上完全不可见。
+    - **状态快照**：终态与待审批项的权威来源。事件流只描述"发生了什么"，
+      而"任务现在到底行不行"仍以 checkpointer 的状态为准（不重复实现一套状态机）。
+
+    这是"订阅"而非"驱动图"：图由创建 / 审批接口在后台驱动，SSE 只读不推。
     """
     yield {"event": "open", "data": _json({"thread_id": thread_id})}
 
+    bus = build_event_bus()
+    sub = bus.subscribe(thread_id)
     last_sig: Any = None
     seen_approval_ids: set[str] = set()
+    reported_dropped = 0
     started = time.time()
+    last_beat = started
 
-    while True:
-        status = await service.get_status(thread_id)
-        if status is None:
-            yield {"event": "error", "data": _json({"error": "任务不存在"})}
-            return
+    try:
+        while True:
+            # ---- 事件流：工具调用 / 子 Agent / 运行 的真实进展 ----
+            for event in sub.drain():
+                yield {"event": event["type"], "data": _json(event)}
+            if sub.dropped > reported_dropped:
+                # 丢了就如实说 —— 界面据此提示"有缺口"，而不是假装连续
+                missed = sub.dropped - reported_dropped
+                reported_dropped = sub.dropped
+                yield {"event": "notice", "data": _json({"dropped": missed})}
 
-        # 新出现的待审批项 → 立即推送（审批人据此决策）
-        for a in status["pending_approvals"]:
-            if a["interrupt_id"] not in seen_approval_ids:
-                yield {"event": "approval", "data": _json(a)}
-        seen_approval_ids = {a["interrupt_id"] for a in status["pending_approvals"]}
+            status = await service.get_status(thread_id)
+            if status is None:
+                yield {"event": "error", "data": _json({"error": "任务不存在"})}
+                return
 
-        sig = (
-            status["status"],
-            status["progress"],
-            bool(status["final_answer"]),
-            tuple(sorted(seen_approval_ids)),
-        )
-        if sig != last_sig:
-            yield {"event": "status", "data": _json(status)}
-            last_sig = sig
+            # 新出现的待审批项 → 立即推送（审批人据此决策）
+            for a in status["pending_approvals"]:
+                if a["interrupt_id"] not in seen_approval_ids:
+                    yield {"event": "approval", "data": _json(a)}
+            seen_approval_ids = {a["interrupt_id"] for a in status["pending_approvals"]}
 
-        if status["status"] == "finished":
-            yield {"event": "final", "data": _json({"final_answer": status["final_answer"]})}
-            yield {"event": "done", "data": _json({"status": "finished"})}
-            return
-        if status["status"] == "failed":
-            yield {"event": "error", "data": _json({"error": status["error"]})}
-            yield {"event": "done", "data": _json({"status": "failed"})}
-            return
+            sig = (
+                status["status"],
+                status["progress"],
+                bool(status["final_answer"]),
+                tuple(sorted(seen_approval_ids)),
+            )
+            if sig != last_sig:
+                yield {"event": "status", "data": _json(status)}
+                last_sig = sig
 
-        if time.time() - started > SSE_MAX_SECONDS:
-            yield {"event": "timeout", "data": _json({"message": "订阅超时，请重新连接"})}
-            return
-        await asyncio.sleep(SSE_POLL_SECONDS)
+            if status["status"] == "finished":
+                yield {"event": "final", "data": _json({"final_answer": status["final_answer"]})}
+                yield {"event": "done", "data": _json({"status": "finished"})}
+                return
+            if status["status"] == "failed":
+                yield {"event": "error", "data": _json({"error": status["error"]})}
+                yield {"event": "done", "data": _json({"status": "failed"})}
+                return
+
+            if time.time() - started > SSE_MAX_SECONDS:
+                yield {"event": "timeout", "data": _json({"message": "订阅超时，请重新连接"})}
+                return
+
+            # 心跳：长任务期间没有新事件时也让连接与代理知道它还活着
+            now = time.time()
+            if now - last_beat >= SSE_HEARTBEAT_SECONDS:
+                last_beat = now
+                yield {"event": "heartbeat", "data": _json({"elapsed_s": int(now - started)})}
+
+            await asyncio.sleep(SSE_POLL_SECONDS)
+    finally:
+        # 断开的客户端必须退订，否则总线里的订阅就是又一处慢性泄漏
+        bus.unsubscribe(sub)
 
 
 def create_app(service: Optional[HarnessService] = None) -> FastAPI:

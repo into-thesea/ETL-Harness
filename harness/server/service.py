@@ -20,6 +20,7 @@ from harness.audit import get_audit_logger
 from harness.trace import cleanup_tracer, get_tracer
 from harness.context import ContextManager
 from harness.domain import FrameworkHandles, PackageManager, PackageState
+from harness.events import build_event_bus
 from harness.orchestrator import SubgraphCache, build_plan_execute_graph, make_plan_execute_state
 from harness.planning import DataQualityChecker, QualityGate, TaskPlanner, TaskStore
 from harness.skills import SkillRegistry
@@ -254,6 +255,8 @@ class HarnessService:
             # 永久驻留 —— 这是接埋点时最容易漏的一步。
             if trace_id:
                 cleanup_tracer(trace_id)
+                # 事件绑定同理：留着就是又一张只增不减的映射表
+                build_event_bus().unbind(thread_id)
             if t.cancelled():
                 return
             exc = t.exception()
@@ -278,6 +281,10 @@ class HarnessService:
             goal, context=context, session_id=thread_id, role=role, origin_principal=origin_principal
         )
         trace_id = str(initial.get("trace_id") or "")
+
+        # 事件路由：埋点只带 trace_id，而订阅按 thread_id —— 绑定表把两者连起来。
+        # 不绑的话事件层是空转的（发布了也没人收得到）。
+        build_event_bus().bind(thread_id, trace_id)
 
         async def _drive():
             # 根 Span 覆盖整个请求；各节点在同一 Trace 上嵌套，构成一棵调用树
