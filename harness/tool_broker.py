@@ -7,10 +7,11 @@ Broker 的完整调用链路：
     2. 工具存在性检查
     3. PDP 权限检查（如果配置了 PDP）
     4. 参数校验（JSON Schema 基础校验）
-    5. 限流准入（滑动时间窗口，判定与记账在同一次加锁内完成）
-    6. 调用实现函数（高风险工具走安全沙箱）
-    7. 中间件 after_tool Hook（缓存/日志/结果修改）
-    8. 结果包装：统一返回 (ok, text, artifacts)
+    5. 熔断准入（按工具名独立的三态熔断，下游持续故障时快速失败）
+    6. 限流准入（滑动时间窗口，判定与记账在同一次加锁内完成）
+    7. 调用实现函数（高风险工具走安全沙箱）
+    8. 中间件 after_tool Hook（缓存/日志/结果修改）
+    9. 结果包装：统一返回 (ok, text, artifacts)
 
 工具实现函数的约定签名：
     handler(args: dict, context: dict) -> tuple[bool, str, dict]
@@ -26,6 +27,7 @@ import time
 from typing import Any, Callable, Optional
 
 from harness.audit import AuditLogger
+from harness.circuit_breaker import CircuitBreaker, build_circuit_breaker
 from harness.middleware import MiddlewareContext, MiddlewareManager
 from harness.models import ToolDef
 
@@ -55,6 +57,19 @@ def _default_sandbox() -> Optional[Any]:
     from harness.sandbox import SandboxExecutor
 
     return SandboxExecutor()
+
+
+def _default_breaker() -> Optional[CircuitBreaker]:
+    """按配置构造默认熔断器；关闭时返回 None（调用方据此跳过熔断这一环）。"""
+    from harness.config import settings
+
+    cb = settings.circuit
+    return build_circuit_breaker(
+        enabled=cb.enabled,
+        failure_threshold=cb.failure_threshold,
+        cooldown_seconds=cb.cooldown_seconds,
+        half_open_trials=cb.half_open_trials,
+    )
 
 
 def render_tool_descriptions(tools: list[ToolDef]) -> str:
@@ -95,6 +110,7 @@ class ToolBroker:
         pdp: Optional[Any] = None,
         sandbox_executor: Optional[Any] = None,
         audit_logger: Optional[AuditLogger] = None,
+        circuit_breaker: Optional[Any] = None,
     ):
         """初始化 Tool Broker。
 
@@ -106,6 +122,8 @@ class ToolBroker:
                 走自动构造；显式传 False 表示关闭沙箱，会归一为 None，标了
                 run_in_sandbox 的工具因此走 fail-closed 分支而不是裸跑。
             audit_logger: 审计器实例（可选，没有则不记录审计日志）
+            circuit_breaker: 按工具名的三态熔断器。缺省按 circuit.enabled 自动
+                构造；显式传 False 表示关闭熔断。
         """
         self._tools: dict[str, tuple[ToolDef, ToolHandler]] = {}
         self._call_log: dict[str, list[float]] = {}
@@ -127,6 +145,14 @@ class ToolBroker:
         else:
             self.sandbox = sandbox_executor
         self.audit = audit_logger
+        # 熔断器：开关语义与沙箱一致 —— 缺省按配置自动构造，显式 False 关闭
+        # （同样归一为 None，让下游只需判 `is not None`）。
+        if circuit_breaker is False:
+            self.breaker: Optional[CircuitBreaker] = None
+        elif circuit_breaker is None:
+            self.breaker = _default_breaker()
+        else:
+            self.breaker = circuit_breaker
 
     # ------------------------------------------------------------------
     # 注册与注销
@@ -283,7 +309,20 @@ class ToolBroker:
             )
             return False, f"参数校验失败：{args_error}", {}
 
-        # ---- 5. 限流准入（判定 + 记账原子完成）----
+        # ---- 5. 熔断准入 ----
+        # 放在限流之前：已经熔断的工具不该再消耗限流配额。熔断针对的是下游
+        # 持续故障，限流针对的是调用过密，前者更该优先短路。
+        if self.breaker is not None:
+            allowed, breaker_error = self.breaker.allow(tool_name)
+            if not allowed:
+                self._audit(
+                    trace_id=trace_id, session_id=session_id, agent_id=agent_id, role=role,
+                    tool_name=tool_name, args=args, pdp_decision="allow",
+                    result_ok=False, error=f"熔断：{breaker_error}",
+                )
+                return False, f"熔断：{breaker_error}", {}
+
+        # ---- 6. 限流准入（判定 + 记账原子完成）----
         rate_ok, rate_error = self._try_acquire(tool_name, tool_def.rate_limit_per_min)
         if not rate_ok:
             self._audit(
@@ -293,8 +332,9 @@ class ToolBroker:
             )
             return False, f"限流：{rate_error}", {}
 
-        # ---- 6. 调用实现函数 ----
+        # ---- 7. 调用实现函数 ----
         start_time = time.time()
+        raised: Optional[BaseException] = None
         try:
             if tool_def.run_in_sandbox:
                 # 高风险工具必须走沙箱；沙箱缺失时 fail closed，绝不裸跑
@@ -321,19 +361,29 @@ class ToolBroker:
                 artifacts = {"result": artifacts}
 
         except Exception as e:
+            raised = e
             duration_ms = int((time.time() - start_time) * 1000)
             logger.error("Tool %s raised exception after %dms: %s", tool_name, duration_ms, e, exc_info=True)
             ok, text, artifacts = False, f"工具执行异常：{type(e).__name__}: {str(e)}", {}
+
+        # 熔断记账：**只有抛异常才算下游故障**。业务上返回 ok=False（文件不存在、
+        # SQL 被权限拒绝）说明下游是活的，不该熔断 —— 熔断器保护的是"依赖坏了"，
+        # 不是"答案是坏的"。
+        if self.breaker is not None:
+            if raised is None:
+                self.breaker.record_success(tool_name)
+            else:
+                self.breaker.record_failure(tool_name, f"{type(raised).__name__}: {raised}")
 
         duration_ms = int((time.time() - start_time) * 1000)
         mw_ctx.extra["duration_ms"] = duration_ms
         mw_ctx.extra["result_ok"] = ok
 
-        # ---- 7. 中间件 after_tool Hook ----
+        # ---- 8. 中间件 after_tool Hook ----
         if self.middleware:
             ok, text, artifacts = self.middleware.exec_after_tool(mw_ctx, tool_name, (ok, text, artifacts))
 
-        # ---- 8. 审计：记录本次调用的最终结果（成功/执行异常） ----
+        # ---- 9. 审计：记录本次调用的最终结果（成功/执行异常） ----
         sandbox_used = bool(tool_def.run_in_sandbox and self.sandbox is not None)
         self._audit(
             trace_id=trace_id, session_id=session_id, agent_id=agent_id, role=role,
@@ -446,6 +496,9 @@ class ToolBroker:
             "pdp_default_policy": getattr(self.pdp, "default_policy", None),
             "sandbox_enabled": self.sandbox is not None,
             "audit_enabled": self.audit is not None,
+            # 只报非正常状态的 key（熔断中或有失败计数），免得快照被一堆 closed 淹没
+            "circuit_breaker_enabled": self.breaker is not None,
+            "circuit_breaker": self.breaker.snapshot() if self.breaker is not None else {},
             # 同理：限流窗口是进程内的，多副本时每个副本各算一份。报出来，免得
             # 看到 rate_limit_per_min 就以为全局总量被卡住了。
             "rate_limit_scope": "process",

@@ -486,6 +486,27 @@ class DataSourceSettings(BaseSettings):
     default: str = Field("", description="默认数据源名（未指定 data_source/db_path 时使用）")
 
 
+class CircuitBreakerSettings(BaseSettings):
+    """工具熔断配置（按工具名独立维护三态熔断器）。
+
+    熔断与限流是两件事：**限流挡的是"调用太密"，熔断挡的是"调了也没用"**。
+    后者保护的是下游持续性故障 —— 每次调用都要等一次超时才失败，而 LLM 看到失败
+    还会重试，把一次等待放大成好几倍。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="CIRCUIT_", extra="ignore")
+
+    enabled: bool = True
+    # 连续失败多少次后熔断。这是**策略阈值**而不是可推导量：太小会因偶发抖动误熔断，
+    # 太大则响应太慢。5 是连续失败型熔断器的常规取值。
+    failure_threshold: int = 5
+    # 熔断后隔离多久再放试探。默认取一个**完整的限流窗口**（60 秒）—— 隔离一个窗口，
+    # 给下游同等的时间恢复。
+    cooldown_seconds: float = 60.0
+    # 半开状态下允许几个试探同时在飞（默认 1：刚恢复不该立刻被打满）
+    half_open_trials: int = 1
+
+
 class Settings(BaseSettings):
     """全局配置聚合。
 
@@ -505,6 +526,7 @@ class Settings(BaseSettings):
     minio: MinIOSettings = Field(default_factory=MinIOSettings)
     server: ServerSettings = Field(default_factory=ServerSettings)
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
+    circuit: CircuitBreakerSettings = Field(default_factory=CircuitBreakerSettings)
     trace: TraceSettings = Field(default_factory=TraceSettings)
     vfs: VFSSettings = Field(default_factory=VFSSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
