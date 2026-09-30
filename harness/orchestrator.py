@@ -55,6 +55,52 @@ def _span(state: Any, name: str, operation: Optional[str] = None):
     return span_for(state, name, operation)
 
 
+class SubgraphCache:
+    """子 Agent 受限执行子图的编译缓存（按子 Agent 名）。
+
+    **为什么要有这个类**：缓存里的子图持有的是一个 `ScopedBroker` —— 它把该子 Agent
+    的工具白名单**固化**在编译结果里。领域包卸载后若不清掉，受限视图还以为自己被
+    授权了那几个工具，就是"假卸载"；重挂载若换了工具集，新工具也会因为旧缓存而
+    看不见（"假挂载"）。
+
+    所以它必须由**装配点持有并注入**（与 `context_manager` / `skill_registry` 同一
+    模式），领域包管理器才拿得到句柄去清。
+
+    ponytail: 按名清理，不做"定义指纹"键。当前没有"原地改定义不卸载"的代码路径；
+    真出现热改需求时再给键加指纹（那时顺带解决内存里留旧图的问题）。
+    """
+
+    def __init__(self) -> None:
+        self._graphs: dict[str, Any] = {}
+
+    def get(self, agent_name: str) -> Any:
+        return self._graphs.get(agent_name)
+
+    def set(self, agent_name: str, graph: Any) -> None:
+        self._graphs[agent_name] = graph
+
+    def invalidate(self, agent_names: Any) -> int:
+        """按子 Agent 名清理，返回清掉的条数。"""
+        doomed = set(agent_names or ())
+        if not doomed:
+            return 0
+        keys = [k for k in self._graphs if k in doomed]
+        for key in keys:
+            del self._graphs[key]
+        return len(keys)
+
+    def clear(self) -> int:
+        count = len(self._graphs)
+        self._graphs.clear()
+        return count
+
+    def names(self) -> list[str]:
+        return sorted(self._graphs)
+
+    def __len__(self) -> int:
+        return len(self._graphs)
+
+
 class PlanExecuteState(TypedDict, total=False):
     """顶层 Plan-and-Execute 图状态。"""
 
@@ -110,15 +156,24 @@ class PlanExecuteNodes:
         datasources: Any = None,
         long_term_memory: Any = None,
         max_parallel: Optional[int] = None,
+        subgraph_cache: Optional[SubgraphCache] = None,
     ) -> None:
         self.llm = llm
         self.broker = broker
         self.registry = registry or AgentRegistry()
         self.store = store or TaskStore(backend="memory")
+        # 角色清单与职责描述都取自注册表（即领域包声明的那份），框架不内置名录
         self.planner = planner or TaskPlanner(
-            llm, broker=broker, available_agents=self.registry.names()
+            llm,
+            broker=broker,
+            available_agents=self.registry.names(),
+            agent_descriptions={
+                d.name: d.description for d in self.registry.list_defs()
+            },
         )
-        self.gate = gate or QualityGate(llm=llm)
+        self.gate = gate or QualityGate(
+            llm=llm, use_critic=settings.quality.critic_enabled
+        )
         self.middleware = middleware
         self.max_replans = max_replans
         self.approval_callback = approval_callback
@@ -147,20 +202,22 @@ class PlanExecuteNodes:
         self.max_parallel = (
             settings.runtime.max_parallel_subtasks if max_parallel is None else max_parallel
         )
-        self._subgraph_cache: dict[str, Any] = {}
+        # 子图编译缓存：缺省自建；装配点可注入，好让领域包卸载时拿得到句柄（见 SubgraphCache）
+        self._subgraph_cache = subgraph_cache or SubgraphCache()
 
     # ------------------------------------------------------------------
     # 工具方法
     # ------------------------------------------------------------------
     def _executor_for(self, agent_name: str) -> Any:
         """按子 Agent 名缓存编译好的受限执行子图（受限 Broker + 专属 prompt）。"""
-        if agent_name not in self._subgraph_cache:
+        cached = self._subgraph_cache.get(agent_name)
+        if cached is None:
             agent_def = self.registry.get(agent_name)
             scoped = self.registry.scoped_broker(self.broker, agent_name)
             # SubAgentDef.skills 非空 → 限定该子 Agent 的 Skill 白名单；
             # 为空 → None（不限定，按任务相关性匹配）。
             allowed_skills = list(agent_def.skills) if agent_def.skills else None
-            self._subgraph_cache[agent_name] = build_executor_graph(
+            cached = build_executor_graph(
                 self.llm, scoped,
                 middleware=self.middleware,
                 system_prefix=agent_def.system_prompt,
@@ -171,7 +228,8 @@ class PlanExecuteNodes:
                 allowed_skills=allowed_skills,
                 datasources=self.datasources,
             )
-        return self._subgraph_cache[agent_name]
+            self._subgraph_cache.set(agent_name, cached)
+        return cached
 
     def _upstream_summary(self, plan: TaskPlan) -> str:
         """汇总已完成上游步骤的结论，注入下游子任务（截断防爆上下文）。"""
@@ -636,6 +694,7 @@ def build_plan_execute_graph(
     datasources: Any = None,
     long_term_memory: Any = None,
     max_parallel: Optional[int] = None,
+    subgraph_cache: Optional[SubgraphCache] = None,
 ):
     """编译顶层 Plan-and-Execute 图并返回（compiled graph）。
 
@@ -666,6 +725,7 @@ def build_plan_execute_graph(
         datasources=datasources,
         long_term_memory=long_term_memory,
         max_parallel=max_parallel,
+        subgraph_cache=subgraph_cache,
     )
 
     g = StateGraph(PlanExecuteState)
@@ -738,6 +798,7 @@ def make_plan_execute_state(
 __all__ = [
     "PlanExecuteState",
     "PlanExecuteNodes",
+    "SubgraphCache",
     "build_plan_execute_graph",
     "make_plan_execute_state",
     "ApprovalCallback",

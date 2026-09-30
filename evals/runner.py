@@ -17,14 +17,15 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from harness.agents.registry import AgentRegistry
+from packages.data_analysis.agents import build_agents
 from harness.audit import get_audit_logger
 from harness.context import ContextManager
 from harness.orchestrator import build_plan_execute_graph, make_plan_execute_state
 from harness.planning import QualityGate, TaskPlanner, TaskStore
 from harness.tool_broker import ToolBroker
 from harness.vfs import VirtualFileSystem
-from tools import register_builtin_tools
-from tools.common import reports_dir, workspace_dir
+from packages.data_analysis.tools import register_builtin_tools
+from packages.data_analysis.tools.common import reports_dir, workspace_dir
 
 LLMFactory = Callable[[], Any]
 
@@ -73,7 +74,7 @@ def scripted_llm_factory() -> LLMFactory:
     """确定性脚本 LLM 工厂：每次返回一个新的回放器，并确保脏数据存在。"""
 
     def _make() -> Any:
-        from examples.data_analysis_demo import (
+        from packages.data_analysis.offline import (
             CLEAN_STEM,
             RAW_FILE,
             ScriptedAnalysisLLM,
@@ -117,11 +118,17 @@ def build_graph(llm: Any) -> Any:
     """构造一次完整的顶层 Plan-and-Execute 编译图（同步内核）。"""
     broker = ToolBroker(audit_logger=get_audit_logger())
     register_builtin_tools(broker)
-    registry = AgentRegistry()
+    # 角色由领域包声明（框架不内置）；评测跑的是数据分析领域的用例
+    registry = AgentRegistry(defs=build_agents())
     store = TaskStore(backend="memory")
     # 评测以硬校验质量门为准，关闭语义 Critic，避免引入额外 LLM 噪声
     gate = QualityGate(llm=llm, use_critic=False)
-    planner = TaskPlanner(llm, broker=broker, available_agents=registry.names())
+    planner = TaskPlanner(
+        llm,
+        broker=broker,
+        available_agents=registry.names(),
+        agent_descriptions={d.name: d.description for d in registry.list_defs()},
+    )
     context_manager = ContextManager(vfs=VirtualFileSystem())
 
     from harness.config import settings

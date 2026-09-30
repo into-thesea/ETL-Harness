@@ -16,9 +16,9 @@ import tempfile
 
 import pytest
 
-import tools.sql_query as sq
+import packages.data_analysis.tools.sql_query as sq
 from harness.datasources import DataSourceManager
-from tools.sql_query import handle
+from packages.data_analysis.tools.sql_query import handle
 
 
 def _make_db(d: str, rows: int = 20) -> str:

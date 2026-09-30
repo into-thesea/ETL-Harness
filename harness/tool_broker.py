@@ -3,15 +3,22 @@
 所有工具调用必须经过 Broker，不允许 Agent 直接调实现函数。
 
 Broker 的完整调用链路：
-    1. 中间件 before_tool Hook（缓存/PII检测/日志）
+    1. 中间件 before_tool Hook（PII检测/日志）
     2. 工具存在性检查
     3. PDP 权限检查（如果配置了 PDP）
     4. 参数校验（JSON Schema 基础校验）
     5. 熔断准入（按工具名独立的三态熔断，下游持续故障时快速失败）
     6. 限流准入（滑动时间窗口，判定与记账在同一次加锁内完成）
-    7. 调用实现函数（高风险工具走安全沙箱）
-    8. 中间件 after_tool Hook（缓存/日志/结果修改）
-    9. 结果包装：统一返回 (ok, text, artifacts)
+    7. 工具结果缓存：命中则跳过第 8 步的执行，**其余各步照常**（见下）
+    8. 调用实现函数（高风险工具走安全沙箱）
+    9. 中间件 after_tool Hook（PII检测/日志/结果修改）
+   10. 审计（记录最终结果，含 cache_hit 标记）
+   11. 结果包装：统一返回 (ok, text, artifacts)
+
+缓存为什么落在这个位置（而不是做成 before_tool 中间件）：命中要省的是"真正的
+执行"，不能顺带省掉权限、参数校验、熔断、限流与 after_tool —— 那些是合规物，
+且都不贵。缓存值写在 after_tool **之后**，存的是脱敏后的最终结果，否则缓存自己
+就成了 PII 的泄漏面。详见 ``harness.cache`` 的模块说明。
 
 工具实现函数的约定签名：
     handler(args: dict, context: dict) -> tuple[bool, str, dict]
@@ -20,6 +27,7 @@ Broker 的完整调用链路：
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import threading
@@ -72,6 +80,17 @@ def _default_breaker() -> Optional[CircuitBreaker]:
     )
 
 
+def _default_cache() -> Optional[Any]:
+    """按配置构造默认工具结果缓存；关闭时返回 None。"""
+    from harness.cache import ToolResultCache
+    from harness.config import settings
+
+    if not settings.cache.enabled:
+        logger.info("cache.enabled=False，工具结果不做缓存")
+        return None
+    return ToolResultCache(max_entries=settings.cache.max_entries)
+
+
 def render_tool_descriptions(tools: list[ToolDef]) -> str:
     """根据给定工具列表渲染给 LLM 看的工具描述文本（Broker 与其受限视图共用）。"""
     if not tools:
@@ -111,6 +130,7 @@ class ToolBroker:
         sandbox_executor: Optional[Any] = None,
         audit_logger: Optional[AuditLogger] = None,
         circuit_breaker: Optional[Any] = None,
+        cache: Optional[Any] = None,
     ):
         """初始化 Tool Broker。
 
@@ -124,6 +144,8 @@ class ToolBroker:
             audit_logger: 审计器实例（可选，没有则不记录审计日志）
             circuit_breaker: 按工具名的三态熔断器。缺省按 circuit.enabled 自动
                 构造；显式传 False 表示关闭熔断。
+            cache: 工具结果缓存（``harness.cache.ToolResultCache``）。缺省按
+                cache.enabled 自动构造；显式传 False 表示关闭缓存。
         """
         self._tools: dict[str, tuple[ToolDef, ToolHandler]] = {}
         self._call_log: dict[str, list[float]] = {}
@@ -153,6 +175,14 @@ class ToolBroker:
             self.breaker = _default_breaker()
         else:
             self.breaker = circuit_breaker
+
+        # 工具结果缓存：开关语义同上，显式 False 归一为 None，下游只判 is not None。
+        if cache is False:
+            self.cache: Optional[Any] = None
+        elif cache is None:
+            self.cache = _default_cache()
+        else:
+            self.cache = cache
 
     # ------------------------------------------------------------------
     # 注册与注销
@@ -188,8 +218,14 @@ class ToolBroker:
         return entry[1] if entry else None
 
     def list_tools(self) -> list[ToolDef]:
-        """列出所有已注册工具的定义。"""
-        return [entry[0] for entry in self._tools.values()]
+        """列出所有已注册工具的定义，**按名排序**。
+
+        顺序必须是确定的，且不能取决于注册顺序：工具定义块会被渲染进提示词，
+        而服务端的提示词前缀缓存按字节比对 —— 顺序一变（例如多接了一个外部
+        MCP server、或对端返回顺序不同），整块缓存静默失效，每一轮都按全价计费。
+        MCP 规范同样要求列表结果确定性排序。
+        """
+        return sorted((entry[0] for entry in self._tools.values()), key=lambda t: t.name)
 
     def search(self, query: str) -> list[ToolDef]:
         """按关键词搜索工具（名称或描述匹配）。"""
@@ -259,7 +295,12 @@ class ToolBroker:
         trace_id = context.get("trace_id")
         session_id = context.get("session_id")
         agent_id = context.get("agent_id")
-        role = context.get("role", "analyst")
+        role = context.get("role", "default")
+
+        # 原始参数的快照：before_tool 的中间件（PII 脱敏）会**就地改写** args，
+        # 而缓存指纹必须基于原始值 —— 否则两个不同手机号的查询会被脱敏成同一个
+        # 键，命中出错误结果。见 harness.cache.ToolResultCache.fingerprint。
+        original_args = copy.deepcopy(args)
 
         # 创建中间件上下文
         mw_ctx = MiddlewareContext(
@@ -272,6 +313,10 @@ class ToolBroker:
 
         # ---- 1. 中间件 before_tool Hook ----
         if self.middleware:
+            # 把工具定义放进上下文：中间件据此判断**工具自己的声明**（如 pii_skip、
+            # cacheable），而不必由配置按名点名工具 —— 框架不该认识领域工具名。
+            entry = self._tools.get(tool_name)
+            mw_ctx.extra["tool_def"] = entry[0] if entry else None
             tool_name, args = self.middleware.exec_before_tool(mw_ctx, tool_name, args)
             if mw_ctx.is_short_circuited:
                 logger.info("Tool %s short-circuited by middleware", tool_name)
@@ -332,39 +377,54 @@ class ToolBroker:
             )
             return False, f"限流：{rate_error}", {}
 
-        # ---- 7. 调用实现函数 ----
+        # ---- 7. 工具结果缓存查找 ----
+        # 位置有意放在限流之后：命中要省的是"真正的执行"，不该顺带省掉权限、
+        # 参数校验、熔断与限流。指纹用**进入本方法时的原始参数**，不能用中间件
+        # 改写后的 —— PII 脱敏会把两个不同号码的查询改成同一个键。
+        cache_key: Optional[str] = None
+        cached: Optional[tuple[bool, str, dict]] = None
+        if self.cache is not None:
+            cache_key = self.cache.fingerprint(tool_name, tool_def, original_args)
+            if cache_key is not None:
+                cached = self.cache.get(cache_key)
+
+        # ---- 8. 调用实现函数（缓存命中则跳过）----
         start_time = time.time()
         raised: Optional[BaseException] = None
-        try:
-            if tool_def.run_in_sandbox:
-                # 高风险工具必须走沙箱；沙箱缺失时 fail closed，绝不裸跑
-                if self.sandbox is None:
-                    ok, text, artifacts = (
-                        False,
-                        f"沙箱已禁用（sandbox.enabled=False），拒绝执行高风险工具 "
-                        f"{tool_name!r}（fail closed）。",
-                        {},
-                    )
+        if cached is not None:
+            ok, text, artifacts = cached
+            logger.info("Tool %s served from cache", tool_name)
+        else:
+            try:
+                if tool_def.run_in_sandbox:
+                    # 高风险工具必须走沙箱；沙箱缺失时 fail closed，绝不裸跑
+                    if self.sandbox is None:
+                        ok, text, artifacts = (
+                            False,
+                            f"沙箱已禁用（sandbox.enabled=False），拒绝执行高风险工具 "
+                            f"{tool_name!r}（fail closed）。",
+                            {},
+                        )
+                    else:
+                        ok, text, artifacts = self.sandbox.execute(
+                            tool_def, args, context, tool_def.sandbox_config
+                        )
                 else:
-                    ok, text, artifacts = self.sandbox.execute(
-                        tool_def, args, context, tool_def.sandbox_config
-                    )
-            else:
-                ok, text, artifacts = handler(args, context)
+                    ok, text, artifacts = handler(args, context)
 
-            # 确保返回值格式正确
-            if not isinstance(ok, bool):
-                ok = bool(ok)
-            if not isinstance(text, str):
-                text = str(text)
-            if not isinstance(artifacts, dict):
-                artifacts = {"result": artifacts}
+                # 确保返回值格式正确
+                if not isinstance(ok, bool):
+                    ok = bool(ok)
+                if not isinstance(text, str):
+                    text = str(text)
+                if not isinstance(artifacts, dict):
+                    artifacts = {"result": artifacts}
 
-        except Exception as e:
-            raised = e
-            duration_ms = int((time.time() - start_time) * 1000)
-            logger.error("Tool %s raised exception after %dms: %s", tool_name, duration_ms, e, exc_info=True)
-            ok, text, artifacts = False, f"工具执行异常：{type(e).__name__}: {str(e)}", {}
+            except Exception as e:
+                raised = e
+                duration_ms = int((time.time() - start_time) * 1000)
+                logger.error("Tool %s raised exception after %dms: %s", tool_name, duration_ms, e, exc_info=True)
+                ok, text, artifacts = False, f"工具执行异常：{type(e).__name__}: {str(e)}", {}
 
         # 熔断记账：**只有抛异常才算下游故障**。业务上返回 ok=False（文件不存在、
         # SQL 被权限拒绝）说明下游是活的，不该熔断 —— 熔断器保护的是"依赖坏了"，
@@ -378,12 +438,19 @@ class ToolBroker:
         duration_ms = int((time.time() - start_time) * 1000)
         mw_ctx.extra["duration_ms"] = duration_ms
         mw_ctx.extra["result_ok"] = ok
+        mw_ctx.extra["cache_hit"] = cached is not None
 
-        # ---- 8. 中间件 after_tool Hook ----
+        # ---- 9. 中间件 after_tool Hook ----
         if self.middleware:
             ok, text, artifacts = self.middleware.exec_after_tool(mw_ctx, tool_name, (ok, text, artifacts))
 
-        # ---- 9. 审计：记录本次调用的最终结果（成功/执行异常） ----
+        # ---- 9.5 写入缓存 ----
+        # 写在 after_tool **之后**：存的是脱敏后的最终结果，否则缓存自己就成了 PII
+        # 的泄漏面。命中时不重复写入（值本就来自缓存）。失败结果不进缓存。
+        if cache_key is not None and cached is None:
+            self.cache.put(cache_key, tool_name, (ok, text, artifacts))
+
+        # ---- 10. 审计：记录本次调用的最终结果（成功/执行异常） ----
         sandbox_used = bool(tool_def.run_in_sandbox and self.sandbox is not None)
         self._audit(
             trace_id=trace_id, session_id=session_id, agent_id=agent_id, role=role,
@@ -392,6 +459,7 @@ class ToolBroker:
             error=None if ok else text,
             sandbox_used=sandbox_used,
             approval_required=tool_def.requires_approval,
+            cache_hit=cached is not None,
         )
 
         logger.info("Tool %s completed: ok=%s duration=%dms", tool_name, ok, duration_ms)

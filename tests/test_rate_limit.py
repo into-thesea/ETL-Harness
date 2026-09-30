@@ -8,7 +8,7 @@
 2. 窗口按 60 秒滑动，被拒绝的调用不占用配额。
 
 限流窗口是进程内的（见 ``ToolBroker._rate_lock`` 上的说明），因此全部用例
-离线可跑，不需要 Redis。
+离线可跑，不需要任何外部服务。
 """
 
 from __future__ import annotations

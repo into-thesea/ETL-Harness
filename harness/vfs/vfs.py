@@ -143,7 +143,12 @@ class VirtualFileSystem:
 
         Returns:
             VFSFile 元数据
+
+        Raises:
+            ValueError: 内容超过 `VFS_MAX_FILE_SIZE_MB`（见 :meth:`_check_size`）。
         """
+        self._check_size(len(content), path)
+
         # 确保父目录存在
         parent = os.path.dirname(path)
         if parent:
@@ -182,6 +187,28 @@ class VirtualFileSystem:
         else:
             new_content = content
         return self.write(path, new_content, message)
+
+    def _check_size(self, size: int, path: str) -> None:
+        """写入前检查单文件大小上限（``VFS_MAX_FILE_SIZE_MB``）。
+
+        上限此前只是个没人读的配置 —— 写了也白写。这里让它真正生效，且**超限直接
+        拒绝**而不是一路写下去：一次失控的写入会先占满磁盘，再在很久之后以更难
+        排查的方式暴露（读的时候才炸）；而且 `write` 还会额外写一份版本影子文件，
+        不拦就是双倍。
+
+        大文件不该走 VFS：VFS 承载的是观察值、报告与代码留档，数据面的大
+        DataFrame 由工具自己直接落盘（那才是能流式写的地方）。
+        """
+        limit_mb = int(getattr(settings.vfs, "max_file_size_mb", 0) or 0)
+        if limit_mb <= 0:
+            return
+        limit_bytes = limit_mb * 1024 * 1024
+        if size > limit_bytes:
+            raise ValueError(
+                f"拒绝写入 {path}：内容 {size / 1024 / 1024:.1f} MB 超过单文件上限 "
+                f"{limit_mb} MB（VFS_MAX_FILE_SIZE_MB）。VFS 不承载大文件 —— 数据面"
+                f"请由工具直接落盘，或调大该上限（同时确认磁盘与版本留痕的代价）。"
+            )
 
     def delete(self, path: str) -> bool:
         """删除文件或目录。"""

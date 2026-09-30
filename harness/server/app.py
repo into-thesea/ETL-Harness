@@ -50,6 +50,17 @@ def _build_router(service: HarnessService, auth: Any) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"任务 {thread_id} 不存在")
         return schemas.TaskStatusResponse(**status)
 
+    # ---------------- 领域包清单 ----------------
+    @router.get("/packages", response_model=list[schemas.PackageInfoResponse])
+    async def list_packages() -> list[schemas.PackageInfoResponse]:
+        """已登记的领域包与装载状态（控制台「插件」页的数据源）。
+
+        这个端点**只读**，且与其他业务路由一样需要令牌（鉴权是全局中间件 + 白名单，
+        新路由默认受保护）。**本轮不提供挂载/卸载** —— 运行时热插拔还没做（见
+        `docs/技术选型决策.md` D-005 的「何时该回头」）。
+        """
+        return [schemas.PackageInfoResponse(**p) for p in await service.list_packages()]
+
     # ---------------- 待审批项 ----------------
     @router.get("/tasks/{thread_id}/approvals", response_model=list[schemas.PendingApproval])
     async def list_approvals(thread_id: str) -> list[schemas.PendingApproval]:

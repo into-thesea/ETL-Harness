@@ -26,7 +26,7 @@ import pytest
 
 from harness.datasources import DataSourceManager
 from harness.permissions import RowColumnPolicy
-from tools.sql_query import handle
+from packages.data_analysis.tools.sql_query import handle
 
 # 订单号取得有辨识度，便于在结果文本里精确断言"哪些行出现了"
 ROWS = [
@@ -368,7 +368,7 @@ def test_pdp_bad_default_policy_fails_loud() -> None:
 # 配置到执行路径（不靠 context 注入也能生效）
 # ----------------------------------------------------------------------
 def test_policy_from_settings_reaches_handler(db, manager, monkeypatch) -> None:
-    import tools.sql_query as sql_query
+    import packages.data_analysis.tools.sql_query as sql_query
 
     from harness.config import PermissionSettings
 

@@ -131,16 +131,29 @@ class ToolDef(BaseModel):
     ``parameters`` 是一个 JSON Schema 对象，用于 Broker 参数校验和渲染给 LLM。
     ``requires_approval`` 为 True 时，调用前需要人工审批。
     ``run_in_sandbox`` 为 True 时，在 Docker 沙箱中执行。
+    ``cacheable`` 为 True 时，Broker 按「工具名 + 参数 + 输入文件身份」缓存结果
+    （见 ``harness.cache``）。**必须显式声明**：能不能缓存只有工具自己知道 ——
+    写产物的、有副作用的、查活库的一律不能开。
+
+    ``sandbox_task`` / ``pii_skip`` 是**工具自己声明**的两件事，替代原先由框架配置
+    按名点名领域工具（框架不该认识任何领域工具名）：
+    ``sandbox_task`` 指定用哪套沙箱任务实现（沙箱执行器按它分派）；
+    ``pii_skip`` 声明入参不做 PII 脱敏（SQL / 代码里的号码是查询条件与字面量，
+    脱敏会把语义改坏）。
     """
 
     name: str
     description: str
     parameters: dict[str, Any]
-    required_role: str = "analyst"
+    required_role: str = "default"
     rate_limit_per_min: int = 60
     requires_approval: bool = False              # 是否需要人工审批
     run_in_sandbox: bool = False                 # 是否在沙箱中执行
     sandbox_config: Optional[dict[str, Any]] = None  # 沙箱配置覆盖
+    sandbox_task: str = ""                       # 沙箱任务实现名（run_in_sandbox 时必须声明）
+    pii_skip: bool = False                       # 入参不脱敏（SQL / 代码字面量）
+    cacheable: bool = False                      # 是否可缓存结果（需显式声明）
+    input_path_params: list[str] = []            # 哪几个参数是输入文件（取值指纹）
 
 
 # ===========================================================================
@@ -182,6 +195,7 @@ class AuditRecord(BaseModel):
     sandbox_used: bool = False                     # 是否使用了沙箱
     approval_required: bool = False                # 是否需要审批
     approval_id: Optional[str] = None              # 关联的审批请求 ID
+    cache_hit: bool = False                        # 结果是否来自工具结果缓存
     timestamp: datetime = Field(default_factory=datetime.now)
 
 
@@ -358,7 +372,7 @@ class SubAgentDef(BaseModel):
     skills: list[str] = Field(default_factory=list)  # 子 Agent 可用的 Skill 名列表
     max_steps: int = 10
     timeout_seconds: int = 120
-    required_role: str = "analyst"
+    required_role: str = "default"
 
 
 class SubAgentResult(BaseModel):
@@ -385,7 +399,7 @@ class AgentRun(BaseModel):
     session_id: str
     agent_id: str
     goal: str
-    role: str = "analyst"
+    role: str = "default"
     status: AgentStatus = AgentStatus.IDLE
     task_plan_id: Optional[str] = None
     start_time: Optional[datetime] = None

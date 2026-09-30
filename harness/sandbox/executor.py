@@ -116,9 +116,11 @@ class SandboxExecutor:
 
     def __init__(self, client: SandboxClient | None = None) -> None:
         self.client = client or SandboxClient()
-        # 工具名 -> 沙箱任务实现。新增沙箱工具在此登记。
+        # 沙箱任务名 -> 实现。工具用 `ToolDef.sandbox_task` **自己声明**用哪一套，
+        # 框架不再按领域工具名分派（框架不该认识任何领域工具名）。新增一类沙箱任务
+        # 时才在这里登记。
         self._tasks: dict[str, Callable[..., tuple[bool, str, dict]]] = {
-            "code_executor": self._run_python_code,
+            "python_code": self._run_python_code,
         }
         # 并发闸门：沙箱是不可无限扩张的资源，一次并行子任务能瞬间把宿主压垮。
         self._limit = resolve_concurrency_limit()
@@ -148,11 +150,18 @@ class SandboxExecutor:
             (ok, text, artifacts)；失败统一返回结构化原因，不抛异常。
         """
         name = getattr(tool_def, "name", None)
-        task = self._tasks.get(name)
+        # 按**声明的**沙箱任务名分派，不按工具名 —— 工具名属于领域，任务名属于框架。
+        task_name = str(getattr(tool_def, "sandbox_task", "") or "")
+        task = self._tasks.get(task_name)
         if task is None:
+            hint = (
+                f"sandbox_task={task_name!r} 未注册，可用：{sorted(self._tasks)}"
+                if task_name
+                else "未声明 ToolDef.sandbox_task"
+            )
             return (
                 False,
-                f"工具 {name!r} 标记了 run_in_sandbox 但未注册沙箱实现，"
+                f"工具 {name!r} 标记了 run_in_sandbox 但无法确定沙箱实现（{hint}），"
                 f"已拒绝执行（fail closed）。",
                 {},
             )
@@ -292,14 +301,12 @@ class SandboxExecutor:
 
 
 def _host_dir(context: dict, key: str, kind: str) -> str:
-    """解析主机侧目录，缺省回退到项目 data/vfs/<kind>。"""
+    """解析主机侧目录，缺省回退到 VFS 的 ``<kind>`` 目录（见 harness.paths）。"""
     if context.get(key):
         return context[key]
-    from tools.common import project_root
+    from harness.paths import vfs_dir
 
-    path = os.path.join(project_root(), "data", "vfs", kind)
-    os.makedirs(path, exist_ok=True)
-    return path
+    return vfs_dir(kind)
 
 
 def _archive_generated_code(code: str, workspace: str, tool_name: str) -> str:

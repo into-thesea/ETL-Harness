@@ -1,28 +1,11 @@
 # Governed 工业级基础设施编排
-# 包含：Redis（短期记忆/缓存/限流）、Milvus（长期向量记忆）、Kafka（链路追踪/审计）、MinIO（VFS文件存储）
+# 包含：Milvus（长期向量记忆）、Kafka（链路追踪/审计）、MinIO（VFS 文件存储）
+# 另含可选：PostgreSQL（多数据源 + pgvector 长期记忆）、MySQL（多数据源）
 # 使用：docker-compose up -d
 
 version: "3.8"
 
 services:
-  # ============================================================
-  # Redis —— 短期记忆、任务状态、缓存、分布式锁、限流
-  # ============================================================
-  redis:
-    image: redis:7-alpine
-    container_name: governed-redis
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
-    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   # ============================================================
   # Milvus —— 长期向量记忆（向量相似度检索）
   # 依赖：etcd（元数据）、minio（对象存储）
@@ -177,7 +160,6 @@ services:
       retries: 30
 
 volumes:
-  redis_data:
   etcd_data:
   minio_data:
   milvus_data:

@@ -7,7 +7,7 @@
 #   2. 通过 start.ps1 启动；服务端 api_key 由环境变量注入（见 start.ps1），
 #      本文件里 api_key 留空即可。
 #
-# 说明：服务端是 Governed 的「沙箱层」基础设施，与 Redis/Kafka/MinIO 同级。
+# 说明：服务端是 Governed 的「沙箱层」基础设施，与 Milvus/Kafka/MinIO 同级。
 # 客户端 SDK（项目 .venv 里的 opensandbox）通过 HTTP 连本服务，不直连 Docker。
 # ============================================================================
 

@@ -19,11 +19,12 @@ from harness.agents.registry import AgentRegistry
 from harness.audit import get_audit_logger
 from harness.trace import cleanup_tracer, get_tracer
 from harness.context import ContextManager
-from harness.orchestrator import build_plan_execute_graph, make_plan_execute_state
+from harness.domain import FrameworkHandles, PackageManager, PackageState
+from harness.orchestrator import SubgraphCache, build_plan_execute_graph, make_plan_execute_state
 from harness.planning import DataQualityChecker, QualityGate, TaskPlanner, TaskStore
+from harness.skills import SkillRegistry
 from harness.tool_broker import ToolBroker
 from harness.vfs import VirtualFileSystem
-from tools import register_builtin_tools
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +105,26 @@ class HarnessService:
             pdp=PDP.from_settings(settings.permission),
             audit_logger=get_audit_logger(),
         )
-        register_builtin_tools(broker)
+        # 框架侧对象先立起来（全部为空）：**工具、角色、技能都由领域包挂载进来**，
+        # 框架不内置任何领域内容。
         registry = AgentRegistry()
+        skill_registry = SkillRegistry()
+        subgraph_cache = SubgraphCache()
+        handles = FrameworkHandles(
+            tools=broker,
+            agents=registry,
+            skills=skill_registry,
+            result_cache=broker.cache,
+            subgraph_cache=subgraph_cache,
+        )
+        # 发现（entry points）→ 挂载。依赖未就绪的包停在 PENDING，不算失败；
+        # 一个包没挂上只会让对应能力缺失，不会把服务拖垮。
+        self.packages = PackageManager(handles)
+        self.packages.discover()
+        self.packages.mount_all()
+        for info in self.packages.list_packages():
+            logger.info("领域包 %s：%s（%s）", info.name, info.state.value, info.contributes_summary)
+
         store = TaskStore(backend="memory")
         llm = self._llm_override or self._select_llm()
         gate = QualityGate(
@@ -115,19 +134,15 @@ class HarnessService:
             middleware=middleware,
         )
         planner = TaskPlanner(
-            llm, broker=broker, available_agents=registry.names(), middleware=middleware
+            llm,
+            broker=broker,
+            available_agents=registry.names(),
+            # 角色职责描述取自注册表（即领域包声明的）—— 框架侧没有名录了，
+            # 不传的话规划提示词会把角色渲染成裸名字。
+            agent_descriptions={d.name: d.description for d in registry.list_defs()},
+            middleware=middleware,
         )
         context_manager = ContextManager(vfs=VirtualFileSystem())
-
-        # Skill 技能系统：加载 harness/skills 下全部 SKILL.md 并透传给图，
-        # 由执行体按任务上下文渐进式披露，而非一次性塞满。
-        import os
-
-        from harness.skills import SkillRegistry
-
-        skill_registry = SkillRegistry()
-        skills_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "skills")
-        skill_registry.load_directory(skills_dir)
 
         # 多数据源（C5）：从 DATASOURCE_SOURCES 加载命名 MySQL/PostgreSQL 源
         from harness.datasources import DataSourceManager
@@ -187,16 +202,37 @@ class HarnessService:
                 timeout=float(settings.llm.timeout_seconds),
             )
 
-        # 离线模式：脚本化 Mock（与真实 LLM 同契约），并确保演示脏数据已生成
-        logger.info("No API key, falling back to scripted Mock LLM (offline mode)")
-        from examples.data_analysis_demo import RAW_FILE, ScriptedAnalysisLLM, make_dirty_data
+        # 离线模式：用**已挂载领域包贡献出来的** LLM 工厂。
+        # 框架不认识"演示脏数据""脚本化工作流"这类领域细节 —— 它只认贡献清单里的入口。
+        logger.info("No API key, falling back to a package-contributed offline LLM")
+        factory = self._offline_llm_factory()
+        if factory is None:
+            raise RuntimeError(
+                "未配置 LLM_API_KEY，且已挂载的领域包都没有贡献离线 LLM"
+                "（contributes['offline_llm']）。请配置 .env 里的 LLM_API_KEY，"
+                "或挂载一个带离线能力的领域包。"
+            )
+        return factory()
 
-        import os
-        from tools.common import workspace_dir
+    def _offline_llm_factory(self) -> Optional[Any]:
+        """取已挂载领域包贡献的离线 LLM 工厂（contributions 里的 ``offline_llm``）。"""
+        for info in self.packages.list_packages():
+            if info.state is not PackageState.ACTIVE:
+                continue
+            spec = str(info.contributes.get("offline_llm") or "")
+            if not spec:
+                continue
+            module_path, _, attr = spec.partition(":")
+            try:
+                import importlib
 
-        if not os.path.exists(os.path.join(workspace_dir({}), RAW_FILE)):
-            make_dirty_data()
-        return ScriptedAnalysisLLM(RAW_FILE, "sales_cleaned")
+                factory = getattr(importlib.import_module(module_path), attr)
+            except Exception as e:  # noqa: BLE001 - 贡献的入口坏了不该让服务起不来
+                logger.error("领域包 %s 贡献的离线 LLM 无法加载（%s）：%s", info.name, spec, e)
+                continue
+            logger.info("离线 LLM 来自领域包 %s：%s", info.name, spec)
+            return factory
+        return None
 
     # ------------------------------------------------------------------
     # 工具
@@ -220,8 +256,13 @@ class HarnessService:
                 cleanup_tracer(trace_id)
             if t.cancelled():
                 return
-            if t.exception():
-                logger.exception("Background graph task %s failed: %s", thread_id, t.exception())
+            exc = t.exception()
+            if exc is not None:
+                # 必须把异常对象本身传给 exc_info：只把 exc 当消息格式化，栈会丢光，
+                # 只剩下 `name 'json' is not defined` 这种无从下手的单行（踩过）。
+                logger.error(
+                    "Background graph task %s failed", thread_id, exc_info=exc
+                )
 
         task.add_done_callback(_done)
         return task
@@ -246,6 +287,30 @@ class HarnessService:
         self._spawn(thread_id, _drive(), trace_id)
         logger.info("Task created: %s (trace=%s)", thread_id, trace_id)
         return thread_id
+
+    async def list_packages(self) -> list[dict]:
+        """领域包清单与装载状态（装配后才有；未装配则先装配）。
+
+        控制台「插件」页的数据源：框架挂了哪些领域、各自贡献了什么、现在什么状态。
+        未挂载/导入失败的包**同样列出**（带上 ``state`` 与 ``error``）—— 界面要能如实
+        显示"有但没起来"，而不是让它凭空消失。
+        """
+        await self._ensure_ready()
+        return [
+            {
+                "name": info.name,
+                "version": info.version,
+                "description": info.description,
+                "provider": info.provider,
+                "state": info.state.value,
+                "requires": list(info.requires),
+                "contributes": dict(info.contributes),
+                "contributes_summary": info.contributes_summary,
+                "status_note": info.status_note,
+                "error": info.error,
+            }
+            for info in self.packages.list_packages()
+        ]
 
     async def get_status(self, thread_id: str) -> Optional[dict]:
         """返回任务状态快照；thread 不存在返回 None。"""

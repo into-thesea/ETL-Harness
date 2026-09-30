@@ -453,7 +453,7 @@ class ReActNodes:
             trace_id=state.get("trace_id"),
             session_id=state.get("session_id"),
             agent_id=state.get("agent_id"),
-            role=state.get("role", "analyst"),
+            role=state.get("role", "default"),
         )
 
         steps = list(state.get("steps", []))
@@ -579,7 +579,7 @@ class ReActNodes:
             trace_id=state.get("trace_id"),
             session_id=state.get("session_id"),
             agent_id=state.get("agent_id"),
-            role=state.get("role", "analyst"),
+            role=state.get("role", "default"),
         )
 
         # before_llm Hook（缓存命中可短路）
@@ -694,7 +694,7 @@ class ReActNodes:
             "trace_id": state.get("trace_id"),
             "session_id": state.get("session_id"),
             "agent_id": state.get("agent_id"),
-            "role": state.get("role", "analyst"),
+            "role": state.get("role", "default"),
             "working_memory": state.get("working_memory", {}),
             "data_source_manager": self.datasources,
             "skill_registry": self.skill_registry,
@@ -768,7 +768,7 @@ class ReActNodes:
             "trace_id": state.get("trace_id"),
             "session_id": state.get("session_id"),
             "agent_id": state.get("agent_id"),
-            "role": state.get("role", "analyst"),
+            "role": state.get("role", "default"),
             "working_memory": state.get("working_memory", {}),
             "data_source_manager": self.datasources,
             "skill_registry": self.skill_registry,

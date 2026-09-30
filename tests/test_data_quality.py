@@ -148,36 +148,50 @@ def test_gate_without_checker_is_unchanged() -> None:
 # 质检能力（并入 reporter 子 Agent）
 # ----------------------------------------------------------------------
 def test_default_agents_are_three_core_roles() -> None:
-    """内置三个核心子 Agent：角色数由上下文隔离需求决定，不按业务步骤铺开。"""
-    from harness.agents.registry import build_default_agents
+    """领域包提供三个核心子 Agent：角色数由上下文隔离需求决定，不按业务步骤铺开。"""
+    from packages.data_analysis.agents import build_agents
 
-    agents = build_default_agents()
+    agents = build_agents()
     assert sorted(agents) == ["analyst", "data-explorer", "reporter"], sorted(agents)
 
 
 def test_reporter_agent_covers_qa() -> None:
     """报告与质检共享一个上下文；质检要能自己核实数字，故带只读查询工具。"""
-    from harness.agents.registry import build_default_agents
+    from packages.data_analysis.agents import build_agents
 
-    reporter = build_default_agents()["reporter"]
+    reporter = build_agents()["reporter"]
     assert reporter.required_role == "analyst"
     assert "data_inspector" in reporter.tools, "质检环节需要能自己核实数据"
 
 
-def test_default_agents_are_all_plannable() -> None:
-    """规划器只认 DEFAULT_AGENT_ROLES 里的描述；缺了会渲染成裸名字。"""
-    from harness.agents.registry import build_default_agents
-    from harness.planning.planner import DEFAULT_AGENT_ROLES
+def test_registry_agents_are_all_plannable() -> None:
+    """注册表里的每个子 Agent 都要能被规划器看到，且**带描述**。
 
-    registered = set(build_default_agents())
-    missing = registered - set(DEFAULT_AGENT_ROLES)
-    assert not missing, f"这些子 Agent 未登记角色描述，规划器看不到它们：{sorted(missing)}"
+    角色清单与描述都取自注册表（装配点这么传）—— 框架侧不再有第二份名录，
+    所以这里检查的是"注册表 → 规划器"这条链真的接通了。
+    """
+    from harness.agents.registry import AgentRegistry
+    from harness.planning.planner import TaskPlanner
+
+    from packages.data_analysis.agents import build_agents
+
+    registry = AgentRegistry(defs=build_agents())
+
+    planner = TaskPlanner(
+        llm=None,
+        available_agents=registry.names(),
+        agent_descriptions={d.name: d.description for d in registry.list_defs()},
+    )
+
+    assert set(planner.roles) == set(registry.names())
+    for name in registry.names():
+        assert registry.get(name).description in planner._agent_hints()
 
 
 def test_reporter_prompt_covers_analysis_pitfalls() -> None:
-    from harness.agents.registry import build_default_agents
+    from packages.data_analysis.agents import build_agents
 
-    prompt = build_default_agents()["reporter"].system_prompt
+    prompt = build_agents()["reporter"].system_prompt
     for term in ("幸存者偏差", "辛普森悖论", "数据泄露"):
         assert term in prompt, f"质检提示词缺少审查项：{term}"
 
@@ -283,7 +297,7 @@ def _write_case_csv(name: str, missing_every_other: bool = True) -> None:
     """在工作区写一份某列大量缺失的 CSV（data_inspector 默认从这里取文件）。"""
     import csv
 
-    from tools.common import workspace_dir
+    from packages.data_analysis.tools.common import workspace_dir
 
     path = os.path.join(workspace_dir({}), name)
     with open(path, "w", newline="", encoding="utf-8") as fh:

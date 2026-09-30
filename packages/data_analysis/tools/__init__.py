@@ -11,20 +11,20 @@
 
 from __future__ import annotations
 
-from tools.chart_generator import TOOL_DEF as CHART_DEF
-from tools.chart_generator import handle as chart_handler
-from tools.code_executor import TOOL_DEF as CODE_DEF
-from tools.code_executor import handle as code_handler
-from tools.data_cleaner import TOOL_DEF as CLEANER_DEF
-from tools.data_cleaner import handle as cleaner_handler
-from tools.data_inspector import TOOL_DEF as INSPECTOR_DEF
-from tools.data_inspector import handle as inspector_handler
-from tools.eda import TOOL_DEF as EDA_DEF
-from tools.eda import handle as eda_handler
-from tools.skill_reference import TOOL_DEF as SKILL_REF_DEF
-from tools.skill_reference import handle as skill_ref_handler
-from tools.sql_query import TOOL_DEF as SQL_DEF
-from tools.sql_query import handle as sql_handler
+from packages.data_analysis.tools.chart_generator import TOOL_DEF as CHART_DEF
+from packages.data_analysis.tools.chart_generator import handle as chart_handler
+from packages.data_analysis.tools.code_executor import TOOL_DEF as CODE_DEF
+from packages.data_analysis.tools.code_executor import handle as code_handler
+from packages.data_analysis.tools.data_cleaner import TOOL_DEF as CLEANER_DEF
+from packages.data_analysis.tools.data_cleaner import handle as cleaner_handler
+from packages.data_analysis.tools.data_inspector import TOOL_DEF as INSPECTOR_DEF
+from packages.data_analysis.tools.data_inspector import handle as inspector_handler
+from packages.data_analysis.tools.eda import TOOL_DEF as EDA_DEF
+from packages.data_analysis.tools.eda import handle as eda_handler
+from packages.data_analysis.tools.skill_reference import TOOL_DEF as SKILL_REF_DEF
+from packages.data_analysis.tools.skill_reference import handle as skill_ref_handler
+from packages.data_analysis.tools.sql_query import TOOL_DEF as SQL_DEF
+from packages.data_analysis.tools.sql_query import handle as sql_handler
 
 # 全部内置工具注册表（后续工具在此登记）
 BUILTIN_TOOLS = {

@@ -46,6 +46,8 @@ TOOL_DEF = ToolDef(
     required_role="senior_analyst",
     rate_limit_per_min=5,
     requires_approval=True,
+    sandbox_task="python_code",   # 沙箱执行器按此分派（框架不认工具名）
+    pii_skip=True,                # 代码里的号码是字面量，脱敏会把程序改错
     run_in_sandbox=True,
 )
 

@@ -12,6 +12,14 @@ import tempfile
 from harness.models import TaskStatus, TaskStep
 from harness.planning import PlanValidationError, TaskPlanner, TaskStore
 
+# 角色清单与描述现在由**领域**提供（框架不内置名录），用例按数据分析域的角色传。
+ROLES = ["data-explorer", "analyst", "reporter"]
+DESCRIPTIONS = {
+    "data-explorer": "数据探查与清洗",
+    "analyst": "分析建模与可视化",
+    "reporter": "报告生成与质检",
+}
+
 PLAN_PAYLOAD = {
     "tasks": [
         {"title": "数据体检", "description": "读取数据并画像", "assigned_to": "data-explorer",
@@ -48,7 +56,7 @@ class MockPlannerLLM:
 
 
 def test_planner_builds_plan() -> None:
-    planner = TaskPlanner(MockPlannerLLM())
+    planner = TaskPlanner(MockPlannerLLM(), available_agents=ROLES, agent_descriptions=DESCRIPTIONS)
     plan = planner.plan("分析 sales.csv 并出报告")
     tasks = plan.tasks
     assert len(tasks) == 3
@@ -61,7 +69,7 @@ def test_planner_builds_plan() -> None:
 
 
 def test_store_topology_and_transitions() -> None:
-    planner = TaskPlanner(MockPlannerLLM())
+    planner = TaskPlanner(MockPlannerLLM(), available_agents=ROLES, agent_descriptions=DESCRIPTIONS)
     plan = planner.plan("分析 sales.csv")
     store = TaskStore(backend="memory")
     store.create_plan(plan.goal, plan.tasks, plan_id=plan.plan_id)
@@ -87,7 +95,7 @@ def test_store_topology_and_transitions() -> None:
 
 
 def test_file_checkpoint_resume() -> None:
-    planner = TaskPlanner(MockPlannerLLM())
+    planner = TaskPlanner(MockPlannerLLM(), available_agents=ROLES, agent_descriptions=DESCRIPTIONS)
     plan = planner.plan("分析 sales.csv")
     with tempfile.TemporaryDirectory() as d:
         s1 = TaskStore(backend="file", base_dir=d)
@@ -124,7 +132,7 @@ def test_cycle_rejected() -> None:
 
 def test_replan_keeps_completed() -> None:
     llm = MockPlannerLLM()
-    planner = TaskPlanner(llm)
+    planner = TaskPlanner(llm, available_agents=ROLES, agent_descriptions=DESCRIPTIONS)
     store = TaskStore(backend="memory")
 
     plan = planner.plan("分析 sales.csv")

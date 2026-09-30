@@ -12,11 +12,10 @@
 | 层 | Dev | Standard | Scale |
 |---|---|---|---|
 | 部署形态 | 单进程，**零外部容器** | 单机 + PostgreSQL | 多副本 + 完整中间件栈 |
-| Checkpoint | SQLite（默认） | SQLite 或 PG | PG / Redis |
+| Checkpoint | SQLite（默认） | SQLite | SQLite（`CHECKPOINT_BACKEND` 目前只支持 `memory \| sqlite`） |
 | VFS | 本地文件系统（默认） | 本地文件系统 | MinIO |
 | 长期记忆后端 | `local`（进程内，数据落 JSON） | `pgvector` | `pgvector` 或 `milvus` |
 | Embedding | `local`（sentence-transformers） | 同左，或任意 OpenAI 兼容端点 | 同左 |
-| Redis | 不启用 | 可选 | 启用 |
 | Kafka | 不启用（审计落 `audit.jsonl`） | 不启用 | 启用（审计 + trace 上送） |
 | Trace 出口 | `local`（JSONL + 轮转） | `local` | `kafka` |
 | Milvus / MinIO | 不启用 | 不启用 | 启用 |
@@ -30,6 +29,7 @@
 
 ```bash
 pip install -r requirements.txt
+pip install -e .                       # 可编辑安装（领域包经 entry points 发现，见下）
 pip install sentence-transformers      # 本地 Embedding 模型（见下）
 python -m examples.data_analysis_demo  # 端到端跑一条链路
 ```
@@ -90,7 +90,7 @@ docker compose -f infra/docker-compose.yml up -d
 ```
 
 ```bash
-CHECKPOINT_BACKEND=sqlite          # 多副本时改 PG/Redis
+CHECKPOINT_BACKEND=sqlite          # 目前只支持 memory | sqlite
 MEMORY_VECTOR_BACKEND=pgvector     # 或 milvus（需 pip install pymilvus）
 EMBEDDING_PROVIDER=local           # 或指向任意 OpenAI 兼容端点
 MINIO_ENABLED=true                 # VFS 落对象存储
@@ -101,8 +101,10 @@ KAFKA_SPOOL_MAX_FILES=5000         # 投递缓冲上限
 多副本时注意：
 
 - **限流是进程内的**（见 `ToolBroker._rate_lock` 的说明）：多副本时实际放行量
-  是「副本数 × `rate_limit_per_min`」。要全局一致需把窗口状态挪到 Redis。
-- **checkpoint 要换成共享后端**，否则中断恢复只在单副本内有效。
+  是「副本数 × `rate_limit_per_min`」。要全局一致需把窗口状态挪到共享存储。
+- **checkpoint 目前只有单机后端（`memory` / `sqlite`）**：多副本部署下中断恢复只在
+  本副本内有效。要真正支持多副本，需要新增共享 checkpointer（PG / Redis saver）——
+  它与上面那条限流是同一件事（都要一份共享的会话/窗口状态），届时应一起做。
 - `TRACE_SINK=kafka` 时 Span 只有上送、没有本地留档；要两者都有就另存一份，
   或保持 `local` 由外部采集。
 

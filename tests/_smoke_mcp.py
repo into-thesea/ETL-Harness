@@ -26,7 +26,7 @@ import pytest
 
 from harness.mcp_adapter import MCPClientAdapter
 from harness.tool_broker import ToolBroker
-from tools.common import project_root
+from packages.data_analysis.tools.common import project_root
 
 
 def _connect() -> MCPClientAdapter:

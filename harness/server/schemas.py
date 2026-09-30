@@ -60,7 +60,27 @@ class HealthResponse(BaseModel):
     version: str
 
 
+class PackageInfoResponse(BaseModel):
+    """一个领域包的清单与装载状态。
+
+    面向控制台的「插件」页：**它说清框架挂了哪些领域、各自贡献了什么、现在是什么状态**。
+    ``state`` 是生命周期状态（见 ``harness.domain.PackageState``）；``status_note`` 是包
+    自己对"哪部分还没接线"的如实说明。
+    """
+
+    name: str
+    version: str = ""
+    description: str = ""
+    provider: str = ""
+    state: str = Field(..., description="pending/loading/active/failed/unloading/disposed")
+    requires: list[str] = Field(default_factory=list, description="需要的框架服务")
+    contributes: dict[str, Any] = Field(default_factory=dict, description="声明式贡献清单")
+    contributes_summary: str = Field("", description="一行摘要，如「工具 7 · 子 Agent 3」")
+    status_note: str = ""
+    error: str = ""
+
+
 __all__ = [
     "CreateTaskRequest", "CreateTaskResponse", "ApprovalRequest",
-    "PendingApproval", "TaskStatusResponse", "HealthResponse",
+    "PendingApproval", "TaskStatusResponse", "HealthResponse", "PackageInfoResponse",
 ]

@@ -85,7 +85,7 @@ def make_executor_state(
     *,
     session_id: Optional[str] = None,
     agent_id: str = "etl-agent",
-    role: str = "analyst",
+    role: str = "default",
     max_steps: int = 12,
     trace_id: Optional[str] = None,
     **extra: Any,

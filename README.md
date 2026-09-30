@@ -22,10 +22,11 @@
 **上下文与记忆**
 - 虚拟文件系统（VFS）：大结果落盘，prompt 里只留摘要和文件引用，需要时再读全文
 - 上下文管理：超长观察值自动沉淀、历史消息自动压缩，带计数统计
-- 分层记忆：Redis 短期 + Milvus 长期向量 + 进程内工作记忆
+- 记忆分三层，按**时间尺度**切：任务内上下文（图状态 + 自动压缩沉淀）、任务断点（检查点落盘，重启可续）、跨会话经验（向量检索，默认 pgvector）
 
 **工具与技能**
 - Tool Broker 统一入口：注册、参数校验、限流、异常兜底，结果统一为 `(ok, text, artifacts)`
+- 工具结果缓存：只读工具按"参数 + 输入文件身份"命中，文件变了立即失效，没有 TTL 可猜；命中仍走权限、校验、熔断、限流与审计
 - 可插拔中间件：在 before/after LLM、工具、文件等节点挂 hook，横切逻辑不侵入业务
 - Skills 系统：把 SOP、模板、SQL、脚本打包成 `SKILL.md`，按相关度渐进式注入
 
@@ -49,8 +50,8 @@
 接入层        FastAPI：任务提交 / SSE 流式 / 状态查询 / 审批（Bearer 鉴权）
 编排层        LangGraph：顶层 Plan-and-Execute，子任务内 ReAct（think → action → final）
 管控运行时    Tool Broker · 中间件 · PDP / 行列权限 · 审批 · 上下文管理 · Skills · 沙箱
-状态与记忆    VFS · Redis 短期 · Milvus 长期 · 工作记忆 · Checkpoint
-基础设施      Docker Compose：Redis / Milvus / Kafka（+ 可选 MinIO / MySQL / PG）
+状态与记忆    VFS · 图状态与上下文压缩 · 检查点 · 长期向量记忆（pgvector / milvus / local）
+基础设施      Docker Compose：Milvus / Kafka（+ 可选 MinIO / MySQL / PG）
 ```
 
 一次请求的完整调用链与各模块详细设计见架构设计文档（整理中）。
@@ -69,6 +70,10 @@ python -m venv .venv
 
 pip install -r requirements.txt
 
+# 以可编辑方式安装本包（**必须**：领域包通过 entry points 发现，
+# 而 entry points 只认已安装的发行版）
+pip install -e .
+
 # 配置环境变量
 copy .env.example .env            # 编辑 .env 填入 API Key 等
 ```
@@ -84,7 +89,7 @@ cd infra
 docker-compose up -d
 ```
 
-默认端口：Redis 6379、Milvus 19530、Kafka 9092。MinIO（9000 / 控制台 9001）**默认不启用**，VFS 落本地磁盘；需要对象存储时再开，见「配置」。
+默认端口：Milvus 19530、Kafka 9092。MinIO（9000 / 控制台 9001）**默认不启用**，VFS 落本地磁盘；需要对象存储时再开，见「配置」。
 
 > 端口被占用（本机可能跑着其他项目的容器）时，不要停别人的容器，改 `infra/docker-compose.yml` 里的端口映射，或只起当前需要的服务。
 
@@ -151,6 +156,9 @@ curl -X POST http://localhost:8000/api/v1/tasks/$THREAD/approval \
 
 # SSE 流式订阅（EventSource 不能设请求头，这条路由额外接受 ?token=）
 curl -N "http://localhost:8000/api/v1/tasks/$THREAD/stream?token=$TOKEN"
+
+# 已挂载的领域包与装载状态（能挂上哪些领域、各自贡献了什么）
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/packages
 ```
 
 `/docs`、`/openapi.json` 也需要令牌，只有 `/health` 匿名。本机开发可设 `AUTH_ENABLED=false`（会打 WARNING，且只有一个 admin 身份）。
@@ -188,25 +196,28 @@ governed/
 │   ├── context/            # 上下文管理（沉淀 + 压缩）
 │   ├── datasources/        # SQLAlchemy 多数据源
 │   ├── permissions/        # 行列级数据权限
-│   ├── memory/             # working / short_term / long_term
+│   ├── memory/             # 长期向量记忆（后端可切换）
 │   ├── planning/           # 规划、任务存储、质量门
 │   ├── vfs/                # 虚拟文件系统
-│   ├── skills/             # loader + 各 SKILL.md
+│   ├── skills/             # 通用技能加载器（SKILL.md → 渐进式披露）
+│   ├── domain/             # 领域包机制：发现 / 挂载 / 卸载 / 回收
 │   ├── trace/              # tracer + Kafka 生产
 │   ├── sandbox/            # 沙箱客户端与执行器
 │   └── server/             # FastAPI（app/auth/service/schemas/run）
-├── tools/                  # 内置数据分析工具集
+├── packages/               # 领域包（以 entry points 挂载到框架）
+│   └── data_analysis/      #   数据分析：tools / agents / skills / 离线能力
 ├── infra/                  # docker-compose、沙箱镜像、opensandbox-server
-├── examples/               # mock 与真实 LLM 示例
+├── examples/               # 端到端示例
 └── tests/                  # pytest 测试
 ```
 
 ## 扩展
 
-- **加工具**：定义 `ToolDef`，写 `handler(args, context) -> (ok, text, artifacts)`，`broker.register(...)`
-- **加中间件**：继承 `Middleware`，实现需要的 hook，注册到 manager
-- **加 Skill**：按约定写 `SKILL.md` 放到技能目录，loader 自动发现；技能目录下的 `references/` 是**按需附件**，正文指到时才经 `skill_reference` 读取，不占默认上下文
-- **加子 Agent**：定义其工具集与系统提示，在 Orchestrator 注册后用 `delegate(...)` 委派
+- **加一个领域（工具 + 角色 + 技能一起）**：实现 `DomainPackage`（`name` / `version` / `requires` / `contributes` / `apply`），在 `apply` 里用 `PackageContext` 注册三样东西，再到 `pyproject.toml` 的 `governed.domain_packages` 分组声明 entry point。框架启动时自动发现并挂载，**卸载时逐项回收**（工具注册、角色注册、技能条目、两处按名归属的缓存）。框架侧不出现任何领域名词。
+- **加工具**：在包的 `apply` 里 `ctx.register_tools([(ToolDef, handler), ...])` —— `handler(args, context) -> (ok, text, artifacts)`，与调用协议（ReAct / Function Calling / MCP）解耦
+- **加子 Agent**：`ctx.register_agents([...])`，定义其工具白名单、系统提示与步数/超时预算
+- **加 Skill**：按约定写 `SKILL.md` 放进包的技能目录，由包声明该目录；技能目录下的 `references/` 是**按需附件**，正文指到时才经 `skill_reference` 读取，不占默认上下文
+- **加中间件**：继承 `Middleware`，实现需要的 hook，注册到 manager（工具结果缓存在 Broker 链路里而非中间件里 —— 因为它的命中必须落在权限/熔断/限流**之后**）
 
 ## Roadmap
 

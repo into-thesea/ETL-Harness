@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from harness.skills import SkillRegistry
-from tools.skill_reference import handle as skill_reference_handle
+from packages.data_analysis.tools.skill_reference import handle as skill_reference_handle
 
 SKILL_MD = """\
 ---

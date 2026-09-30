@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from packages.data_analysis.agents import build_agents
 from harness.trace import (
     LocalTraceSink,
     NullTraceSink,
@@ -204,7 +205,7 @@ class TestWiringIntoGraph:
         )
         llm = _ToolThenFinalLLM()
         graph = build_plan_execute_graph(
-            llm, broker, registry=AgentRegistry(),
+            llm, broker, registry=AgentRegistry(defs=build_agents()),
             planner=TaskPlanner(llm, available_agents=["reporter"]),
             gate=QualityGate(llm=llm),
         )

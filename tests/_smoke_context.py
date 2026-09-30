@@ -1,6 +1,6 @@
 r"""tests._smoke_context —— ContextManager 冒烟测试。
 
-不依赖 Redis/Milvus/MinIO：VFS 用本地后端，LLM 摘要器用假函数。
+不依赖任何外部服务（Milvus/MinIO）：VFS 用本地后端，LLM 摘要器用假函数。
 运行（项目根）：
     $env:PYTHONIOENCODING="utf-8"
     .\.venv\Scripts\python.exe -m tests._smoke_context

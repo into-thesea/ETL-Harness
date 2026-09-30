@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from packages.data_analysis.agents import build_agents
 from harness.audit import AuditLogger
 from harness.config import settings
 from harness.sandbox.executor import SandboxExecutor, resolve_concurrency_limit
@@ -98,8 +99,9 @@ class TestSandboxConcurrency:
                 running -= 1
             return True, "ok", {}
 
-        executor._tasks["fake"] = fake_task
-        tool_def = SimpleNamespace(name="fake")
+        # 沙箱执行器按工具**声明**的任务名分派（不再是按工具名）
+        executor._tasks["fake_task"] = fake_task
+        tool_def = SimpleNamespace(name="fake", sandbox_task="fake_task")
 
         workers = [
             threading.Thread(target=executor.execute, args=(tool_def, {}, {}, None))
@@ -169,7 +171,7 @@ def _run_plan(plan: dict, thread_id: str):
     broker.register(ToolDef(name="noop", description="d", parameters={}),
                     lambda a, c: (True, "ok", {}))
     graph = build_plan_execute_graph(
-        llm, broker, registry=AgentRegistry(),
+        llm, broker, registry=AgentRegistry(defs=build_agents()),
         planner=TaskPlanner(llm, available_agents=["reporter"]),
         gate=QualityGate(llm=llm),
     )
@@ -267,7 +269,7 @@ class TestSubResultsAccumulate:
         broker.register(ToolDef(name="noop", description="d", parameters={}),
                         lambda a, c: (True, "ok", {}))
         graph = build_plan_execute_graph(
-            llm, broker, registry=AgentRegistry(),
+            llm, broker, registry=AgentRegistry(defs=build_agents()),
             planner=TaskPlanner(llm, available_agents=["reporter"]),
             gate=QualityGate(llm=llm),
         )

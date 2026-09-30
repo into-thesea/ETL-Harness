@@ -24,7 +24,7 @@ import pandas as pd
 from pandas.api import types as pdt
 
 from harness.models import ToolDef
-from tools.common import (
+from packages.data_analysis.tools.common import (
     ToolDataError,
     infer_semantic_type,
     load_table,

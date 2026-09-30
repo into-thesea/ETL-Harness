@@ -1,0 +1,41 @@
+# governed —— 通用 Agent Harness 运行时。
+#
+# 存在的第一个理由不是"打包好看"，而是 **entry points**：领域包只能通过它被声明与发现，
+# 而 entry points 又只能挂在**已安装的发行版**上（`pip install -e .`）。见
+# docs/领域包与插件接口设计.md 切片 1。
+#
+# 三条刻意的约束：
+# 1. **依赖清单只有一份** —— 用 dynamic 引 requirements.txt，不在这里复制第二份
+#    （复制出来的那份迟早和 requirements.txt 走散，正是本项目反复在消的重复名录）。
+# 2. **包只包含框架与领域目录** —— evals / examples / tests 是开发用，不进发行版；
+#    flat-layout 下必须显式声明，否则 setuptools 会因为"发现多个顶层包"直接报错。
+# 3. **pytest 配置不搬过来** —— 仓库根已有 pytest.ini，它优先于 pyproject 里的
+#    [tool.pytest.ini_options]；搬过来会得到一个"看起来在配置、实际不生效"的假象。
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "governed"
+version = "1.0.0"          # 与 harness/server/service.py 的 VERSION 必须一致（有漂移用例守着）
+description = "通用 Agent Harness 运行时：LangGraph 编排底座 + 自研管控层，领域能力以包挂载"
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+# 框架本体不需要这些；按运行形态与领域包的需要装。
+embedding-local = ["sentence-transformers"]
+vector-milvus = ["pymilvus>=2.3.0"]
+parquet = ["pyarrow"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["harness*", "packages*"]
+
+# 领域包的发现入口。**框架不认识任何领域**：它只遍历这个分组，逐个 mount。
+[project.entry-points."governed.domain_packages"]
+data_analysis = "packages.data_analysis:DataAnalysisPackage"

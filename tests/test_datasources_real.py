@@ -26,7 +26,7 @@ from __future__ import annotations
 import pytest
 
 from harness.datasources import DataSourceManager
-from tools.sql_query import handle
+from packages.data_analysis.tools.sql_query import handle
 
 pytestmark = pytest.mark.needs_db
 

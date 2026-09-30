@@ -137,6 +137,24 @@ class SkillRegistry:
     def names(self) -> list[str]:
         return list(self._skills.keys())
 
+    def unload_directory(self, directory: str) -> int:
+        """移除某目录加载进来的技能，返回移除数量（领域包卸载时调用）。
+
+        按 ``SkillDef.source_path`` 是否落在该目录下判定 —— 技能名与目录名无关，
+        只能靠来源路径认领，否则会误删别的包注册的同名技能。
+        """
+        prefix = str(Path(directory).resolve())
+        doomed = [
+            name
+            for name, skill in self._skills.items()
+            if str(skill.source_path or "").startswith(prefix)
+        ]
+        for name in doomed:
+            del self._skills[name]
+        if doomed:
+            logger.info("Unloaded %d skills from %s", len(doomed), directory)
+        return len(doomed)
+
     def load_directory(self, directory: str) -> int:
         """加载目录下的技能文件，返回加载数量。
 

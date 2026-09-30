@@ -199,6 +199,48 @@ class TestVirtualFileSystem:
 
 
 # ======================================================================
+# 单文件大小上限（VFS_MAX_FILE_SIZE_MB）
+# ======================================================================
+class TestFileSizeLimit:
+    """上限此前是空配置（定义了但无人读），这里让它真正生效并守住行为。
+
+    上限设成 1 MB 跑用例，避免真的写几十 MB。写入路径只有 ``write`` 一个入口 ——
+    ``write_text`` / ``append`` / ``sink_large_result`` 都汇到它，所以一处守住即可。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _small_limit(self, monkeypatch):
+        monkeypatch.setattr(settings.vfs, "max_file_size_mb", 1)
+
+    def test_under_limit_writes(self, vfs) -> None:
+        info = vfs.write("/ok.bin", b"x" * (1024 * 1024 - 1))
+        assert info.size == 1024 * 1024 - 1
+
+    def test_over_limit_rejected_and_nothing_written(self, vfs) -> None:
+        with pytest.raises(ValueError) as exc:
+            vfs.write("/big.bin", b"x" * (1024 * 1024 + 1))
+        assert "VFS_MAX_FILE_SIZE_MB" in str(exc.value)
+        assert not vfs.exists("/big.bin")
+
+    def test_write_text_and_append_go_through_the_same_gate(self, vfs) -> None:
+        with pytest.raises(ValueError):
+            vfs.write_text("/big.txt", "x" * (1024 * 1024 + 1))
+
+        vfs.write("/half.bin", b"x" * (600 * 1024))
+        with pytest.raises(ValueError):
+            vfs.append("/half.bin", b"y" * (600 * 1024))
+
+    def test_sink_large_result_is_gated_too(self, vfs) -> None:
+        with pytest.raises(ValueError):
+            vfs.sink_large_result("eda", "x" * (1024 * 1024 + 1), session_id="s")
+
+    def test_zero_means_unlimited(self, vfs, monkeypatch) -> None:
+        """上限为 0 视为不限制（给"确实要大文件"的部署留一个明确出口）。"""
+        monkeypatch.setattr(settings.vfs, "max_file_size_mb", 0)
+        assert vfs.write("/huge.bin", b"x" * (1024 * 1024 + 1)).size == 1024 * 1024 + 1
+
+
+# ======================================================================
 # MinIOStorageBackend（连接不可达分支）
 # ======================================================================
 class TestStorageBackendSelection:

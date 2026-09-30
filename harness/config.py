@@ -21,7 +21,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # 把 .env 注入 os.environ 后再实例化任何 Settings。
 #
 # 为什么需要这一步：pydantic-settings 的 env_file **不会传播到嵌套模型** ——
-# 顶层 Settings 虽然声明了 env_file=".env"，但其嵌套字段（llm / redis / sandbox …）
+# 顶层 Settings 虽然声明了 env_file=".env"，但其嵌套字段（llm / sandbox / vfs …）
 # 各自是独立的 BaseSettings，只从 os.environ 读取。结果是 .env 整体失效，
 # 框架一直静默运行在代码默认值上（例如 llm.api_key 恒为空、llm.model 恒为默认）。
 # 显式 load_dotenv 让所有嵌套模型都能读到，且不覆盖已存在的真实环境变量。
@@ -65,36 +65,14 @@ class EmbeddingSettings(BaseSettings):
     batch_size: int = 32
 
 
-class RedisSettings(BaseSettings):
-    """Redis 配置。
-
-    使用方**只有短期记忆**（``harness.memory.short_term``）；任务状态、缓存、限流
-    都是进程内实现，多副本部署时各算各的。
-    """
-
-    model_config = SettingsConfigDict(env_prefix="REDIS_", extra="ignore")
-
-    # 用 IPv4 字面量，别写 "localhost"：Docker 默认只把端口发布在 IPv4 上，而
-    # "localhost" 在 Windows 上优先解析到 ::1，连接会先在 IPv6 上死等约 20 秒
-    # 才回落到 IPv4。实测 Redis / Milvus / MinIO 三个服务都会中招。
-    host: str = "127.0.0.1"
-    port: int = 6379
-    db: int = 0
-    password: Optional[str] = None
-    key_prefix: str = "governed:"
-    max_connections: int = 20
-    socket_timeout: int = 5
-    socket_connect_timeout: int = 5
-
-
 class MilvusSettings(BaseSettings):
-    """Milvus 配置（长期向量记忆）。"""
+    """Milvus 配置（长期向量记忆，可选后端）。"""
 
     model_config = SettingsConfigDict(env_prefix="MILVUS_", extra="ignore")
 
     # 用 IPv4 字面量，别写 "localhost"：Docker 默认只把端口发布在 IPv4 上，而
     # "localhost" 在 Windows 上优先解析到 ::1，连接会先在 IPv6 上死等约 20 秒
-    # 才回落到 IPv4。实测 Redis / Milvus / MinIO 三个服务都会中招。
+    # 才回落到 IPv4。实测 Milvus / MinIO 都会中招。
     host: str = "127.0.0.1"
     port: int = 19530
     collection_prefix: str = "governed_"
@@ -137,7 +115,7 @@ class MinIOSettings(BaseSettings):
     # 只会让 VFS 数据悄悄落到别人的对象存储里（9000 这类端口在开发机上常被
     # 别的项目占着，比如 Milvus 自带的 MinIO）。
     enabled: bool = False
-    # 同 RedisSettings.host：写 IPv4 字面量。MinIO 每个 VFS 构造都要连一次，
+    # 同 MilvusSettings.host：写 IPv4 字面量。MinIO 每个 VFS 构造都要连一次，
     # 用 "localhost" 会让每个任务白等 20 秒。
     endpoint: str = "127.0.0.1:9000"
     access_key: str = "minioadmin"
@@ -243,7 +221,6 @@ class MemorySettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="MEMORY_", extra="ignore")
 
-    short_term_max_turns: int = 20
     long_term_top_k: int = 5
     # 检索相似度阈值。**这个值取决于 Embedding 模型**，换模型要重新标定：
     # BGE 中文系列在"相关/无关"两档上整体比 OpenAI 系偏低（实测 bge-base-zh-v1.5：
@@ -251,7 +228,6 @@ class MemorySettings(BaseSettings):
     # 阈值取在两档之间，宁松勿紧 —— 多注入一条无关记忆只是噪声，漏掉相关记忆
     # 则等于这层能力不存在。
     long_term_similarity_threshold: float = 0.38
-    working_memory_max_items: int = 100
     local_dir: str = "data/memory"
 
     # ---- 长期向量记忆 ----
@@ -416,11 +392,12 @@ class PIISettings(BaseSettings):
     mask_artifacts: bool = True
     """是否脱敏工具返回的结构化产物（真实行数据在这里，不脱敏等于没脱敏）。"""
 
-    skip_tools: str = "sql_query,code_executor"
-    """入参不脱敏的工具（逗号分隔）。
+    skip_tools: str = ""
+    """入参不脱敏的工具名（逗号分隔）。**默认空**。
 
-    SQL 与代码里的号码是**查询条件/字面量**：脱敏会把查询改坏、把程序改错，
-    结果与原始数据不再一致 —— 这不是可选优化，是正确性要求。
+    "哪些工具的入参不该脱敏"是**工具自己**的事，由 ``ToolDef.pii_skip`` 声明 ——
+    框架配置按名点名领域工具，等于让框架认识领域名词（默认值写错就是全错）。
+    本项只作部署期的兜底覆盖，默认不点名任何工具。
     """
 
 
@@ -444,6 +421,23 @@ class QualitySettings(BaseSettings):
 
     critic_enabled: bool = True
     """是否启用质量门 Critic（每个子任务一次 LLM 裁判）。关闭可省调用。"""
+
+
+class CacheSettings(BaseSettings):
+    """工具结果缓存配置（见 ``harness.cache``）。
+
+    缓存的对象是**工具结果**，不是 LLM 响应 —— 后者的成本目标已由服务端的提示词
+    前缀缓存覆盖。键由「工具名 + 参数 + 输入文件身份」构成，因此**没有 TTL**：
+    文件没变就命中，变了立即失效。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="CACHE_", extra="ignore")
+
+    enabled: bool = True
+    """是否启用工具结果缓存。"""
+
+    max_entries: int = 128
+    """条目上限（有界 LRU，超出淘汰最久未用）。"""
 
 
 class CheckpointSettings(BaseSettings):
@@ -511,7 +505,7 @@ class Settings(BaseSettings):
     """全局配置聚合。
 
     所有子配置作为嵌套属性访问：
-        settings.redis.host
+        settings.milvus.host
         settings.kafka.bootstrap_servers
         settings.llm.api_key
     """
@@ -520,7 +514,6 @@ class Settings(BaseSettings):
 
     llm: LLMSettings = Field(default_factory=LLMSettings)
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
-    redis: RedisSettings = Field(default_factory=RedisSettings)
     milvus: MilvusSettings = Field(default_factory=MilvusSettings)
     kafka: KafkaSettings = Field(default_factory=KafkaSettings)
     minio: MinIOSettings = Field(default_factory=MinIOSettings)
@@ -533,6 +526,7 @@ class Settings(BaseSettings):
     context: ContextSettings = Field(default_factory=ContextSettings)
     checkpoint: CheckpointSettings = Field(default_factory=CheckpointSettings)
     quality: QualitySettings = Field(default_factory=QualitySettings)
+    cache: CacheSettings = Field(default_factory=CacheSettings)
     pii: PIISettings = Field(default_factory=PIISettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
     permission: PermissionSettings = Field(default_factory=PermissionSettings)

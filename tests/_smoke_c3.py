@@ -17,7 +17,7 @@ from harness.llm_client import (
     reset_usage_context,
 )
 from harness.sandbox.executor import SandboxExecutor, _archive_generated_code
-from tools.code_executor import TOOL_DEF
+from packages.data_analysis.tools.code_executor import TOOL_DEF
 
 
 def _resp(p: int, c: int, t: int) -> SimpleNamespace:

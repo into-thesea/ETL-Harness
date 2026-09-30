@@ -1,7 +1,10 @@
 """harness.middleware —— 可插拔中间件（Hook 机制）。
 
 在关键节点（LLM调用/工具调用/文件读写/任务状态变更）注入 Hook，
-支持横切关注点的可插拔扩展：缓存、重试、PII检测、权限校验、日志采集等。
+支持横切关注点的可插拔扩展：重试、PII检测、权限校验、日志采集等。
+
+注：工具结果缓存**不在**这里 —— 它需要插在权限/熔断/限流**之后**、执行**之前**，
+而 before_tool 短路点在它们之前（命中会绕过管控面）。见 ``harness.cache``。
 
 设计约定：
 - 中间件继承 Middleware 基类，实现需要的 Hook 方法。
@@ -337,7 +340,12 @@ class PIIDetectionMiddleware(Middleware):
         if not self.enabled:
             return tool_name, args
         if tool_name in self.skip_tools:
-            # SQL/代码里的号码是查询条件/字面量，脱敏会把语义改坏
+            # 部署期的兜底覆盖（默认空，见 PIISettings.skip_tools）
+            return tool_name, args
+        if getattr(ctx.extra.get("tool_def"), "pii_skip", False):
+            # 工具**自己声明**入参不脱敏：SQL/代码里的号码是查询条件与字面量，
+            # 脱敏会把查询改坏、把程序改错。这比框架配置按名点名领域工具更准，
+            # 也让框架不必认识任何领域工具名。
             return tool_name, args
         for key, value in args.items():
             if isinstance(value, str):
@@ -362,63 +370,6 @@ class PIIDetectionMiddleware(Middleware):
         if self.mask_artifacts and artifacts:
             artifacts = mask_value(artifacts, validate_checksum=self.validate_checksum)
         return ok, text, artifacts
-
-
-class CacheMiddleware(Middleware):
-    """缓存中间件：LLM 响应和工具结果缓存。
-
-    LLM 缓存：相同的 messages 哈希直接返回缓存结果。
-    工具缓存：相同的 (tool_name, args_hash) 直接返回缓存结果。
-    缓存存储在 Redis（如果可用），否则用内存字典。
-    """
-
-    def __init__(self, ttl_seconds: int = 300, config: Optional[MiddlewareConfig] = None):
-        super().__init__(config or MiddlewareConfig(name="cache", priority=95, hook_points=[HookPoint.BEFORE_LLM, HookPoint.AFTER_LLM, HookPoint.BEFORE_TOOL, HookPoint.AFTER_TOOL]))
-        self.ttl_seconds = ttl_seconds
-        self._memory_cache: dict[str, tuple[float, Any]] = {}
-
-    def _get_cache(self, key: str) -> Optional[Any]:
-        import time as _time
-        cached = self._memory_cache.get(key)
-        if cached and _time.time() - cached[0] < self.ttl_seconds:
-            return cached[1]
-        return None
-
-    def _set_cache(self, key: str, value: Any) -> None:
-        import time as _time
-        self._memory_cache[key] = (_time.time(), value)
-
-    def before_llm(self, ctx, messages, **kwargs):
-        import hashlib
-        key = f"llm:{hashlib.sha256(str(messages).encode()).hexdigest()[:16]}"
-        cached = self._get_cache(key)
-        if cached is not None:
-            logger.info("[CACHE] LLM hit | key=%s", key)
-            ctx.short_circuit(cached)
-        ctx.extra["cache_key"] = key
-        return messages
-
-    def after_llm(self, ctx, response, **kwargs):
-        key = ctx.extra.get("cache_key")
-        if key:
-            self._set_cache(key, response)
-        return response
-
-    def before_tool(self, ctx, tool_name, args, **kwargs):
-        import hashlib
-        key = f"tool:{tool_name}:{hashlib.sha256(str(sorted(args.items())).encode()).hexdigest()[:16]}"
-        cached = self._get_cache(key)
-        if cached is not None:
-            logger.info("[CACHE] tool hit | tool=%s", tool_name)
-            ctx.short_circuit(cached)
-        ctx.extra["cache_key"] = key
-        return tool_name, args
-
-    def after_tool(self, ctx, tool_name, result, **kwargs):
-        key = ctx.extra.get("cache_key")
-        if key and result[0]:  # 只缓存成功结果
-            self._set_cache(key, result)
-        return result
 
 
 # ===========================================================================
@@ -572,5 +523,4 @@ __all__ = [
     "LoggingMiddleware",
     "RetryMiddleware",
     "PIIDetectionMiddleware",
-    "CacheMiddleware",
 ]

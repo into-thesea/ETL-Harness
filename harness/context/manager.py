@@ -12,7 +12,7 @@
 
 设计原则：
 - 不依赖外部服务即可工作：VFS 缺省时退化为"硬截断"，LLM 摘要器缺省时退化为
-  确定性规则摘要；Redis/Milvus/MinIO 只改变持久化/检索后端，不影响本模块运行。
+  确定性规则摘要；Milvus/MinIO 只改变持久化/检索后端，不影响本模块运行。
 - 与编排解耦：本模块不 import LangGraph，只处理 OpenAI 风格的消息 dict，
   由 nodes.py 在 think/action 节点调用，是否启用经依赖注入决定。
 - 可单测、可快照：沉淀引用与预算可导出/恢复，供黑板与 Checkpointer 使用。

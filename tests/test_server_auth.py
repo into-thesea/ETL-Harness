@@ -172,6 +172,35 @@ def test_query_token_accepted_on_stream(auth_env) -> None:
 
 
 # ----------------------------------------------------------------------
+# 3b：领域包清单端点
+# ----------------------------------------------------------------------
+def test_packages_endpoint_requires_token(auth_env) -> None:
+    """新增的业务路由**默认在鉴权范围内** —— 鉴权是全局中间件 + 白名单，
+    新端点不该因为"忘了加装饰器"而变成匿名可读。"""
+    with TestClient(create_app(_offline_service())) as client:
+        resp = client.get("/api/v1/packages")
+
+    assert resp.status_code == 401, resp.status_code
+
+
+def test_packages_endpoint_reports_the_domain_package(auth_env) -> None:
+    """清单要如实报出：挂了哪个领域、贡献了什么、现在什么状态。"""
+    with TestClient(create_app(_offline_service())) as client:
+        resp = client.get("/api/v1/packages", headers=ANALYST)
+
+    assert resp.status_code == 200, resp.text
+    packages = {p["name"]: p for p in resp.json()}
+    assert "data_analysis" in packages, packages
+    info = packages["data_analysis"]
+    assert info["state"] == "active"
+    assert info["provider"] == "governed"
+    assert info["requires"] == ["tools", "agents", "skills"]
+    assert len(info["contributes"]["tools"]) == 7
+    assert sorted(info["contributes"]["agents"]) == ["analyst", "data-explorer", "reporter"]
+    assert "工具 7" in info["contributes_summary"]
+
+
+# ----------------------------------------------------------------------
 # 4：审批需要审批人角色，且不能自批
 # ----------------------------------------------------------------------
 def _paused_thread(client: TestClient, headers, service) -> str:

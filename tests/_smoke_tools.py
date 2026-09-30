@@ -17,7 +17,7 @@ import pytest
 import pandas as pd
 
 from harness.tool_broker import ToolBroker
-from tools import register_builtin_tools
+from packages.data_analysis.tools import register_builtin_tools
 
 
 def _make_dirty_csv(dir_path: str) -> str:
@@ -308,7 +308,7 @@ def test_sql_query() -> None:
     print("7. sql_query 只读查询 ok（聚合/自动LIMIT/参数化/写操作DDL多语句拦截）")
 
     # 释放 db_path 懒建的进程级默认 manager 持有的 sqlite 连接
-    import tools.sql_query as _sq
+    import packages.data_analysis.tools.sql_query as _sq
     if _sq._default_manager is not None:
         _sq._default_manager.close()
         _sq._default_manager = None
@@ -356,7 +356,7 @@ def test_code_executor() -> None:
     不做静默跳过 —— 沙箱是本项目的安全边界，其可用性不该被降级掩盖。
     """
     from harness.sandbox.client import SandboxClient
-    from tools.code_executor import handle as code_handler
+    from packages.data_analysis.tools.code_executor import handle as code_handler
 
     ready, reason = SandboxClient().available()
     assert ready, f"沙箱基础设施不可用：{reason}"
@@ -439,7 +439,7 @@ def test_sandbox_fail_closed() -> None:
     """
     from harness.config import SandboxSettings
     from harness.sandbox import SandboxClient, SandboxExecutor
-    from tools.code_executor import TOOL_DEF
+    from packages.data_analysis.tools.code_executor import TOOL_DEF
 
     # 指向一个必然拒绝连接的端口，模拟服务端故障
     dead = SandboxSettings(server_url="http://127.0.0.1:9", api_key="irrelevant")

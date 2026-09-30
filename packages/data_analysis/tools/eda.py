@@ -27,7 +27,7 @@ import pandas as pd
 from pandas.api import types as pdt
 
 from harness.models import ToolDef
-from tools.common import (
+from packages.data_analysis.tools.common import (
     ToolDataError,
     infer_semantic_type,
     load_table,
@@ -71,6 +71,8 @@ TOOL_DEF = ToolDef(
     rate_limit_per_min=15,
     requires_approval=False,
     run_in_sandbox=False,
+    cacheable=True,                      # 只读且确定性：同样的文件同样的参数结果一致
+    input_path_params=["file_path"],     # 文件身份（大小 + mtime）进缓存键
 )
 
 _R = 4  # 统一小数位

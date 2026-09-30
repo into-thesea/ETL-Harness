@@ -16,6 +16,7 @@ import json
 
 import pytest
 
+from packages.data_analysis.agents import build_agents
 from harness.config import settings
 from harness.memory.long_term import EXPERIENCE, LongTermMemory
 from harness.memory.vector_store import LocalVectorStore, PgVectorStore, VectorRecord
@@ -295,7 +296,7 @@ class TestWiringIntoOrchestration:
         llm = _WireLLM()
         return build_plan_execute_graph(
             llm, ToolBroker(),
-            registry=AgentRegistry(),
+            registry=AgentRegistry(defs=build_agents()),
             planner=TaskPlanner(llm, available_agents=["reporter"]),
             gate=QualityGate(llm=llm),
             long_term_memory=ltm,

@@ -1,7 +1,11 @@
-"""tests.test_core_primitives —— 工作记忆 / PDP / Tracer 单元测试。
+"""tests.test_core_primitives —— PDP / Tracer 单元测试。
 
-这三个是 Harness 的确定性基础件：纯内存 / 纯判定 / 纯结构化埋点，
-不依赖任何外部服务，离线即可验证。
+这两个是 Harness 的确定性基础件：纯判定 / 纯结构化埋点，不依赖任何外部服务，
+离线即可验证。
+
+（"工作记忆"作为**记忆模块**已删除 —— 它从未被构造；其真实职责由图状态里的
+``working_memory`` 字段 + 执行节点的资产索引承担，见
+``tests/_verify_stats_wm.py``。）
 """
 
 from __future__ import annotations
@@ -10,80 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from harness.memory.working import WorkingMemory
 from harness.pdp import PDP
 from harness.trace.tracer import Tracer, cleanup_tracer, get_tracer
-
-
-# ======================================================================
-# WorkingMemory
-# ======================================================================
-class TestWorkingMemory:
-    def test_set_get_default(self) -> None:
-        wm = WorkingMemory()
-        wm.set("a", 1)
-        assert wm.get("a") == 1
-        assert wm.get("missing") is None
-        assert wm.get("missing", 42) == 42
-
-    def test_get_item_has_metadata(self) -> None:
-        wm = WorkingMemory()
-        wm.set("a", 1, source="user", metadata={"k": "v"})
-        item = wm.get_item("a")
-        assert item["value"] == 1
-        assert item["source"] == "user"
-        assert item["metadata"] == {"k": "v"}
-        assert "timestamp" in item
-        assert wm.get_item("nope") is None
-
-    def test_has_delete(self) -> None:
-        wm = WorkingMemory()
-        assert wm.has("a") is False
-        wm.set("a", 1)
-        assert wm.has("a") is True
-        assert wm.delete("a") is True
-        assert wm.delete("a") is False
-        assert wm.has("a") is False
-
-    def test_all_keys_values(self) -> None:
-        wm = WorkingMemory()
-        wm.set("a", 1)
-        wm.set("b", 2)
-        assert wm.all() == {"a": 1, "b": 2}
-        assert set(wm.keys()) == {"a", "b"}
-        assert set(wm.values()) == {1, 2}
-        assert wm.all_with_metadata()["a"]["value"] == 1
-
-    def test_clear_update(self) -> None:
-        wm = WorkingMemory()
-        wm.update({"a": 1, "b": 2}, source="batch")
-        assert wm.get("a") == 1
-        wm.clear()
-        assert len(wm) == 0
-
-    def test_context_text(self) -> None:
-        wm = WorkingMemory()
-        assert wm.build_context_text() == ""
-        wm.set("total", 100, source="calc")
-        text = wm.build_context_text()
-        assert "工作记忆" in text and "total: 100" in text and "calc" in text
-
-    def test_snapshot_restore(self) -> None:
-        wm = WorkingMemory()
-        wm.set("a", 1)
-        snap = wm.snapshot()
-        wm2 = WorkingMemory()
-        wm2.restore(snap)
-        assert wm2.get("a") == 1
-        wm2.restore({})  # 缺 data 字段不报错
-
-    def test_dunder_methods(self) -> None:
-        wm = WorkingMemory()
-        wm["a"] = 1
-        assert wm["a"] == 1
-        assert len(wm) == 1
-        assert "a" in wm
-        assert "z" not in wm
 
 
 # ======================================================================

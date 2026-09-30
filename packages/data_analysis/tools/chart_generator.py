@@ -29,7 +29,7 @@ import pandas as pd  # noqa: E402
 from pandas.api import types as pdt  # noqa: E402
 
 from harness.models import ToolDef  # noqa: E402
-from tools.common import (  # noqa: E402
+from packages.data_analysis.tools.common import (  # noqa: E402
     ToolDataError,
     infer_semantic_type,
     load_table,

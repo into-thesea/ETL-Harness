@@ -238,7 +238,7 @@ class MCPClientAdapter:
         broker: Any,
         *,
         prefix: str = "",
-        required_role: str = "analyst",
+        required_role: str = "default",
         rate_limit_per_min: int = 60,
         names: Optional[list[str]] = None,
         requires_approval: bool = False,
@@ -369,7 +369,7 @@ def build_mcp_server(
     broker: Any,
     *,
     name: str = "governed",
-    role: str = "analyst",
+    role: str = "default",
     context: Optional[dict] = None,
     tools: Optional[list[str]] = None,
 ) -> Any:

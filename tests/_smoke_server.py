@@ -29,7 +29,7 @@ import os as _os
 from examples.data_analysis_demo import (
     RAW_FILE as _RAW, ScriptedAnalysisLLM, make_dirty_data,
 )
-from tools.common import workspace_dir as _wsd
+from packages.data_analysis.tools.common import workspace_dir as _wsd
 
 if not _os.path.exists(_os.path.join(_wsd({}), _RAW)):
     make_dirty_data()

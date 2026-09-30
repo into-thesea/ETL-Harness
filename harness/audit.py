@@ -150,7 +150,7 @@ class AuditLogger:
         args: Optional[dict[str, Any]],
         session_id: str = "unknown",
         agent_id: str = "unknown",
-        role: str = "analyst",
+        role: str = "default",
         trace_id: Optional[str] = None,
         pdp_decision: str = "allow",
         result_ok: Optional[bool] = None,
@@ -159,6 +159,7 @@ class AuditLogger:
         sandbox_used: bool = False,
         approval_required: bool = False,
         approval_id: Optional[str] = None,
+        cache_hit: bool = False,
     ) -> Optional[str]:
         """记录一次工具调用审计。
 
@@ -181,6 +182,7 @@ class AuditLogger:
             sandbox_used=sandbox_used,
             approval_required=approval_required,
             approval_id=approval_id,
+            cache_hit=cache_hit,
         )
 
         # Pydantic 模型序列化为可 JSON 化的 dict（datetime 转 ISO 字符串）
@@ -199,7 +201,7 @@ class AuditLogger:
         reason: str,
         session_id: str = "unknown",
         agent_id: str = "unknown",
-        role: str = "analyst",
+        role: str = "default",
         trace_id: Optional[str] = None,
     ) -> Optional[str]:
         """记录一次被 PDP 拒绝的调用尝试（安全敏感事件）。"""

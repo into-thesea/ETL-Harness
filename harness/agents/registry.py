@@ -21,91 +21,38 @@ critic（质量门裁判）与 supervisor（主控）不作为执行子 Agent �
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from harness.models import SubAgentDef
 from harness.tool_broker import ScopedBroker, ToolBroker
 
-
-def build_default_agents() -> dict[str, SubAgentDef]:
-    """内置数据分析 / ETL 专业子 Agent 集合。"""
-    defs = [
-        SubAgentDef(
-            name="data-explorer",
-            description=(
-                "数据探查与清洗：读取数据并输出 schema、行数、缺失率与质量风险画像，"
-                "再处理缺失/重复/类型/异常/文本规范，产出干净数据集与清洗报告"
-            ),
-            system_prompt=(
-                "你是数据探查与清洗员（data-explorer）。先读取数据并客观描述它：字段、类型、"
-                "行数、缺失情况、明显异常与风险，产出结构化数据画像；再依据画像确定清洗策略，"
-                "逐步处理缺失值、重复行、类型错误、异常值与不规范文本。"
-                "不要臆测业务结论，所有判断必须基于工具返回的真实数据。每一步清洗都要可解释，"
-                "最终给出干净数据集以及'改了什么、为什么、行数如何变化'的清洗报告。"
-            ),
-            tools=["data_inspector", "data_cleaner", "skill_reference"],
-            required_role="analyst",
-            max_steps=12,
-            timeout_seconds=180,
-        ),
-        SubAgentDef(
-            name="analyst",
-            description=(
-                "分析建模与可视化：EDA、只读 SQL、复杂计算与临时建模，并按结论选出图型产出图表"
-            ),
-            system_prompt=(
-                "你是分析师（analyst），负责分析建模与可视化。围绕分析目标，用统计与数值分析"
-                "回答'数据里有什么规律/差异/关系'，必要时做只读 SQL 查询；标准工具不够用时，"
-                "在隔离沙箱中编写并运行 pandas/python 完成复杂变换与临时建模；最后依据要表达的"
-                "结论选择最合适的图型产出图表（比较用柱状、趋势用折线、构成用饼图/堆叠、"
-                "关系用散点、分布用直方）。\n"
-                "区分事实与推测，给出关键指标、对比、相关性，并指出样本量与局限。只读查询，"
-                "不修改原始数据；每张图必须有明确标题与坐标轴含义，不为画图而画图。"
-            ),
-            tools=[
-                "data_inspector", "eda", "sql_query",
-                "chart_generator", "code_executor", "skill_reference",
-            ],
-            required_role="senior_analyst",
-            max_steps=14,
-            timeout_seconds=300,
-        ),
-        SubAgentDef(
-            name="reporter",
-            description=(
-                "报告生成与质检：汇总上游结论与图表成稿，并审查方法论缺陷"
-                "（幸存者偏差、辛普森悖论、数据泄露），确保结论可溯源"
-            ),
-            system_prompt=(
-                "你是报告撰写与质检员（reporter）。\n"
-                "**写报告**：基于上游各专业子 Agent 已经产出的结论与图表，组织成结构清晰、"
-                "结论可溯源的分析报告：背景、数据概况、分析发现、图表引用、结论与建议。"
-                "不得编造上游没有的数据。\n"
-                "**做质检**：成稿前审查上游分析的方法论与逻辑缺陷，必要时用工具核实数字：\n"
-                "1) 幸存者偏差：样本是否只覆盖了「幸存」或可见的部分；\n"
-                "2) 辛普森悖论：分组结论与整体结论是否方向相反（按关键维度复核）；\n"
-                "3) 数据泄露（目标泄漏）：是否用到了分析时点不可得的信息，"
-                "例如结果字段参与了特征或口径。\n"
-                "质疑必须给出证据与具体位置，不得凭感觉否定；没有发现问题就明确说没有，"
-                "不要为了交差编造问题。"
-            ),
-            tools=["data_inspector", "eda", "sql_query", "skill_reference"],
-            required_role="analyst",
-            max_steps=8,
-            timeout_seconds=180,
-        ),
-    ]
-    return {d.name: d for d in defs}
+logger = logging.getLogger(__name__)
 
 
 class AgentRegistry:
     """子 Agent 定义注册表，并负责为子 Agent 派生受限 Broker 视图。"""
 
-    def __init__(self, defs: Optional[dict[str, SubAgentDef]] = None) -> None:
-        self._defs: dict[str, SubAgentDef] = defs or build_default_agents()
+    def __init__(
+        self,
+        defs: Optional[dict[str, SubAgentDef]] = None,
+        default_name: Optional[str] = None,
+    ) -> None:
+        # 必须判 `is None`：`defs or build_default_agents()` 会把**显式的空字典**当成
+        # "没传"，于是空注册表又长出默认角色。领域包机制要求 `{}` 真的表示"一个角色都
+        # 没有"（框架最终不内置任何领域角色）。
+        # 框架**不内置任何领域角色**：不传就是空注册表（角色由领域包挂载进来）。
+        self._defs: dict[str, SubAgentDef] = dict(defs or {})
+        # 未知负责人时的首选回退；缺省按回退顺序降级（见 get）。
+        # 由装配点或领域包声明，框架不猜。
+        self.default_name = default_name
 
     def register(self, agent_def: SubAgentDef) -> None:
         self._defs[agent_def.name] = agent_def
+
+    def unregister(self, name: str) -> bool:
+        """移除一个子 Agent 定义，返回是否移除成功（领域包卸载时调用）。"""
+        return self._defs.pop(name, None) is not None
 
     def names(self) -> list[str]:
         return list(self._defs.keys())
@@ -116,13 +63,34 @@ class AgentRegistry:
     def list_defs(self) -> list[SubAgentDef]:
         return list(self._defs.values())
 
-    def get(self, name: Optional[str], fallback: str = "analyst") -> SubAgentDef:
-        """取子 Agent 定义；未知名称回退到通用角色（兜底，不抛断编排）。"""
+    def get(self, name: Optional[str], fallback: Optional[str] = None) -> SubAgentDef:
+        """取子 Agent 定义；未知名称按回退顺序兜底（不抛断编排）。
+
+        回退顺序：``fallback``（调用方指定）→ ``default_name``（装配点/领域包声明）→
+        **注册顺序第一个**。全程**不出现任何领域角色名** —— 原先这里写死回退到
+        ``"analyst"``，等于框架内置了一个领域角色。
+
+        回退时记 warning：静默回退会把"计划里的负责人名是模型编的"这件事藏起来。
+        """
         if name and name in self._defs:
             return self._defs[name]
-        if fallback in self._defs:
-            return self._defs[fallback]
-        raise KeyError(f"子 Agent {name!r} 不存在且兜底 {fallback!r} 也未注册")
+
+        for candidate, why in ((fallback, "调用方指定"), (self.default_name, "注册表声明")):
+            if candidate and candidate in self._defs:
+                logger.warning("子 Agent %r 未注册，回退到 %r（%s）", name, candidate, why)
+                return self._defs[candidate]
+
+        if self._defs:
+            first = next(iter(self._defs))
+            logger.warning(
+                "子 Agent %r 未注册且无声明默认，回退到注册顺序第一个（%r）", name, first
+            )
+            return self._defs[first]
+
+        raise KeyError(
+            f"子 Agent {name!r} 不存在，且注册表里没有任何子 Agent —— "
+            f"框架不内置领域角色，请确认已挂载领域包"
+        )
 
     def scoped_broker(self, broker: ToolBroker, name: Optional[str]) -> ScopedBroker:
         """按子 Agent 的工具白名单与角色派生受限 Broker 视图。"""
@@ -131,4 +99,4 @@ class AgentRegistry:
         return broker.scoped(allowed, force_role=agent_def.required_role)
 
 
-__all__ = ["AgentRegistry", "build_default_agents"]
+__all__ = ["AgentRegistry"]

@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 from harness.datasources import DataSourceManager
 from harness.models import ToolDef
-from tools.common import resolve_input_path, to_native, truncate
+from packages.data_analysis.tools.common import resolve_input_path, to_native, truncate
 
 TOOL_DEF = ToolDef(
     name="sql_query",
@@ -53,6 +53,7 @@ TOOL_DEF = ToolDef(
     rate_limit_per_min=30,
     requires_approval=False,
     run_in_sandbox=False,
+    pii_skip=True,   # SQL 里的号码是查询条件，脱敏会把查询改坏
 )
 
 HARD_LIMIT = 10000

@@ -19,6 +19,11 @@ from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
+
+# 目录布局属于框架：这些函数的实现**必须**来自 harness.paths，别在包内另算一套。
+# 用别名导入以免与下面的同名包装函数混淆。
+from harness.paths import project_root as _framework_project_root
+from harness.paths import vfs_dir as _framework_vfs_dir
 from pandas.api import types as pdt
 
 
@@ -29,27 +34,23 @@ class ToolDataError(Exception):
 # ----------------------------------------------------------------------
 # 路径与工作目录
 # ----------------------------------------------------------------------
+# **目录布局由框架定义**（`data/vfs/<workspace|reports>`，见 harness.paths 与
+# VFSSettings.local_root）：这里只做"按 context 覆盖，否则用框架默认"。
+# 不能在本文件里靠 __file__ 推算项目根 —— 工具搬到领域包之后，那样的推算会得到
+# `packages/data_analysis`，与框架（以及工具结果缓存）认定的路径不是同一个地方。
 def project_root() -> str:
-    # tools/common.py 的上两级即项目根
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    """项目根（沿用框架的定义）。"""
+    return _framework_project_root()
 
 
 def workspace_dir(context: Optional[dict]) -> str:
     context = context or {}
-    path = context.get("workspace_dir") or os.path.join(
-        project_root(), "data", "vfs", "workspace"
-    )
-    os.makedirs(path, exist_ok=True)
-    return path
+    return context.get("workspace_dir") or _framework_vfs_dir("workspace")
 
 
 def reports_dir(context: Optional[dict]) -> str:
     context = context or {}
-    path = context.get("reports_dir") or os.path.join(
-        project_root(), "data", "vfs", "reports"
-    )
-    os.makedirs(path, exist_ok=True)
-    return path
+    return context.get("reports_dir") or _framework_vfs_dir("reports")
 
 
 def resolve_input_path(file_path: str, context: Optional[dict] = None) -> str:

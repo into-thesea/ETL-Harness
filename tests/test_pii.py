@@ -128,13 +128,33 @@ def test_after_tool_keeps_text_masked() -> None:
 
 
 def test_sql_and_code_args_are_not_masked() -> None:
-    """SQL/代码里的号码是**查询条件**，脱敏会把查询改坏、结果变样。"""
+    """SQL/代码里的号码是**查询条件**，脱敏会把查询改坏、结果变样。
+
+    不脱敏现在是**工具自己声明**的（``ToolDef.pii_skip``），不再由框架配置按名点名
+    工具 —— 所以这里必须把带声明的 ToolDef 放进上下文（Broker 在调 before_tool 前会放）。
+    """
+    from harness.models import ToolDef
+
+    mw = _middleware()
+    sql_def = ToolDef(name="sql_query", description="d", parameters={}, pii_skip=True)
+    code_def = ToolDef(name="code_executor", description="d", parameters={}, pii_skip=True)
+
+    _, args = mw.before_tool(
+        _ctx(tool_def=sql_def), "sql_query", {"sql": f"select * from t where phone='{PHONE}'"}
+    )
+    assert PHONE in args["sql"], f"声明了 pii_skip 的工具入参不得被脱敏：{args}"
+
+    _, args = mw.before_tool(
+        _ctx(tool_def=code_def), "code_executor", {"code": f"print('{PHONE}')"}
+    )
+    assert PHONE in args["code"]
+
+
+def test_pii_skip_comes_from_the_tool_not_from_config() -> None:
+    """没有声明就不跳过 —— 哪怕工具名叫 sql_query（配置默认已不点名任何工具）。"""
     mw = _middleware()
     _, args = mw.before_tool(_ctx(), "sql_query", {"sql": f"select * from t where phone='{PHONE}'"})
-    assert PHONE in args["sql"], f"SQL 入参不得被脱敏：{args}"
-
-    _, args = mw.before_tool(_ctx(), "code_executor", {"code": f"print('{PHONE}')"})
-    assert PHONE in args["code"]
+    assert PHONE not in args["sql"], "未声明 pii_skip 的工具，入参照常脱敏"
 
 
 def test_other_tool_args_are_masked() -> None:
@@ -161,10 +181,14 @@ def test_disabled_middleware_passes_through() -> None:
     assert mw.before_llm(_ctx(), messages)[0]["content"] == PHONE
 
 
-def _ctx():
+def _ctx(tool_def=None):
     from harness.middleware import MiddlewareContext
 
-    return MiddlewareContext(operation="test")
+    ctx = MiddlewareContext(operation="test")
+    # Broker 在调 before_tool 之前会把解析出的 ToolDef 放进 extra（工具据自己的声明
+    # 决定 PII 行为）；手工调中间件的用例要照做。
+    ctx.extra["tool_def"] = tool_def
+    return ctx
 
 
 # ----------------------------------------------------------------------

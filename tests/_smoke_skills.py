@@ -17,7 +17,8 @@ from harness.skills import SkillRegistry
 from harness.tool_broker import ToolBroker
 from harness.graph import build_executor_graph, make_executor_state
 
-SKILLS_DIR = os.path.join(os.path.dirname(harness.__file__), "skills")
+# 技能库随领域包走：框架只留通用加载器（harness/skills/loader.py）
+from packages.data_analysis.package import SKILLS_DIR
 
 # 注入用例的目标：一个典型的数据探查子任务描述
 SKILL_INJECTION_GOAL = "子任务：数据体检，检查缺失值"

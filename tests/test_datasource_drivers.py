@@ -122,7 +122,7 @@ def test_unknown_source_raises_keyerror() -> None:
 
 def test_sql_query_fails_cleanly_when_database_is_down() -> None:
     """库连不上时工具要返回**可读失败**，不能把异常抛进 agent 循环。"""
-    from tools.sql_query import handle
+    from packages.data_analysis.tools.sql_query import handle
 
     mgr = DataSourceManager()
     try:

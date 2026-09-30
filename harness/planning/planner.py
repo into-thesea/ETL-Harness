@@ -22,35 +22,19 @@ from harness.tool_broker import ToolBroker
 logger = logging.getLogger(__name__)
 
 
-# 数据分析 / ETL 的专业子 Agent 角色提示（与 agents 注册表保持一致）。
-# critic 是质量门裁判、supervisor 是主控，均不参与执行，故不在此列。
-DEFAULT_AGENT_ROLES: dict[str, str] = {
-    "data-explorer": (
-        "数据探查与清洗：读取数据输出 schema/行数/缺失率/质量风险画像，"
-        "再处理缺失/重复/类型/异常/文本规范，产出干净数据集与清洗报告"
-    ),
-    "analyst": (
-        "分析建模与可视化：EDA、只读 SQL、复杂计算与临时建模，"
-        "并按结论选出图型产出图表"
-    ),
-    "reporter": (
-        "报告生成与质检：汇总上游结论与图表成稿，"
-        "并审查方法论缺陷（幸存者偏差/辛普森悖论/数据泄露）"
-    ),
-}
-
-# 规划器给出未知负责人时的回退角色：取工具覆盖面最广的一个
-DEFAULT_AGENT = "analyst"
-
-
 class TaskPlanner:
     """把目标拆成 TaskPlan；执行受阻时重规划。
+
+    **角色清单与描述由调用方给**（来自子 Agent 注册表，即来自领域包）—— 框架不内置
+    任何领域角色，因此这里没有默认名录。原先的 ``DEFAULT_AGENT_ROLES`` 是「与
+    agents 注册表保持一致」的**第二份手工名录**，已删除。
 
     Args:
         llm: 具备 ``chat_json(messages) -> dict`` 的对象（LLMClient 或 Mock）。
         broker: 可选 ToolBroker，用于把当前可用工具清单告诉规划器。
-        available_agents: 可分派的子 Agent 名列表，默认用内置数据分析角色。
-        default_agent: LLM 给出未知负责人时的回退角色。
+        available_agents: 可分派的子 Agent 名列表（装配点从注册表取）。
+        agent_descriptions: 名字 → 一句话职责，用于渲染规划提示词。
+        default_agent: LLM 给出未知负责人时的回退角色；缺省取 ``available_agents`` 第一个。
         middleware: 可选 MiddlewareManager；规划提示词里含用户原始目标，
             出站前必须过 ``before_llm``（PII 脱敏覆盖规划器，不只有推理节点）。
     """
@@ -60,14 +44,23 @@ class TaskPlanner:
         llm: Any,
         broker: Optional[ToolBroker] = None,
         available_agents: Optional[list[str]] = None,
-        default_agent: str = DEFAULT_AGENT,
+        agent_descriptions: Optional[dict[str, str]] = None,
+        default_agent: Optional[str] = None,
         middleware: Optional[Any] = None,
     ) -> None:
         self.llm = llm
         self.broker = broker
-        self.roles = available_agents or list(DEFAULT_AGENT_ROLES.keys())
-        self.default_agent = default_agent
+        self.roles = list(available_agents or [])
+        self.descriptions = dict(agent_descriptions or {})
+        self.default_agent = default_agent or (self.roles[0] if self.roles else "")
         self.middleware = middleware
+        if not self.roles:
+            # 不是错误：框架可以不带任何领域包启动（那时也确实无人可分派）。
+            # 但必须响亮 —— 否则表现为"规划器产出正常、执行时无处派发"。
+            logger.warning(
+                "规划器没有可用的子 Agent（available_agents 为空）："
+                "请确认已挂载领域包，或装配点是否传了注册表"
+            )
 
     def _outbound(self, messages: list[dict], operation: str) -> list[dict]:
         """LLM 出站前过一遍 before_llm 钩子（无中间件时原样返回）。"""
@@ -85,9 +78,9 @@ class TaskPlanner:
     def _agent_hints(self) -> str:
         lines = []
         for name in self.roles:
-            desc = DEFAULT_AGENT_ROLES.get(name, name)
+            desc = self.descriptions.get(name, name)
             lines.append(f"- {name}: {desc}")
-        return "\n".join(lines)
+        return "\n".join(lines) if lines else "（当前没有任何可派发的子 Agent）"
 
     def _tool_hints(self) -> str:
         if self.broker is not None:
@@ -257,4 +250,4 @@ class TaskPlanner:
         return plan
 
 
-__all__ = ["TaskPlanner", "DEFAULT_AGENT_ROLES"]
+__all__ = ["TaskPlanner"]
