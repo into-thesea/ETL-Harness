@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import datetime
 from typing import Any, Optional
 
@@ -129,21 +130,47 @@ class ReActNodes:
     # 工具执行前审批闸门（Human-in-the-Loop）
     # ------------------------------------------------------------------
     def _request_tool_approval(
-        self, tool_name: str, args: dict, state: AgentState
-    ) -> tuple[bool, str]:
-        """高风险工具执行前请求人工审批（LangGraph interrupt）。
+        self,
+        tool_name: str,
+        args: dict,
+        state: AgentState,
+        invoke_context: Optional[dict] = None,
+    ) -> tuple[bool, str, Optional[dict]]:
+        """高风险工具执行前的闸门：先授权预检，再人工审批（LangGraph interrupt）。
 
         ``ToolDef.requires_approval=True`` 时，在真正执行前 interrupt 暂停，
         把工具 / 参数 / 风险暴露给审批人；审批人经服务层 ``Command(resume=...)``
-        下发决策。返回 (是否批准, 审批意见)。
+        下发决策。
 
-        无需审批的工具直接返回 (True, "")，零中断。审批闸门在节点层而非
-        Broker 内部：interrupt 只能在 LangGraph 节点中调用，Broker 是与编排
-        解耦的普通 Python。
+        返回 ``(是否放行, 可直接回灌模型的 observation, 审批凭证)``：
+
+        - 无需审批：``(True, "", None)``，零中断；
+        - 授权预检拒绝（PDP / 子 Agent 工具边界）：``(False, <权限提示>, None)``，
+          **不弹审批** —— 先判"准不准做"（authorize），再问"要不要做"（人工
+          审批），避免对无权工具也打扰审批人、批准后仍被 Broker 拒（挂账 #12）；
+        - 人工驳回：``(False, <驳回提示>, None)``；
+        - 人工批准：``(True, "", <审批凭证>)``。凭证须随 invoke 上下文交给
+          Broker，Broker 第 3.5 步校验匹配后才放行（挂账 #11：执行点 fail
+          closed，MCP 等非交互通道拿不到凭证即无法绕过审批）。
+
+        审批闸门在节点层而非 Broker 内部：interrupt 只能在 LangGraph 节点中
+        调用，Broker 是与编排解耦的普通 Python；Broker 另以凭证闸门兜底。
         """
         tool_def = self.broker.get(tool_name)
         if tool_def is None or not tool_def.requires_approval:
-            return True, ""
+            return True, "", None
+
+        call_ctx = invoke_context or self._invoke_context(state)
+
+        # 先授权（PDP / 子 Agent 白名单），再请求人工审批。
+        allowed, authz_reason = self.broker.authorize(tool_name, call_ctx)
+        if not allowed:
+            observation = (
+                f"工具调用未获授权，未进入人工审批：{authz_reason}。"
+                "请改用你有权限的工具，不要再次请求该操作。"
+            )
+            logger.info("Tool %s blocked before approval: %s", tool_name, authz_reason)
+            return False, observation, None
 
         payload = {
             "type": "tool_approval",
@@ -159,7 +186,24 @@ class ReActNodes:
         approved, comment = self._parse_approval(raw_decision)
         logger.info("Tool %s approval: approved=%s comment=%s",
                     tool_name, approved, comment)
-        return approved, comment
+        if not approved:
+            observation = (
+                f"工具调用被人工审批拒绝：{comment or '未说明原因'}。"
+                "请调整方案，不要再次请求同样的操作。"
+            )
+            return False, observation, None
+
+        approval = {
+            "id": f"apr_{uuid.uuid4().hex[:12]}",
+            "approved": True,
+            "tool": tool_name,
+            "comment": comment,
+            "approved_at": datetime.now().isoformat(),
+            "session_id": state.get("session_id"),
+            "agent_id": state.get("agent_id"),
+            "trace_id": state.get("trace_id"),
+        }
+        return True, "", approval
 
     @staticmethod
     def _parse_approval(raw: Any) -> tuple[bool, str]:
@@ -720,22 +764,26 @@ class ReActNodes:
             name = call.get("name") or ""
             args = call.get("arguments") or {}
 
-            # 审批闸门：requires_approval 工具 interrupt 等待人工决策
-            approved, comment = self._request_tool_approval(name, args, state)
+            # 审批闸门：requires_approval 工具先授权、再 interrupt 等待人工决策
+            approved, observation, approval = self._request_tool_approval(
+                name, args, state, invoke_context
+            )
             if not approved:
-                observation = (
-                    f"工具调用被人工审批拒绝：{comment or '未说明原因'}。"
-                    "请调整方案，不要再次请求同样的操作。"
-                )
                 observations.append(f"[{name}] {observation}")
                 tool_messages.append(
                     self.llm.tool_result_message(call.get("id", ""), observation)
                 )
                 continue
 
-            # Broker 内部跑中间件、PDP、校验、限流、沙箱、审计
+            # 审批凭证注入独立副本：同批可能有多个工具，不能让 A 的凭证污染 B
+            # （Broker 还会校验凭证里的工具名与本次调用一致）。
+            call_ctx = dict(invoke_context)
+            if approval:
+                call_ctx["approval"] = approval
+
+            # Broker 内部跑中间件、PDP、审批凭证校验、参数校验、限流、沙箱、审计
             with _span(state, "tool_call", name):
-                ok, text, artifacts = self.broker.invoke(name, args, invoke_context)
+                ok, text, artifacts = self.broker.invoke(name, args, call_ctx)
             observation = text if ok else f"工具调用失败：{text}"
             observation = self._settle_observation(name, observation, state)
             observations.append(f"[{name}] {observation}")
@@ -775,16 +823,14 @@ class ReActNodes:
             "step": state.get("current_step"),
         }
 
-        # 审批闸门：requires_approval 工具 interrupt 等待人工决策
-        approved, comment = self._request_tool_approval(tool_name, tool_args, state)
+        # 审批闸门：requires_approval 工具先授权、再 interrupt 等待人工决策
+        approved, observation, approval = self._request_tool_approval(
+            tool_name, tool_args, state, invoke_context
+        )
 
         # 把 observation 回填到本轮 ThoughtStep
         steps = list(state.get("steps", []))
         if not approved:
-            observation = (
-                f"工具调用被人工审批拒绝：{comment or '未说明原因'}。"
-                "请调整方案，不要再次请求同样的操作。"
-            )
             if steps:
                 steps[-1] = steps[-1].model_copy(update={"observation": observation})
             new_messages = [{"role": "user", "content": f"Observation:\n{observation}"}]
@@ -795,9 +841,14 @@ class ReActNodes:
                 "updated_at": self._now(),
             }
 
-        # Broker 内部会跑工具中间件、PDP、校验、限流、沙箱、审计
+        # 审批凭证注入独立副本后交给 Broker（Broker 第 3.5 步强制校验）
+        call_ctx = dict(invoke_context)
+        if approval:
+            call_ctx["approval"] = approval
+
+        # Broker 内部会跑工具中间件、PDP、审批凭证、参数校验、限流、沙箱、审计
         with _span(state, "tool_call", tool_name):
-            ok, text, artifacts = self.broker.invoke(tool_name, tool_args, invoke_context)
+            ok, text, artifacts = self.broker.invoke(tool_name, tool_args, call_ctx)
         observation = text if ok else f"工具调用失败：{text}"
         observation = self._settle_observation(tool_name, observation, state)
 

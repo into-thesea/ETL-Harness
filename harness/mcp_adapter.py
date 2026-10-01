@@ -334,6 +334,32 @@ def _synth_signature(parameters: dict, name: str) -> inspect.Signature:
     return inspect.Signature(params, return_annotation=str)
 
 
+def _select_tools_for_exposure(
+    broker: Any,
+    tools: Optional[list[str]],
+    expose_approval_required: bool,
+) -> tuple[list[ToolDef], list[str]]:
+    """按暴露策略筛选要挂到 MCP Server 的工具。
+
+    ``requires_approval`` 的工具默认**不暴露**：MCP 是无交互的跨进程通道，
+    没有地方发起 / 完成 LangGraph 节点层的人工审批；执行层（Broker 第 3.5
+    步）对缺少审批凭证的调用也会 fail closed，两道防线一致。
+
+    Returns:
+        (允许暴露的 ToolDef 列表, 因需人工审批而被跳过的工具名列表)。
+    """
+    exposed: list[ToolDef] = []
+    skipped_approval: list[str] = []
+    for tool_def in broker.list_tools():
+        if tools is not None and tool_def.name not in tools:
+            continue
+        if tool_def.requires_approval and not expose_approval_required:
+            skipped_approval.append(tool_def.name)
+            continue
+        exposed.append(tool_def)
+    return exposed, skipped_approval
+
+
 def _make_mcp_tool_fn(
     broker: Any,
     tool_def: ToolDef,
@@ -348,6 +374,9 @@ def _make_mcp_tool_fn(
         # 外部客户端（Claude Desktop / Cursor）没有本框架的会话身份，用可辨识值占位
         call_context.setdefault("agent_id", "mcp-client")
         call_context.setdefault("session_id", "mcp")
+        # 刻意不设置 call_context["approval"]：MCP 客户端无法完成节点层人工
+        # 审批，Broker 第 3.5 步对 requires_approval 工具会据此 fail closed，
+        # 因此外部接入无法绕过人工审批（挂账 #11）。
         ok, text, _artifacts = broker.invoke(tool_def.name, kwargs, call_context)
         if not ok:
             # 失败必须走异常通道。MCP 把**正常返回**一律视为 isError=False 的成功结果，
@@ -372,11 +401,18 @@ def build_mcp_server(
     role: str = "default",
     context: Optional[dict] = None,
     tools: Optional[list[str]] = None,
+    expose_approval_required: bool = False,
 ) -> Any:
     """把 ToolBroker 的工具装配成一个 MCP Server（方向 B）。
 
-    工具**全部经 broker.invoke 执行**，因此 PDP 鉴权、参数校验、限流、沙箱、审计
-    这些管控对 MCP 客户端同样生效 —— 外部接入并不绕过管控层。
+    工具经 ``broker.invoke`` 执行，因此 PDP 鉴权、参数校验、限流、熔断、沙箱、
+    审计对 MCP 客户端同样生效。**人工审批也不会被绕过**，这里有两道防线：
+
+    1. 暴露层：``requires_approval`` 的工具**默认不暴露** —— MCP 是非交互的
+       跨进程通道，没有地方发起 / 完成 LangGraph 的节点层 interrupt 审批；
+    2. 执行层：即使显式 ``expose_approval_required=True`` 把它暴露出去，
+       ``_make_mcp_tool_fn`` 不会携带审批凭证，Broker 第 3.5 步仍会 fail
+       closed 拒绝执行。
 
     Args:
         broker: ToolBroker 实例。
@@ -384,6 +420,8 @@ def build_mcp_server(
         role: 以何角色过 PDP（外部客户端无框架内身份，故显式指定）。
         context: 传给 broker.invoke 的额外上下文。
         tools: 只暴露指定工具；None 表示全部。
+        expose_approval_required: 是否连需人工审批的工具也暴露，默认 False。
+            置 True 仅用于显式验证 fail-closed，这些工具实际仍会被拒绝。
 
     Returns:
         配置好的 ``MCPServer``。由调用方选择传输方式启动::
@@ -394,11 +432,13 @@ def build_mcp_server(
     """
     from mcp.server.mcpserver import MCPServer
 
+    exposed_defs, skipped_approval = _select_tools_for_exposure(
+        broker, tools, expose_approval_required
+    )
+
     server = MCPServer(name=name)
     exposed: list[str] = []
-    for tool_def in broker.list_tools():
-        if tools is not None and tool_def.name not in tools:
-            continue
+    for tool_def in exposed_defs:
         server.add_tool(
             _make_mcp_tool_fn(broker, tool_def, role, context),
             name=tool_def.name,
@@ -407,6 +447,12 @@ def build_mcp_server(
         exposed.append(tool_def.name)
 
     logger.info("MCP Server %s：暴露 %d 个工具 %s", name, len(exposed), exposed)
+    if skipped_approval:
+        logger.warning(
+            "MCP Server %s：以下需人工审批的工具默认不向 MCP 暴露（非交互通道"
+            "无法完成节点层审批；执行层亦会对缺失凭证 fail-closed）：%s",
+            name, skipped_approval,
+        )
     return server
 
 

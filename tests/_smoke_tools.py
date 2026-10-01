@@ -365,13 +365,18 @@ def test_code_executor() -> None:
     broker = ToolBroker()
     register_builtin_tools(broker)
     ctx = {"workspace_dir": tmp, "reports_dir": tmp, "role": "admin"}
+    # 节点外直接走 Broker：code_executor 需人工审批，显式带上与工具匹配的审批
+    # 凭证（模拟节点 interrupt 审批通过后注入），否则 Broker 第 3.5 步 fail closed。
+    approved_ctx = dict(ctx, approval={
+        "id": "apr_smoke_code_executor", "approved": True, "tool": "code_executor",
+    })
 
     # 经 broker 端到端（pandas 计算 + 中文输出）
     ok, text, art = broker.invoke("code_executor", {"code": """
 import pandas as pd
 df = pd.DataFrame({'a': [1, 2, 3, 4], 'g': ['x', 'x', 'y', 'y']})
 print('分组结果：', df.groupby('g')['a'].sum().to_dict())
-"""}, ctx)
+"""}, approved_ctx)
     assert ok, text
     assert "分组结果" in art["execution"]["stdout"]
     assert art["execution"]["returncode"] == 0

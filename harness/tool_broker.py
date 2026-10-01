@@ -6,6 +6,7 @@ Broker 的完整调用链路：
     1. 中间件 before_tool Hook（PII检测/日志）
     2. 工具存在性检查
     3. PDP 权限检查（如果配置了 PDP）
+    3.5 人工审批凭证（requires_approval 工具须带节点层审批产生的匹配凭证，否则 fail closed）
     4. 参数校验（JSON Schema 基础校验）
     5. 熔断准入（按工具名独立的三态熔断，下游持续故障时快速失败）
     6. 限流准入（滑动时间窗口，判定与记账在同一次加锁内完成）
@@ -271,6 +272,32 @@ class ToolBroker:
         return ScopedBroker(self, allowed_tools, force_role=force_role)
 
     # ------------------------------------------------------------------
+    # 授权预检（人工审批之前先判"准不准做"）
+    # ------------------------------------------------------------------
+    def authorize(self, tool_name: str, context: Optional[dict] = None) -> tuple[bool, str]:
+        """授权预检：调用方是否允许调用此工具（存在性 + PDP），不做审批/限流/执行。
+
+        节点层在发起 LangGraph interrupt 人工审批**之前**先调用本方法：先判
+        "准不准做"（PDP），再问"要不要做"（人工审批），避免对一个根本无权
+        调用的工具也弹出审批卡片（挂账 #12：审批曾发生在权限判定之前）。
+
+        Returns:
+            (是否允许, 理由)。允许时理由为空串；拒绝时理由说明原因。
+        """
+        context = context or {}
+        role = context.get("role", "default")
+        entry = self._tools.get(tool_name)
+        if not entry:
+            return False, (
+                f"工具 '{tool_name}' 不存在。可用工具：{', '.join(self._tools.keys())}"
+            )
+        if self.pdp is not None:
+            allowed, reason = self.pdp.check(role, tool_name, context)
+            if not allowed:
+                return False, f"角色 '{role}' 不允许调用工具 '{tool_name}'：{reason}"
+        return True, ""
+
+    # ------------------------------------------------------------------
     # 统一调用入口（核心方法）
     # ------------------------------------------------------------------
     def invoke(
@@ -343,6 +370,39 @@ class ToolBroker:
                     result_ok=False, error=reason,
                 )
                 return False, f"权限不足：角色 '{role}' 不允许调用工具 '{tool_name}'。原因：{reason}", {}
+
+        # ---- 3.5 人工审批凭证（HITL）----
+        # requires_approval 的工具必须携带由**节点层 interrupt 人工审批**产生、
+        # 且与本工具名匹配的批准凭证（context["approval"]）。审批 interrupt 只能
+        # 在 LangGraph 节点里触发，Broker 是与编排解耦的普通 Python；MCP Server
+        # 等非交互入口（mcp_adapter）直接调本方法、拿不到凭证 —— 这里 fail
+        # closed，保证任何通道都无法绕过人工审批（挂账 #11）。
+        approval_cred: Optional[dict] = (
+            context.get("approval") if isinstance(context, dict) else None
+        )
+        if tool_def.requires_approval:
+            cred_valid = (
+                isinstance(approval_cred, dict)
+                and approval_cred.get("approved") is True
+                and approval_cred.get("tool") == tool_name
+            )
+            if not cred_valid:
+                gate_reason = (
+                    "该工具需人工审批，但当前调用通道未提供与本工具匹配的审批通过凭证"
+                    "（fail closed；MCP/脚本等非交互入口不得绕过人工审批）"
+                )
+                logger.warning(
+                    "Tool %s blocked by approval gate (role=%s agent=%s credential_present=%s)",
+                    tool_name, role, agent_id, approval_cred is not None,
+                )
+                self._audit(
+                    trace_id=trace_id, session_id=session_id, agent_id=agent_id, role=role,
+                    tool_name=tool_name, args=args, pdp_decision="allow",
+                    result_ok=False, error=f"审批闸门拦截：{gate_reason}",
+                    approval_required=True,
+                    approval_id=approval_cred.get("id") if isinstance(approval_cred, dict) else None,
+                )
+                return False, f"工具 '{tool_name}' 被人工审批闸门拦截：{gate_reason}", {}
 
         # ---- 4. 参数校验 ----
         args_ok, args_error = self._validate_args(tool_def, args)
@@ -459,6 +519,7 @@ class ToolBroker:
             error=None if ok else text,
             sandbox_used=sandbox_used,
             approval_required=tool_def.requires_approval,
+            approval_id=(approval_cred or {}).get("id") if tool_def.requires_approval else None,
             cache_hit=cached is not None,
         )
 
@@ -633,6 +694,20 @@ class ScopedBroker:
 
     def search(self, query: str) -> list[ToolDef]:
         return [t for t in self._inner.search(query) if self._is_allowed(t.name)]
+
+    def authorize(self, tool_name: str, context: Optional[dict] = None) -> tuple[bool, str]:
+        """授权预检的受限视图：先拦越界工具，再透传底层 Broker 的 PDP 判定。
+
+        与 ``invoke`` 的授权口径保持一致（force_role 同样在此生效），供节点层
+        在人工审批之前做"先授权、后审批"的预检。
+        """
+        if not self._is_allowed(tool_name):
+            allowed = "*" if self._all else ", ".join(sorted(self._allowed)) or "(无)"
+            return False, f"工具 '{tool_name}' 对当前子 Agent 不可用（可用：{allowed}）"
+        ctx = dict(context or {})
+        if self.force_role:
+            ctx["role"] = self.force_role
+        return self._inner.authorize(tool_name, ctx)
 
     def invoke(
         self,
