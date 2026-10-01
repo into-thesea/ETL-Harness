@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import datetime
 from typing import Any, Optional
 
 from harness.agents.registry import AgentRegistry
@@ -20,7 +21,12 @@ from harness.audit import get_audit_logger
 from harness.trace import cleanup_tracer, get_tracer
 from harness.context import ContextManager
 from harness.domain import FrameworkHandles, PackageManager, PackageState
-from harness.events import build_event_bus
+from harness.events import (
+    GUARD_LAYER_APPROVAL,
+    build_event_bus,
+    emit_approval_resolved,
+    emit_guard_decision,
+)
 from harness.orchestrator import SubgraphCache, build_plan_execute_graph, make_plan_execute_state
 from harness.planning import DataQualityChecker, QualityGate, TaskPlanner, TaskStore
 from harness.skills import SkillRegistry
@@ -245,18 +251,19 @@ class HarnessService:
     def _lock(self, thread_id: str) -> asyncio.Lock:
         return self._locks.setdefault(thread_id, asyncio.Lock())
 
-    def _spawn(self, thread_id: str, coro, trace_id: str = "") -> asyncio.Task:
-        """在后台驱动图，并记录任务（异常仅记录，不静默成功）。"""
+    def _spawn(self, thread_id: str, coro) -> asyncio.Task:
+        """在后台驱动图，并记录任务（异常仅记录，不静默成功）。
+
+        Tracer / 事件绑定的清理**不放在 done 回调里**：图遇到人工审批 interrupt 时
+        本次 ``ainvoke`` 就结束了，但任务只是**暂停**、随后还要 resume —— 若在这里
+        无条件 ``unbind``，会把中断前的事件历史一并清掉，晚到的控制台 / 审批卡片就
+        看不到 ``APPROVAL_REQUIRED``，resume 阶段的事件也会丢。改由驱动协程按图的
+        真实状态决定收尾（见 :meth:`_settle_after_run`）。
+        """
         task = asyncio.create_task(coro)
         self._bg_tasks[thread_id] = task
 
         def _done(t: asyncio.Task) -> None:
-            # 任务结束就释放该链路的 Tracer。不释放的话它持有的 Span 会在进程内
-            # 永久驻留 —— 这是接埋点时最容易漏的一步。
-            if trace_id:
-                cleanup_tracer(trace_id)
-                # 事件绑定同理：留着就是又一张只增不减的映射表
-                build_event_bus().unbind(thread_id)
             if t.cancelled():
                 return
             exc = t.exception()
@@ -269,6 +276,33 @@ class HarnessService:
 
         task.add_done_callback(_done)
         return task
+
+    async def _settle_after_run(self, thread_id: str, trace_id: str) -> None:
+        """一次图驱动结束后的收尾：仍在等审批就保留绑定 / Tracer，否则释放。
+
+        判据与 ``get_status`` 一致 —— 快照里任一 task 带 interrupts，即图暂停在
+        人工审批上（可能跨越整个审批等待期），此时事件历史与绑定必须原样保留，
+        供晚到的订阅者 replay 以及 resume 后继续路由。
+        """
+        try:
+            snap = await self.graph.aget_state(self._config(thread_id))
+            awaiting = any(t.interrupts for t in (snap.tasks or []))
+        except Exception:  # noqa: BLE001 - 状态都查不到时按终态兜底，避免映射只增不减
+            awaiting = False
+        if awaiting:
+            return
+        if trace_id:
+            # 任务结束才释放该链路的 Tracer（不释放它持有的 Span 会在进程内常驻）
+            cleanup_tracer(trace_id)
+            # 事件绑定同理：终态后断开订阅、丢掉历史、删掉映射
+            build_event_bus().unbind(thread_id)
+
+    async def _drive_until_settled(self, thread_id: str, coro, trace_id: str):
+        """跑一次图驱动（首次 / resume），并在结束后按状态收尾。"""
+        try:
+            return await coro
+        finally:
+            await self._settle_after_run(thread_id, trace_id)
 
     # ------------------------------------------------------------------
     # 任务生命周期
@@ -291,7 +325,7 @@ class HarnessService:
             with get_tracer(trace_id).span("request", operation="run_task"):
                 return await self.graph.ainvoke(initial, self._config(thread_id))
 
-        self._spawn(thread_id, _drive(), trace_id)
+        self._spawn(thread_id, self._drive_until_settled(thread_id, _drive(), trace_id))
         logger.info("Task created: %s (trace=%s)", thread_id, trace_id)
         return thread_id
 
@@ -360,8 +394,31 @@ class HarnessService:
         snap = await self.graph.aget_state(self._config(thread_id))
         return str((snap.values or {}).get("origin_principal") or "")
 
+    async def _trace_id(self, thread_id: str) -> str:
+        """从图状态取该任务的 trace_id（事件按 trace_id 路由）。"""
+        snap = await self.graph.aget_state(self._config(thread_id))
+        return str((snap.values or {}).get("trace_id") or "")
+
+    @staticmethod
+    def _is_approval_expired(expires_at: Any) -> bool:
+        """审批是否已过 ``expires_at``；无过期时间或解析失败按"未过期"处理（不误伤）。"""
+        if not expires_at:
+            return False
+        try:
+            exp = datetime.fromisoformat(str(expires_at))
+            now = datetime.now(exp.tzinfo) if exp.tzinfo else datetime.now()
+            return now > exp
+        except (ValueError, TypeError):
+            return False
+
     async def submit_approval(
-        self, thread_id: str, approved: bool, comment: str = "", approver_principal: str = ""
+        self,
+        thread_id: str,
+        approved: bool,
+        comment: str = "",
+        approver_principal: str = "",
+        approver_name: str = "",
+        approver_role: str = "",
     ) -> dict:
         """提交审批决策并恢复图，返回提交后的状态快照。
 
@@ -371,9 +428,11 @@ class HarnessService:
         Args:
             approver_principal: 提交审批者的身份指纹（令牌 hash）。与任务**发起者身份**
                 相同则拒绝（职责分离：发起人不能自己批准自己触发的高危操作）。
+            approver_name/approver_role: 审批人展示名与角色，写入 APPROVAL_RESOLVED 事件。
 
         Raises:
             PermissionError: 发起人试图审批自己发起的任务。
+            RuntimeError: 无待审批项，或审批已过期却试图"批准"。
         """
         from langgraph.types import Command
 
@@ -382,7 +441,8 @@ class HarnessService:
             current = await self.get_status(thread_id)
             if current is None:
                 raise KeyError(f"任务 {thread_id} 不存在")
-            if not current["pending_approvals"]:
+            pending = current["pending_approvals"]
+            if not pending:
                 raise RuntimeError(
                     f"任务当前无待审批项（状态 {current['status']}），无法提交审批"
                 )
@@ -393,17 +453,59 @@ class HarnessService:
                         "发起者不能审批自己发起的任务（职责分离）"
                     )
 
+            item = pending[0]
+            interrupt_id = item.get("interrupt_id")
+            payload = item.get("payload") or {}
+            # 两类人工卡点（设计 §3.6）：高危工具审批 vs 质量门 HUMAN 结论审查
+            kind = "gate" if payload.get("type") == "gate_review" else "tool"
+            tool = payload.get("tool")
+            request_id = payload.get("approval_request_id")
+            task_id = payload.get("task_id")
+            expires_at = payload.get("expires_at")
+            trace_id = await self._trace_id(thread_id)
+
+            # 图在 interrupt 时首个后台任务即结束并在 _done 里 unbind；resume 是新的
+            # 一次 ainvoke，必须先重新绑定事件路由，否则下面的 RESOLVED 及恢复阶段的
+            # 工具/管控事件全都发不到控制台（bind 幂等）。
+            if trace_id:
+                build_event_bus().bind(thread_id, trace_id)
+
+            # 过期强制：超时后不能再"批准"一个早已过时的现场，但始终允许"驳回"，
+            # 让 Agent 重新提请。
+            if approved and self._is_approval_expired(expires_at):
+                reason = "审批已过期，不能再批准；请驳回后由 Agent 重新提请"
+                emit_approval_resolved(
+                    trace_id, approved=False, expired=True, kind=kind,
+                    request_id=request_id, interrupt_id=interrupt_id, tool=tool,
+                    task_id=task_id, approver=approver_name or None,
+                    approver_role=approver_role or None, comment=reason,
+                    expires_at=expires_at,
+                )
+                emit_guard_decision(
+                    trace_id, layer=GUARD_LAYER_APPROVAL, reason=reason, tool=tool,
+                    task_id=task_id, expired=True,
+                )
+                raise RuntimeError(reason)
+
+            emit_approval_resolved(
+                trace_id, approved=approved, kind=kind, request_id=request_id,
+                interrupt_id=interrupt_id, tool=tool, task_id=task_id,
+                approver=approver_name or None, approver_role=approver_role or None,
+                comment=comment, expires_at=expires_at,
+            )
+
             resume = {"approved": approved, "comment": comment}
-            # 后台驱动恢复（恢复后可能再次 interrupt 或跑完）
+            # 后台驱动恢复（恢复后可能再次 interrupt 或跑完）；收尾协程会在再次暂停
+            # 时保留绑定、到达终态时释放 tracer / 事件路由。
+            resume_coro = self.graph.ainvoke(Command(resume=resume), self._config(thread_id))
             self._spawn(
                 thread_id,
-                self.graph.ainvoke(Command(resume=resume), self._config(thread_id)),
+                self._drive_until_settled(thread_id, resume_coro, trace_id),
             )
 
         # 稍让后台任务推进，再回快照（调用方也可随后轮询）
         await asyncio.sleep(0)
-        result = await self.get_status(thread_id)
-        return result
+        return await self.get_status(thread_id)
 
 
 __all__ = ["HarnessService", "VERSION"]

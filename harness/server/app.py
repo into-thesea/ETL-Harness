@@ -94,6 +94,8 @@ def _build_router(service: HarnessService, auth: Any) -> APIRouter:
                 req.approved,
                 req.comment,
                 approver_principal=principal.token_hash if principal.authenticated else "",
+                approver_name=principal.name,
+                approver_role=principal.role,
             )
         except KeyError:
             raise HTTPException(status_code=404, detail=f"任务 {thread_id} 不存在")

@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from harness.config import settings
+from harness.events import GUARD_LAYER_SANDBOX, emit_guard_decision
 
 from harness.sandbox.client import (
     SANDBOX_IN,
@@ -159,12 +160,16 @@ class SandboxExecutor:
                 if task_name
                 else "未声明 ToolDef.sandbox_task"
             )
-            return (
-                False,
+            reason = (
                 f"工具 {name!r} 标记了 run_in_sandbox 但无法确定沙箱实现（{hint}），"
-                f"已拒绝执行（fail closed）。",
-                {},
+                f"已拒绝执行（fail closed）。"
             )
+            emit_guard_decision(
+                (context or {}).get("trace_id"), layer=GUARD_LAYER_SANDBOX,
+                reason=reason, tool=name, task_id=(context or {}).get("task_id"),
+                agent_id=(context or {}).get("agent_id"),
+            )
+            return False, reason, {}
 
         acquired = False
         if self._slots is not None:
@@ -181,7 +186,13 @@ class SandboxExecutor:
                 return task(tool_def, args, context or {}, sandbox_config or {})
             except SandboxUnavailable as exc:
                 # 基础设施不可用 —— fail closed，绝不退化为宿主进程执行
-                return False, f"沙箱不可用，已拒绝执行：{exc}", {}
+                reason = f"沙箱不可用，已拒绝执行：{exc}"
+                emit_guard_decision(
+                    (context or {}).get("trace_id"), layer=GUARD_LAYER_SANDBOX,
+                    reason=reason, tool=name, task_id=(context or {}).get("task_id"),
+                    agent_id=(context or {}).get("agent_id"),
+                )
+                return False, reason, {}
             except Exception as exc:  # noqa: BLE001 - 沙箱层兜底，避免拖垮 broker
                 logger.error("沙箱任务 %s 异常：%s", name, exc, exc_info=True)
                 return False, f"沙箱执行异常：{type(exc).__name__}: {exc}", {}

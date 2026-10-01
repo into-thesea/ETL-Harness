@@ -37,6 +37,14 @@ from typing import Any, Callable, Optional
 
 from harness.audit import AuditLogger
 from harness.circuit_breaker import CircuitBreaker, build_circuit_breaker
+from harness.events import (
+    GUARD_LAYER_APPROVAL,
+    GUARD_LAYER_BREAKER,
+    GUARD_LAYER_PDP,
+    GUARD_LAYER_RATE_LIMIT,
+    GUARD_LAYER_SANDBOX,
+    emit_guard_decision,
+)
 from harness.middleware import MiddlewareContext, MiddlewareManager
 from harness.models import ToolDef
 
@@ -369,6 +377,10 @@ class ToolBroker:
                     tool_name=tool_name, args=args, pdp_decision="deny",
                     result_ok=False, error=reason,
                 )
+                emit_guard_decision(
+                    trace_id, layer=GUARD_LAYER_PDP, reason=reason, tool=tool_name,
+                    task_id=context.get("task_id"), agent_id=agent_id, role=role,
+                )
                 return False, f"权限不足：角色 '{role}' 不允许调用工具 '{tool_name}'。原因：{reason}", {}
 
         # ---- 3.5 人工审批凭证（HITL）----
@@ -402,6 +414,12 @@ class ToolBroker:
                     approval_required=True,
                     approval_id=approval_cred.get("id") if isinstance(approval_cred, dict) else None,
                 )
+                emit_guard_decision(
+                    trace_id, layer=GUARD_LAYER_APPROVAL, reason=gate_reason, tool=tool_name,
+                    task_id=context.get("task_id"), agent_id=agent_id, role=role,
+                    approval_id=approval_cred.get("id")
+                    if isinstance(approval_cred, dict) else None,
+                )
                 return False, f"工具 '{tool_name}' 被人工审批闸门拦截：{gate_reason}", {}
 
         # ---- 4. 参数校验 ----
@@ -425,6 +443,10 @@ class ToolBroker:
                     tool_name=tool_name, args=args, pdp_decision="allow",
                     result_ok=False, error=f"熔断：{breaker_error}",
                 )
+                emit_guard_decision(
+                    trace_id, layer=GUARD_LAYER_BREAKER, reason=breaker_error, tool=tool_name,
+                    task_id=context.get("task_id"), agent_id=agent_id,
+                )
                 return False, f"熔断：{breaker_error}", {}
 
         # ---- 6. 限流准入（判定 + 记账原子完成）----
@@ -434,6 +456,10 @@ class ToolBroker:
                 trace_id=trace_id, session_id=session_id, agent_id=agent_id, role=role,
                 tool_name=tool_name, args=args, pdp_decision="allow",
                 result_ok=False, error=f"限流：{rate_error}",
+            )
+            emit_guard_decision(
+                trace_id, layer=GUARD_LAYER_RATE_LIMIT, reason=rate_error, tool=tool_name,
+                task_id=context.get("task_id"), agent_id=agent_id,
             )
             return False, f"限流：{rate_error}", {}
 
@@ -459,12 +485,15 @@ class ToolBroker:
                 if tool_def.run_in_sandbox:
                     # 高风险工具必须走沙箱；沙箱缺失时 fail closed，绝不裸跑
                     if self.sandbox is None:
-                        ok, text, artifacts = (
-                            False,
+                        sandbox_reason = (
                             f"沙箱已禁用（sandbox.enabled=False），拒绝执行高风险工具 "
-                            f"{tool_name!r}（fail closed）。",
-                            {},
+                            f"{tool_name!r}（fail closed）。"
                         )
+                        emit_guard_decision(
+                            trace_id, layer=GUARD_LAYER_SANDBOX, reason=sandbox_reason,
+                            tool=tool_name, task_id=context.get("task_id"), agent_id=agent_id,
+                        )
+                        ok, text, artifacts = False, sandbox_reason, {}
                     else:
                         ok, text, artifacts = self.sandbox.execute(
                             tool_def, args, context, tool_def.sandbox_config
@@ -719,6 +748,12 @@ class ScopedBroker:
         if not self._is_allowed(tool_name):
             allowed = "*" if self._all else ", ".join(sorted(self._allowed)) or "(无)"
             logger.warning("ScopedBroker denied out-of-scope tool: %s (allowed: %s)", tool_name, allowed)
+            scope_reason = f"子 Agent 工具白名单越界（可用：{allowed}）"
+            emit_guard_decision(
+                (context or {}).get("trace_id"), layer=GUARD_LAYER_PDP,
+                reason=scope_reason, tool=tool_name, task_id=(context or {}).get("task_id"),
+                agent_id=(context or {}).get("agent_id"), scope="sub_agent",
+            )
             return False, f"工具 '{tool_name}' 对当前子 Agent 不可用（可用：{allowed}）", {}
         ctx = dict(context or {})
         if self.force_role:

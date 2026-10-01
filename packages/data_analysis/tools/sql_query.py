@@ -22,6 +22,11 @@ import time
 from typing import Any, Optional
 
 from harness.datasources import DataSourceManager
+from harness.events import (
+    DECISION_ALLOW,
+    GUARD_LAYER_ROW_COLUMN,
+    emit_guard_decision,
+)
 from harness.models import ToolDef
 from packages.data_analysis.tools.common import resolve_input_path, to_native, truncate
 
@@ -203,7 +208,22 @@ def handle(args: dict, context: dict):
             dialect=dialect,
         )
         if deny:
+            emit_guard_decision(
+                (context or {}).get("trace_id"), layer=GUARD_LAYER_ROW_COLUMN,
+                reason=deny, tool=TOOL_DEF.name, task_id=(context or {}).get("task_id"),
+                agent_id=(context or {}).get("agent_id"), role=(context or {}).get("role"),
+                data_source=source_name,
+            )
             return False, f"SQL 查询被拒绝：{deny}", {}
+        if rewritten.strip() != clean_sql.strip():
+            # 放行但被收窄（注入行过滤 / 列白名单）：让控制台看到"权限确实生效了"，
+            # 而不只是在拒绝时才出现这一层。
+            emit_guard_decision(
+                (context or {}).get("trace_id"), layer=GUARD_LAYER_ROW_COLUMN,
+                decision=DECISION_ALLOW, reason="行列权限改写后放行", tool=TOOL_DEF.name,
+                task_id=(context or {}).get("task_id"), agent_id=(context or {}).get("agent_id"),
+                role=(context or {}).get("role"), data_source=source_name, rewritten=True,
+            )
         clean_sql = rewritten
 
     # 强制 LIMIT（未显式指定时追加；三种方言均支持 LIMIT）

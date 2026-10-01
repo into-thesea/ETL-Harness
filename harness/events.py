@@ -284,6 +284,134 @@ def reset_event_bus(bus: Optional[EventBus] = None) -> None:
         _bus = bus
 
 
+# ---------------------------------------------------------------------------
+# 语义化事件快捷入口：管控判定（GUARD_DECISION）与人工审批生命周期
+# （APPROVAL_REQUIRED / APPROVAL_RESOLVED）。
+#
+# 埋点遍布 Broker / 沙箱 / 编排器 / 服务层，若每处各自拼 data 字段，控制台协议
+# 迟早对不齐。这里统一字段形状并集中兜底：观测异常一律吞掉（与 Tracer._notify
+# 同一条纪律），未绑定 trace 时 publish 本身零成本返回，因此调用方无需先判绑定。
+# ---------------------------------------------------------------------------
+
+#: GUARD_DECISION.layer 取值（与《控制台与事件协议设计》§3 对齐）
+GUARD_LAYER_PDP = "pdp"
+GUARD_LAYER_ROW_COLUMN = "row_column"
+GUARD_LAYER_BREAKER = "breaker"
+GUARD_LAYER_RATE_LIMIT = "rate_limit"
+GUARD_LAYER_APPROVAL = "approval"
+GUARD_LAYER_SANDBOX = "sandbox"
+
+#: GUARD_DECISION.decision 取值
+DECISION_ALLOW = "allow"
+DECISION_DENY = "deny"
+DECISION_DEFER = "defer"
+
+
+def _prune(data: dict[str, Any]) -> dict[str, Any]:
+    """去掉值为 None 的键：事件里留一堆 null 只会让协议显得"好像有这项"。"""
+    return {k: v for k, v in data.items() if v is not None}
+
+
+def _emit(trace_id: Optional[str], event_type: str, data: dict[str, Any]) -> None:
+    """发事件的统一兜底：无 trace / 未绑定 / 发布异常都不得影响主流程。"""
+    if not trace_id:
+        return
+    try:
+        build_event_bus().publish(str(trace_id), event_type, _prune(data))
+    except Exception:  # noqa: BLE001 - 观测旁路，失败只调试记录
+        logger.debug("事件发布失败（忽略）：%s", event_type, exc_info=True)
+
+
+def emit_guard_decision(
+    trace_id: Optional[str],
+    *,
+    layer: str,
+    decision: str = DECISION_DENY,
+    reason: str = "",
+    tool: Optional[str] = None,
+    task_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    **extra: Any,
+) -> None:
+    """上报一道管控关卡的判定（默认只在 deny / defer 时调用，避免常态噪声）。"""
+    _emit(trace_id, "GUARD_DECISION", {
+        "layer": layer,
+        "decision": decision,
+        "reason": reason or "",
+        "tool": tool,
+        "task_id": task_id,
+        "agent_id": agent_id,
+        **extra,
+    })
+
+
+def emit_approval_required(
+    trace_id: Optional[str],
+    *,
+    tool: Optional[str] = None,
+    request_id: Optional[str] = None,
+    description: Optional[str] = None,
+    expires_at: Optional[str] = None,
+    task_id: Optional[str] = None,
+    task_title: Optional[str] = None,
+    sub_agent: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    kind: str = "tool",
+) -> None:
+    """图因人工审批而暂停（interrupt 冒泡到顶层、归因补全后调用）。
+
+    此刻 LangGraph 的系统 interrupt id 尚未生成（resume 时才在快照里出现），
+    故用节点生成的 ``request_id`` 关联后续 RESOLVED，而不伪造 interrupt_id。
+
+    ``kind`` 区分两类审批（设计 §3.6）：``"tool"`` 是高危工具执行前审批
+    （有 ``tool``），``"gate"`` 是质量门 HUMAN 对任务结论的审查（无 ``tool``）。
+    """
+    _emit(trace_id, "APPROVAL_REQUIRED", {
+        "kind": kind,
+        "request_id": request_id,
+        "tool": tool,
+        "description": description,
+        "task_id": task_id,
+        "task_title": task_title,
+        "sub_agent": sub_agent,
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "expires_at": expires_at,
+    })
+
+
+def emit_approval_resolved(
+    trace_id: Optional[str],
+    *,
+    approved: bool,
+    request_id: Optional[str] = None,
+    interrupt_id: Optional[str] = None,
+    tool: Optional[str] = None,
+    task_id: Optional[str] = None,
+    approver: Optional[str] = None,
+    approver_role: Optional[str] = None,
+    comment: str = "",
+    expires_at: Optional[str] = None,
+    expired: bool = False,
+    kind: str = "tool",
+) -> None:
+    """审批人下发决策（服务层 resume 前调用）；``interrupt_id`` 为系统中断 id。"""
+    _emit(trace_id, "APPROVAL_RESOLVED", {
+        "kind": kind,
+        "request_id": request_id,
+        "interrupt_id": interrupt_id,
+        "tool": tool,
+        "task_id": task_id,
+        "approver": approver,
+        "approver_role": approver_role,
+        "approved": bool(approved),
+        "comment": comment or "",
+        "expires_at": expires_at,
+        "expired": bool(expired),
+    })
+
+
 __all__ = [
     "DEFAULT_BUFFER",
     "DEFAULT_HISTORY",
@@ -291,4 +419,18 @@ __all__ = [
     "EventSubscription",
     "build_event_bus",
     "reset_event_bus",
+    # 管控层 / 判定常量
+    "GUARD_LAYER_PDP",
+    "GUARD_LAYER_ROW_COLUMN",
+    "GUARD_LAYER_BREAKER",
+    "GUARD_LAYER_RATE_LIMIT",
+    "GUARD_LAYER_APPROVAL",
+    "GUARD_LAYER_SANDBOX",
+    "DECISION_ALLOW",
+    "DECISION_DENY",
+    "DECISION_DEFER",
+    # 语义化事件入口
+    "emit_guard_decision",
+    "emit_approval_required",
+    "emit_approval_resolved",
 ]

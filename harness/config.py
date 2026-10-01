@@ -138,6 +138,14 @@ class ServerSettings(BaseSettings):
     api_prefix: str = "/api/v1"
     request_timeout_seconds: int = 300
     stream_heartbeat_seconds: int = 15
+    approval_timeout_seconds: int = 3600
+    """人工审批等待超时（秒）。
+
+    节点发起审批时在卡片与 ``APPROVAL_REQUIRED`` 事件上写
+    ``expires_at = now + 本值``；超时后审批人**不能再"批准"**（服务层按 409
+    拒绝，避免对早已过时的现场放行），但始终可以**驳回**让 Agent 重新提请。
+    设为 0 或负数表示不过期。
+    """
 
 
 class SandboxSettings(BaseSettings):

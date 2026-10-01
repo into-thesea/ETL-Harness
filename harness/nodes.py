@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from langchain_core.messages import BaseMessage
@@ -38,6 +38,22 @@ logger = logging.getLogger(__name__)
 
 # LangChain 消息 type → OpenAI 角色名
 _ROLE_MAP = {"human": "user", "ai": "assistant", "system": "system", "tool": "tool"}
+
+
+def _approval_expires_at() -> Optional[str]:
+    """审批卡片的过期时刻（ISO 字符串）；``SERVER_APPROVAL_TIMEOUT_SECONDS<=0`` 不过期。
+
+    配置不可得时按"不过期"处理 —— 配置/观测问题不该把人工审批这条路堵死。
+    """
+    try:
+        from harness.config import settings
+
+        timeout_s = int(settings.server.approval_timeout_seconds)
+    except Exception:  # noqa: BLE001 - 同上：配置异常不应阻断审批
+        return None
+    if timeout_s <= 0:
+        return None
+    return (datetime.now() + timedelta(seconds=timeout_s)).isoformat()
 
 
 def _normalize_tool_calls(tool_calls: Any) -> list[dict]:
@@ -172,12 +188,19 @@ class ReActNodes:
             logger.info("Tool %s blocked before approval: %s", tool_name, authz_reason)
             return False, observation, None
 
+        # 审批请求的关联 id 与过期时刻：request_id 用来把 APPROVAL_REQUIRED 与
+        # 后续 APPROVAL_RESOLVED 配对（此刻还没有 LangGraph 的系统 interrupt id）；
+        # expires_at 由服务层在 resume 时强制（超时只能驳回、不能批准）。
+        request_id = f"aprreq_{uuid.uuid4().hex[:12]}"
+        expires_at = _approval_expires_at()
         payload = {
             "type": "tool_approval",
             "tool": tool_name,
             "description": tool_def.description,
             "arguments": args,
             "run_in_sandbox": tool_def.run_in_sandbox,
+            "approval_request_id": request_id,
+            "expires_at": expires_at,
             "session_id": state.get("session_id"),
             "agent_id": state.get("agent_id"),
             "trace_id": state.get("trace_id"),

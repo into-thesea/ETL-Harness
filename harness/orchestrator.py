@@ -35,9 +35,10 @@ from typing import TypedDict
 
 from harness.agents.registry import AgentRegistry
 from harness.config import settings
+from harness.events import emit_approval_required
 from harness.graph import build_executor_graph, make_executor_state
 from harness.models import SubAgentResult, TaskPlan, TaskStatus
-from harness.nodes import ReActNodes
+from harness.nodes import ReActNodes, _approval_expires_at
 from harness.planning.gate import GateDecision, QualityGate
 from harness.planning.planner import TaskPlanner
 from harness.planning.task_store import TaskStore
@@ -326,7 +327,7 @@ class PlanExecuteNodes:
         }}
         return agent_def, subgraph, sub_state, sub_config
 
-    def _resume_with_approval(self, subgraph, sub_config, out, task, agent_def):
+    def _resume_with_approval(self, subgraph, sub_config, out, task, agent_def, state):
         """把子图的中断冒泡给上层图，拿到人工决策后恢复子图。
 
         **必须在节点自己的线程里调用**：``interrupt()`` 靠抛异常把控制权交回
@@ -338,6 +339,23 @@ class PlanExecuteNodes:
             request.setdefault("task_id", task.task_id)
             request.setdefault("task_title", task.title)
             request.setdefault("sub_agent", agent_def.name)
+            # 工具审批在此刻冒泡到顶层、归因已补全，发 REQUIRED。系统 interrupt id
+            # 要 resume 时才在快照里出现，故用 payload 的 approval_request_id 关联
+            # 后续 RESOLVED（见 harness.events）。
+            if request.get("type") == "tool_approval":
+                emit_approval_required(
+                    state.get("trace_id"),
+                    kind="tool",
+                    tool=request.get("tool"),
+                    request_id=request.get("approval_request_id"),
+                    description=request.get("description"),
+                    expires_at=request.get("expires_at"),
+                    task_id=request.get("task_id"),
+                    task_title=request.get("task_title"),
+                    sub_agent=request.get("sub_agent"),
+                    agent_id=request.get("agent_id"),
+                    session_id=state.get("session_id"),
+                )
         # resume 后本节点重新执行：子图同 thread_id 幂等返回同一中断，
         # 此处 interrupt 立即返回审批值，再用 Command 恢复子图。
         decision = interrupt(request)
@@ -375,7 +393,7 @@ class PlanExecuteNodes:
         with _span(state, "delegate", agent_def.name):
             out = subgraph.invoke(sub_state, sub_config)
         if out.get("__interrupt__"):
-            out = self._resume_with_approval(subgraph, sub_config, out, task, agent_def)
+            out = self._resume_with_approval(subgraph, sub_config, out, task, agent_def, state)
         return self._to_result(task, agent_def, out, int((time.time() - start) * 1000))
 
     def _run_batch(self, plan: TaskPlan, tasks: list[Any],
@@ -418,7 +436,7 @@ class PlanExecuteNodes:
             if out.get("__interrupt__"):
                 # 中断逐个处理：interrupt() 只能在本节点的线程里调
                 began = time.time()
-                out = self._resume_with_approval(subgraph, sub_config, out, task, agent_def)
+                out = self._resume_with_approval(subgraph, sub_config, out, task, agent_def, state)
                 duration_ms += int((time.time() - began) * 1000)
             results.append(self._to_result(task, agent_def, out, duration_ms))
         return results
@@ -562,14 +580,31 @@ class PlanExecuteNodes:
                     "error": f"子任务 {task.title} 未通过人工审批"}
 
         # 正确形态：interrupt 暂停，审批人经服务层 Command(resume=...) 下发决策
+        gate_request_id = f"aprreq_{uuid.uuid4().hex[:12]}"
+        gate_expires_at = _approval_expires_at()
+        conclusion_head = (result.conclusion if result else "")[:1500]
         payload = {
             "type": "gate_review",
+            "approval_request_id": gate_request_id,
+            "expires_at": gate_expires_at,
             "task_id": task.task_id,
             "task_title": task.title,
             "sub_agent": task.assigned_to,
-            "conclusion": (result.conclusion if result else "")[:1500],
+            "conclusion": conclusion_head,
             "note": state.get("feedback", ""),
         }
+        # 质量门 HUMAN 与工具审批是两类不同的人工卡点（设计 §3.6），用 kind="gate" 区分
+        emit_approval_required(
+            state.get("trace_id"),
+            kind="gate",
+            request_id=gate_request_id,
+            expires_at=gate_expires_at,
+            task_id=task.task_id,
+            task_title=task.title,
+            sub_agent=task.assigned_to,
+            session_id=state.get("session_id"),
+            description=conclusion_head[:200],
+        )
         raw_decision = interrupt(payload)
         approved, comment = ReActNodes._parse_approval(raw_decision)
 
