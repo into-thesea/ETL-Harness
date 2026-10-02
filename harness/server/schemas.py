@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class CreateTaskRequest(BaseModel):
@@ -36,6 +36,19 @@ class ApprovalRequest(BaseModel):
         description='本任务内的常驻决定："allow" / "deny"；不传表示只对本次生效。'
                     "必须与 approved 同向，服务层会把非法值归一为不授予。",
     )
+
+    @field_validator("remember", mode="before")
+    @classmethod
+    def _coerce_remember(cls, v: Any) -> Any:
+        """非字符串一律归一为 ``None``，**绝不 422**。
+
+        规格要求"非法值一律当 None 而不报错，避免把审批卡死"。若只在 service 层归一，
+        ``Optional[str]`` 会让 pydantic 在**入口**就把 ``{"remember": true}`` 之类挡成 422 ——
+        审批根本没提交，卡死的正是那句话要防的情形。
+        """
+        if v is None or isinstance(v, str):
+            return v
+        return None
 
 
 class PendingApproval(BaseModel):

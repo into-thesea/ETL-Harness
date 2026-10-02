@@ -650,3 +650,46 @@ def test_http_end_to_end_without_effective_grant_asks_again(monkeypatch) -> None
 
         _final, paused_again = _poll_http(client, tid)
         assert paused_again, "豁免未生效时应当再次弹卡 —— 否则正向用例是空转的"
+
+
+# ======================================================================
+# 整支复核后的修复：Important 2 —— 非字符串 remember 不得挡在 422
+# ======================================================================
+def test_http_approval_normalizes_non_string_remember() -> None:
+    """非字符串的 remember 必须被归一为 None，而不是让 pydantic 在入口抛 422。
+
+    规格（Global Constraints）明确要求：非法值一律当 None **而不报错** ——
+    报错会把整张审批卡死住，这恰恰是"手工客户端传了脏值"时最糟的结果。
+    """
+    from harness.server.schemas import ApprovalRequest
+
+    for bad in (True, 123, 1.5, ["allow"], {"x": 1}):
+        req = ApprovalRequest.model_validate({"approved": True, "remember": bad})
+        assert req.remember is None, f"{bad!r} 应被归一为 None"
+
+    # 合法值原样保留
+    assert ApprovalRequest.model_validate(
+        {"approved": True, "remember": "allow"}).remember == "allow"
+    assert ApprovalRequest.model_validate({"approved": True}).remember is None
+
+
+def test_http_approval_endpoint_tolerates_non_string_remember() -> None:
+    """端点层：脏 remember 不能让审批返回 422（审批必须仍然提交成功）。"""
+    from fastapi.testclient import TestClient
+
+    from harness.server.app import create_app
+
+    svc = HarnessService(checkpointer=_memory_saver(), llm=ApprovalLLM(), auto_assemble=False)
+    seen: dict = {}
+
+    async def _submit(thread_id, approved, comment="", **kwargs):
+        seen.update(kwargs)
+        return {"thread_id": thread_id, "status": "running", "goal": "g",
+                "pending_approvals": []}
+
+    svc.submit_approval = _submit
+    with TestClient(create_app(svc)) as client:
+        r = client.post("/api/v1/tasks/x/approval",
+                        json={"approved": True, "comment": "c", "remember": True})
+    assert r.status_code == 200, f"脏 remember 把审批挡在门外了：{r.status_code} {r.text}"
+    assert seen.get("remember") is None
