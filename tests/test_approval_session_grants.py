@@ -10,8 +10,12 @@ PDP（``authorize``）与沙箱永不被豁免；豁免按 ``(session_id, tool)`
 
 from __future__ import annotations
 
+import pytest
+
 from harness.audit import AuditLogger
+from harness.events import build_event_bus, reset_event_bus
 from harness.server.service import HarnessService
+from tests.test_approval_gate import _guarded_broker
 
 
 def test_aggregate_audit_counts_legacy_rows_without_event_field() -> None:
@@ -55,3 +59,84 @@ def test_record_approval_grant_writes_grant_event(tmp_path) -> None:
     assert rec["tool_name"] == "code_executor"
     assert rec["session_id"] == "s1"
     assert "args" not in rec and "args_hash" in rec, "沿用只存哈希的纪律"
+
+
+# ======================================================================
+# Task 2：Broker 的会话授权表
+# ======================================================================
+def _broker_with_audit(tmp_path):
+    broker = _guarded_broker()
+    broker.audit = AuditLogger(local_dir=str(tmp_path), enabled=True)
+    return broker
+
+
+def test_grant_then_apply_returns_effect_and_records_both(tmp_path) -> None:
+    reset_event_bus()
+    broker = _broker_with_audit(tmp_path)
+    bus = build_event_bus()
+    bus.bind("s1", "t1")
+    sub = bus.subscribe("s1")
+
+    broker.grant_session_approval(
+        "s1", "danger", "allow", granted_by="管理员A", granted_role="admin",
+        comment="本任务内免问", request_id="aprreq_1", trace_id="t1", agent_id="a1",
+    )
+    granted_events = [e["type"] for e in sub.drain()]
+    assert "GUARD_DECISION" in granted_events, "授予必须可见（挂账 #13 定位）"
+
+    grant = broker.apply_session_grant("s1", "danger", trace_id="t1", agent_id="a1")
+    assert grant is not None and grant["effect"] == "allow"
+    assert grant["grant_id"].startswith("aprgrant_")
+    use_events = sub.drain()
+    assert [e["type"] for e in use_events] == ["GUARD_DECISION"]
+    assert use_events[0]["data"]["via"] == "session_grant"
+    assert use_events[0]["data"]["applied"] is True
+
+    # audit.query 是"最新在前"，故这里只断言集合：授予与使用各留一条痕
+    rows = broker.audit.query(session_id="s1")
+    assert sorted(r["applied"] for r in rows) == [False, True]
+
+
+def test_apply_returns_none_without_grant(tmp_path) -> None:
+    reset_event_bus()
+    broker = _broker_with_audit(tmp_path)
+    assert broker.apply_session_grant("s1", "danger") is None
+    assert broker.audit.query(session_id="s1") == []
+
+
+def test_grant_is_scoped_to_session_and_tool(tmp_path) -> None:
+    reset_event_bus()
+    broker = _broker_with_audit(tmp_path)
+    broker.grant_session_approval("s1", "danger", "allow")
+    assert broker.apply_session_grant("s2", "danger") is None, "不得跨会话"
+    assert broker.apply_session_grant("s1", "echo") is None, "不得跨工具"
+    assert broker.apply_session_grant("s1", "danger") is not None
+
+
+def test_regrant_overwrites_instead_of_appending(tmp_path) -> None:
+    """同一会话同一工具重复授予：覆盖旧条目，不叠成两条。"""
+    reset_event_bus()
+    broker = _broker_with_audit(tmp_path)
+    broker.grant_session_approval("s1", "danger", "allow")
+    broker.grant_session_approval("s1", "danger", "deny")
+    grants = broker.list_session_grants("s1")
+    assert len(grants) == 1
+    assert grants[0]["effect"] == "deny"
+
+
+def test_invalid_effect_raises(tmp_path) -> None:
+    reset_event_bus()
+    broker = _broker_with_audit(tmp_path)
+    with pytest.raises(ValueError):
+        broker.grant_session_approval("s1", "danger", "maybe")
+
+
+def test_clear_session_grants(tmp_path) -> None:
+    reset_event_bus()
+    broker = _broker_with_audit(tmp_path)
+    broker.grant_session_approval("s1", "danger", "allow")
+    broker.grant_session_approval("s2", "danger", "allow")
+    assert broker.clear_session_grants("s1") == 1
+    assert broker.list_session_grants("s1") == []
+    assert broker.apply_session_grant("s1", "danger") is None
+    assert broker.list_session_grants("s2"), "别的会话不受影响"

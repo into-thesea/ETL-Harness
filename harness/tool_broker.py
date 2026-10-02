@@ -33,6 +33,8 @@ import json
 import logging
 import threading
 import time
+import uuid
+from datetime import datetime
 from typing import Any, Callable, Optional
 
 from harness.audit import AuditLogger
@@ -163,6 +165,14 @@ class ToolBroker:
         # 放行量是「副本数 × rate_limit_per_min」。要跨副本一致，需把 _call_log
         # 挪到 Redis（zset + Lua 做滑动窗口），届时代替本锁。
         self._rate_lock = threading.Lock()
+        # 会话级人工审批豁免：键 (session_id, tool) → 授予记录。
+        # 与 PDP 的区别：PDP 是 (角色, 工具) 的**全局**策略表，写进去会影响所有任务且永久；
+        # 这里只豁免"人工审批"这一步，且随任务收尾清除 —— 进程重启即丢是**有意**的失败方向
+        # （重新问一次，而不是把放宽永久留下来）。
+        # ponytail: 无 TTL。上界 = 该会话被授予过的工具数（工具总数是常数级）；任务若始终
+        # 不到终态（进程被杀 / 被遗弃），条目留到进程结束。真要更严就加 TTL 清扫或按会话数封顶。
+        self._session_grants: dict[tuple[str, str], dict[str, Any]] = {}
+        self._grant_lock = threading.Lock()
         self.middleware = middleware_manager
         self.pdp = pdp
         # 显式传 False = 关闭沙箱，归一成 None。不能把 False 直接存进来：invoke 与
@@ -278,6 +288,133 @@ class ToolBroker:
             force_role: 若提供，视图内所有调用强制以此角色过 PDP。
         """
         return ScopedBroker(self, allowed_tools, force_role=force_role)
+
+    # ------------------------------------------------------------------
+    # 会话级人工审批豁免（"本任务内总是允许 / 总是拒绝"）
+    # ------------------------------------------------------------------
+    def grant_session_approval(
+        self,
+        session_id: str,
+        tool_name: str,
+        effect: str,
+        *,
+        granted_by: str = "",
+        granted_role: str = "",
+        comment: str = "",
+        request_id: str = "",
+        trace_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """授予"本任务内该工具不再询问审批人"。
+
+        ``effect`` 为 ``"allow"``（后续直接放行）或 ``"deny"``（后续直接驳回）。
+        **只影响人工审批那一步** —— ``invoke`` 的 PDP、参数校验、熔断、限流、沙箱与审计
+        全部照旧（见设计 §3.1）。同一 (session, tool) 重复授予是**覆盖**，不是追加。
+
+        ``trace_id`` / ``task_id`` / ``agent_id`` 只为留痕（审计与事件归因），不参与判定。
+        """
+        if effect not in ("allow", "deny"):
+            raise ValueError(f"会话豁免的 effect 必须是 allow 或 deny，得到: {effect!r}")
+
+        grant = {
+            "grant_id": f"aprgrant_{uuid.uuid4().hex[:12]}",
+            "session_id": session_id,
+            "tool": tool_name,
+            "effect": effect,
+            "granted_by": granted_by,
+            "granted_role": granted_role,
+            "granted_at": datetime.now().isoformat(),
+            "comment": comment,
+            "request_id": request_id,
+        }
+        with self._grant_lock:
+            self._session_grants[(session_id, tool_name)] = grant
+
+        # 锁外留痕：授予是一次"放宽"，一旦发生必须可见、必须留痕（挂账 #13 的定位）
+        self._record_grant(grant, applied=False, trace_id=trace_id, agent_id=agent_id)
+        emit_guard_decision(
+            trace_id, layer=GUARD_LAYER_APPROVAL, decision=effect,
+            reason="已授予本任务内的审批豁免（该工具不再询问审批人）",
+            tool=tool_name, task_id=task_id, agent_id=agent_id,
+            via="session_grant", granted_by=granted_by, granted_role=granted_role,
+            comment=comment, request_id=request_id, grant_id=grant["grant_id"],
+        )
+        return dict(grant)
+
+    def apply_session_grant(
+        self,
+        session_id: str,
+        tool_name: str,
+        *,
+        trace_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """读取该 (会话, 工具) 的豁免并**留痕**；没有则返回 None。
+
+        唯一的读取入口，且自带留痕 —— 唯一的调用方（节点审批闸门）每次都需要这次留痕：
+        靠豁免放行的调用是一次"静默放宽"，必须与拦截一样可见。不删除条目（"应用"不是
+        "消费"：同一豁免在本任务内会生效多次）。
+        """
+        with self._grant_lock:
+            grant = self._session_grants.get((session_id, tool_name))
+            snapshot = dict(grant) if grant is not None else None
+        if snapshot is None:
+            return None
+
+        self._record_grant(snapshot, applied=True, trace_id=trace_id, agent_id=agent_id)
+        emit_guard_decision(
+            trace_id, layer=GUARD_LAYER_APPROVAL, decision=snapshot["effect"],
+            reason="命中本任务内的审批豁免，未再询问审批人",
+            tool=tool_name, task_id=task_id, agent_id=agent_id,
+            via="session_grant", applied=True, grant_id=snapshot["grant_id"],
+        )
+        return snapshot
+
+    def list_session_grants(self, session_id: str) -> list[dict[str, Any]]:
+        """该会话当前生效的全部豁免（控制台展示用）。"""
+        with self._grant_lock:
+            return [
+                dict(g) for (sid, _), g in self._session_grants.items() if sid == session_id
+            ]
+
+    @property
+    def session_grants_total(self) -> int:
+        """当前进程内生效的豁免总条数（管控面展示用）。"""
+        with self._grant_lock:
+            return len(self._session_grants)
+
+    def clear_session_grants(self, session_id: str) -> int:
+        """清掉该会话的全部豁免，返回清掉的条数（任务收尾调用）。"""
+        with self._grant_lock:
+            keys = [k for k in self._session_grants if k[0] == session_id]
+            for k in keys:
+                del self._session_grants[k]
+        return len(keys)
+
+    def _record_grant(
+        self,
+        grant: dict[str, Any],
+        *,
+        applied: bool,
+        trace_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+    ) -> None:
+        """落一条豁免审计；审计器缺失或抛错都不能影响主流程。"""
+        if self.audit is None:
+            return
+        try:
+            self.audit.record_approval_grant(
+                tool_name=grant["tool"], session_id=grant["session_id"],
+                effect=grant["effect"], applied=applied,
+                granted_by=grant["granted_by"], granted_role=grant["granted_role"],
+                comment=grant["comment"], request_id=grant["request_id"],
+                grant_id=grant["grant_id"], agent_id=agent_id or "unknown",
+                trace_id=trace_id,
+            )
+        except Exception:  # noqa: BLE001 - 观测面绝不拖垮主流程
+            logger.exception("记录会话豁免审计失败")
 
     # ------------------------------------------------------------------
     # 授权预检（人工审批之前先判"准不准做"）
