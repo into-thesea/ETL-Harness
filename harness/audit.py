@@ -193,6 +193,44 @@ class AuditLogger:
         self._send_kafka(data)
         return record.audit_id
 
+    def query(
+        self,
+        session_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """只读查询：从本地 JSON Lines 读审计记录，最新在前。
+
+        Args:
+            session_id: 传入则只返回该会话（= 任务 thread_id）的记录；None 表示全部。
+            limit: 最多返回条数（倒序后截断），None 表示全量。
+
+        审计文件是追加存证，读取是旁路：文件不存在返回空列表；个别坏行跳过而不是
+        整次查询失败。聚合统计交给调用方（service 层），本方法只负责如实读出。
+        """
+        if not self.enabled or not os.path.exists(self.local_file):
+            return []
+        rows: list[dict[str, Any]] = []
+        try:
+            with open(self.local_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:  # noqa: BLE001 - 单行损坏不影响其余存证读取
+                        continue
+                    if session_id is not None and rec.get("session_id") != session_id:
+                        continue
+                    rows.append(rec)
+        except Exception:  # noqa: BLE001 - 观测面只读，不向前端抛
+            logger.exception("读取审计文件失败：%s", self.local_file)
+            return rows
+        rows.reverse()  # 最新在前
+        if limit is not None and limit > 0:
+            rows = rows[:limit]
+        return rows
+
     def record_denial(
         self,
         *,

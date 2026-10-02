@@ -6,9 +6,11 @@ import asyncio
 import json
 import logging
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
 from harness.events import build_event_bus
@@ -46,6 +48,12 @@ def _build_router(service: HarnessService, auth: Any) -> APIRouter:
         logger.info("任务创建：%s by %s(%s)", thread_id, principal.name, principal.role)
         return schemas.CreateTaskResponse(thread_id=thread_id, status="running")
 
+    # ---------------- 任务列表 ----------------
+    @router.get("/tasks", response_model=list[schemas.TaskSummaryResponse])
+    async def list_tasks() -> list[schemas.TaskSummaryResponse]:
+        """枚举全部会话摘要（控制台「任务列表」页）。只读，默认受令牌保护。"""
+        return [schemas.TaskSummaryResponse(**t) for t in await service.list_tasks()]
+
     # ---------------- 任务状态 ----------------
     @router.get("/tasks/{thread_id}", response_model=schemas.TaskStatusResponse)
     async def get_task(thread_id: str) -> schemas.TaskStatusResponse:
@@ -64,6 +72,12 @@ def _build_router(service: HarnessService, auth: Any) -> APIRouter:
         `docs/技术选型决策.md` D-005 的「何时该回头」）。
         """
         return [schemas.PackageInfoResponse(**p) for p in await service.list_packages()]
+
+    # ---------------- 管控面（组件配置 / 运行时状态） ----------------
+    @router.get("/control-plane")
+    async def get_control_plane() -> dict:
+        """各管控组件的配置开关与运行时实际状态（控制台「管控面」页）。只读。"""
+        return await service.control_plane()
 
     # ---------------- 待审批项 ----------------
     @router.get("/tasks/{thread_id}/approvals", response_model=list[schemas.PendingApproval])
@@ -107,6 +121,23 @@ def _build_router(service: HarnessService, auth: Any) -> APIRouter:
                     thread_id, req.approved, principal.name, principal.role)
         return schemas.TaskStatusResponse(**status)
 
+    # ---------------- 单会话指标 / 产物（只读观测面） ----------------
+    @router.get("/tasks/{thread_id}/metrics")
+    async def get_task_metrics(thread_id: str) -> dict:
+        """审计 / 管控事件 / 上下文沉淀 / 缓存 / token 指标（控制台「指标」页）。"""
+        metrics = await service.task_metrics(thread_id)
+        if metrics is None:
+            raise HTTPException(status_code=404, detail=f"任务 {thread_id} 不存在")
+        return metrics
+
+    @router.get("/tasks/{thread_id}/artifacts")
+    async def get_task_artifacts(thread_id: str) -> dict:
+        """子任务产物索引 + 大结果沉淀文件 + VFS 根列举（控制台「产物」页）。"""
+        artifacts = await service.task_artifacts(thread_id)
+        if artifacts is None:
+            raise HTTPException(status_code=404, detail=f"任务 {thread_id} 不存在")
+        return artifacts
+
     # ---------------- SSE 流式订阅 ----------------
     @router.get("/tasks/{thread_id}/stream")
     async def stream_task(thread_id: str) -> EventSourceResponse:
@@ -142,7 +173,16 @@ async def _event_stream(service: HarnessService, thread_id: str):
 
     try:
         while True:
+            status = await service.get_status(thread_id)
+            if status is None:
+                yield {"event": "error", "data": _json({"error": "任务不存在"})}
+                return
+
             # ---- 事件流：工具调用 / 子 Agent / 运行 的真实进展 ----
+            # 必须排在状态读取**之后**：取快照的 await 期间图仍在推进（脚本化任务
+            # 快到能在这一个 await 里跑完全程），这段时间发布的事件要在本轮发出。
+            # 若先 drain 再取状态，终态分支会直接 return，队列里剩的事件再没人取 ——
+            # 界面只看到开头两条就"完成"了，且看不出是丢了。
             for event in sub.drain():
                 yield {"event": event["type"], "data": _json(event)}
             if sub.dropped > reported_dropped:
@@ -150,11 +190,6 @@ async def _event_stream(service: HarnessService, thread_id: str):
                 missed = sub.dropped - reported_dropped
                 reported_dropped = sub.dropped
                 yield {"event": "notice", "data": _json({"dropped": missed})}
-
-            status = await service.get_status(thread_id)
-            if status is None:
-                yield {"event": "error", "data": _json({"error": "任务不存在"})}
-                return
 
             # 新出现的待审批项 → 立即推送（审批人据此决策）
             for a in status["pending_approvals"]:
@@ -220,6 +255,16 @@ def create_app(service: Optional[HarnessService] = None) -> FastAPI:
     @app.get("/health", response_model=schemas.HealthResponse, tags=["meta"])
     async def health() -> schemas.HealthResponse:
         return schemas.HealthResponse(status="ok", version=VERSION)
+
+    # 控制台零构建静态页：挂在所有 /api、/health 显式路由**之后**做兜底，html=True
+    # 让 "/" 直接返回 index.html；前端用 hash 路由（#/tasks 等），因此不需要服务端
+    # history fallback。静态资源不含数据，数据一律走受保护的 /api/v1（协议 §2 决策2）。
+    # 目录缺失（精简打包）时跳过，不影响纯 API 部署。
+    static_dir = Path(__file__).resolve().parent / "static"
+    if static_dir.is_dir():
+        app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="console")
+    else:
+        logger.warning("控制台静态目录不存在，跳过前端挂载：%s", static_dir)
 
     return app
 

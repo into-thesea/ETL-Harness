@@ -11,9 +11,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import copy
+import json
 import logging
+import threading
 import uuid
-from datetime import datetime
+from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from harness.agents.registry import AgentRegistry
@@ -68,6 +73,19 @@ class HarnessService:
         self.graph: Any = None
         self.llm: Any = None
         self.datasources: Any = None
+        # 控制台只读端点要直接观测的组件：assemble() 里赋值（未装配前为 None）。
+        self.broker: Any = None
+        self.context_manager: Any = None
+        self.middleware: Any = None
+        self.gate: Any = None
+        self.planner: Any = None
+        self.registry: Any = None
+        self.skill_registry: Any = None
+        self.store: Any = None
+        # 进程内按会话聚合的管控事件计数（全局事件观察者填充，不随 unbind 清空）。
+        self._guard_metrics: dict[str, dict] = {}
+        self._metrics_lock = threading.Lock()
+        self._metrics_bus: Any = None
         self._auto_assemble = auto_assemble
         # 注入了 checkpointer 才能立即装配；否则等第一个异步入口（见 _ensure_ready）
         if auto_assemble and checkpointer is not None:
@@ -177,6 +195,16 @@ class HarnessService:
             )
 
         self.llm = llm
+        # 存下组件引用，供控制台只读端点（管控面 / 指标 / 产物）直接观测，不必再
+        # 从编译图里反向捞。图仍用同一批对象，不存在两份实例。
+        self.broker = broker
+        self.middleware = middleware
+        self.context_manager = context_manager
+        self.gate = gate
+        self.planner = planner
+        self.registry = registry
+        self.skill_registry = skill_registry
+        self.store = store
         self.graph = build_plan_execute_graph(
             llm, broker,
             planner=planner, store=store, registry=registry, gate=gate,
@@ -187,13 +215,58 @@ class HarnessService:
             datasources=datasources,
             long_term_memory=long_term_memory,
         )
+        # 注册进程级管控事件聚合观察者。按 bus 实例去重：测试 reset_event_bus 后总线
+        # 换新，需在重新装配时挂到新 bus；同一 bus 不重复注册（否则计数翻倍）。
+        bus = build_event_bus()
+        if self._metrics_bus is not bus:
+            bus.add_global_listener(self._on_metric_event)
+            self._metrics_bus = bus
+
         self._ready = True
         logger.info("HarnessService assembled (checkpointer=%s)", type(self.checkpointer).__name__)
         return self.graph
 
-    @staticmethod
-    def _select_llm() -> Any:
-        """真实 LLM 优先；未配置 Key 时退回脚本化 Mock 并确保演示数据存在。"""
+    def _empty_guard_metrics(self) -> dict:
+        return {
+            "guard_by_layer": {},
+            "guard_total": 0,
+            "approval_required": 0,
+            "approval_resolved": {"approved": 0, "rejected": 0, "expired": 0},
+        }
+
+    def _on_metric_event(self, event: dict) -> None:
+        """全局事件观察者：把 GUARD / 审批事件按会话聚合成计数（控制台指标页）。
+
+        只做常数时间的字典累加，不做 IO；可能从执行器工作线程回调，故全程持锁。
+        与 per-thread history 的区别：history 在任务终态 unbind 时清空，这里保留，
+        因此任务跑完后指标端点仍能给出本次进程内该会话被各管控点拦了多少次。
+        """
+        etype = event.get("type")
+        tid = event.get("thread_id")
+        data = event.get("data") or {}
+        if not tid or etype not in ("GUARD_DECISION", "APPROVAL_REQUIRED", "APPROVAL_RESOLVED"):
+            return
+        with self._metrics_lock:
+            m = self._guard_metrics.setdefault(tid, self._empty_guard_metrics())
+            if etype == "GUARD_DECISION":
+                layer = str(data.get("layer") or "unknown")
+                decision = str(data.get("decision") or "deny")
+                bucket = m["guard_by_layer"].setdefault(layer, {})
+                bucket[decision] = bucket.get(decision, 0) + 1
+                m["guard_total"] += 1
+            elif etype == "APPROVAL_REQUIRED":
+                m["approval_required"] += 1
+            else:  # APPROVAL_RESOLVED
+                resolved = m["approval_resolved"]
+                if data.get("expired"):
+                    resolved["expired"] += 1
+                elif data.get("approved"):
+                    resolved["approved"] += 1
+                else:
+                    resolved["rejected"] += 1
+
+    def _select_llm(self) -> Any:
+        """真实 LLM 优先；未配置 Key 时退回领域包贡献的脚本化 Mock。"""
         from harness.config import settings
 
         key = (settings.llm.api_key or "").strip()
@@ -387,6 +460,320 @@ class HarnessService:
             "error": values.get("error"),
             "pending_approvals": pending,
             "token_usage": dict(token_usage) if token_usage else None,
+            # 计划与子任务状态机（运行详情 / 计划页的数据源）：含每个 TaskStep 的
+            # 状态、分配、门结论、重试、依赖、验收标准、产物索引、计时。
+            "plan": self._plan_to_dict(plan),
+        }
+
+    @staticmethod
+    def _plan_to_dict(plan: Any) -> Optional[dict]:
+        """把 ``TaskPlan`` 序列化成 JSON 友好的 dict；无计划（尚未规划）返回 None。
+
+        用 ``mode="json"`` 让 pydantic 一并转好嵌套的 datetime / Enum，再用
+        ``default=str`` 兜底 artifacts 里可能出现的任意对象（产物内容不进状态，
+        这里只有路径 / 类型等索引信息，正常都是标量）。
+        """
+        if plan is None:
+            return None
+        try:
+            dumped = plan.model_dump(mode="json")
+            return json.loads(json.dumps(dumped, ensure_ascii=False, default=str))
+        except Exception:  # noqa: BLE001 - 观测/展示面不能因序列化失败拖垮状态查询
+            logger.warning("计划序列化失败，退回精简字段", exc_info=True)
+            return {
+                "plan_id": getattr(plan, "plan_id", ""),
+                "goal": getattr(plan, "goal", ""),
+                "progress": getattr(plan, "progress", 0.0),
+                "version": getattr(plan, "version", 1),
+                "replan_count": getattr(plan, "replan_count", 0),
+                "tasks": [],
+            }
+
+    async def list_tasks(self, limit: int = 100) -> list[dict]:
+        """枚举 checkpointer 里的全部会话，返回任务列表页所需的摘要。
+
+        跨后端（memory / sqlite）走官方 ``saver.alist`` 而不是直接读存储表：
+        只取每个 thread **最新**（``metadata.step`` 最大）的快照，再复用
+        :meth:`_snap_to_dict` 做权威序列化，不自己反序列化 msgpack。顶层图与子图
+        共用一个 checkpointer，用 ``checkpoint_ns == ""`` 过滤掉子图检查点。
+
+        枚举是只读观测面：任何异常都记日志后返回已收集到的部分，不向前端抛 500。
+        """
+        await self._ensure_ready()
+        # alist 只用来枚举 distinct 顶层会话 id：它产出 CheckpointTuple（只有
+        # config/metadata/checkpoint，没有反序列化好的 .values/.tasks，且 memory 后端
+        # metadata 里不带 created_at）。权威快照（含 StateSnapshot.created_at）统一再走
+        # 编译图的 aget_state，与 get_status 同一条读法。
+        thread_ids: set[str] = set()
+        try:
+            # aclosing 确保异步生成器在中途 / 结束后正确关闭游标（sqlite 后端否则会
+            # 在 "Cannot operate on a closed database" 上炸，探活时踩过）。
+            # config 必须传 None 才是"列全部会话"：MemorySaver 里是
+            # ``(...,) if config else self.storage``，传 {"configurable": {}} 反而是
+            # 真值、会去取 config["configurable"]["thread_id"] 而 KeyError。
+            async with contextlib.aclosing(self.checkpointer.alist(None)) as agen:
+                async for item in agen:
+                    conf = ((item.config or {}).get("configurable") or {})
+                    tid = conf.get("thread_id")
+                    if tid and not conf.get("checkpoint_ns"):
+                        thread_ids.add(tid)  # 顶层图与子图共用 checkpointer，只收顶层
+        except Exception:  # noqa: BLE001 - 列表是观测面，失败不应让控制台整页不可用
+            logger.exception("枚举会话（checkpointer.alist）失败，返回已收集的 %d 条", len(thread_ids))
+
+        items: list[dict] = []
+        for tid in thread_ids:
+            # aget_state 是编译图（而非裸 saver）的方法，与 get_status 走同一入口
+            snap = await self.graph.aget_state(self._config(tid))
+            if snap is None or not (snap.values or {}).get("goal"):
+                continue  # 与 get_status 同一"会话是否存在"判据
+            detail = self._snap_to_dict(tid, snap)
+            plan = detail.get("plan") or {}
+            tasks = plan.get("tasks") or []
+            created = getattr(snap, "created_at", None)
+            items.append({
+                "thread_id": tid,
+                "status": detail["status"],
+                "goal": detail["goal"],
+                "progress": detail["progress"],
+                "awaiting_approval": bool(detail.get("pending_approvals")),
+                "task_total": len(tasks),
+                "task_completed": sum(1 for t in tasks if t.get("status") == "completed"),
+                "has_final": bool(detail.get("final_answer")),
+                "error": detail.get("error"),
+                "updated_at": created.isoformat() if hasattr(created, "isoformat") else (str(created) if created else None),
+            })
+
+        items.sort(key=lambda x: (x.get("updated_at") or ""), reverse=True)
+        return items[: max(1, int(limit))]
+
+    async def control_plane(self) -> dict:
+        """管控面只读快照（控制台「管控面」页）：各管控组件的**配置开关**与**运行时
+        实际状态**并排报出。
+
+        刻意区分两者：``configured_enabled`` 是配置/默认值，``connected``/``runtime``
+        是装配后真正生效的状态（例如沙箱配置启用但 Docker 没连上、PDP 启用但零规则
+        默认放行）——只报一个布尔会让运维误判"已经在拦了"。全部为只读，任何单项取数
+        失败都降级为空值而不是让整页 500。
+        """
+        await self._ensure_ready()
+        from harness.config import settings
+
+        broker_stats: dict[str, Any] = {}
+        if self.broker is not None:
+            try:
+                broker_stats = self.broker.get_stats()
+            except Exception:  # noqa: BLE001 - 观测面容错
+                logger.exception("读取 broker 管控统计失败")
+
+        tools_view = broker_stats.get("tools") or []
+        cache_runtime = None
+        cache_obj = getattr(self.broker, "cache", None) if self.broker else None
+        if cache_obj is not None:
+            try:
+                cache_runtime = cache_obj.stats()
+            except Exception:  # noqa: BLE001
+                logger.exception("读取缓存统计失败")
+
+        memory_stats: dict[str, Any] = {}
+        ltm = getattr(self, "long_term_memory", None)
+        if ltm is not None:
+            try:
+                memory_stats = ltm.stats()
+            except Exception:  # noqa: BLE001
+                logger.exception("读取长期记忆统计失败")
+
+        middleware_items: list[dict] = []
+        if self.middleware is not None:
+            try:
+                middleware_items = self.middleware.list_all()
+            except Exception:  # noqa: BLE001
+                logger.exception("读取中间件清单失败")
+
+        ds_names: list[str] = []
+        if self.datasources is not None:
+            try:
+                ds_names = self.datasources.names()
+            except Exception:  # noqa: BLE001
+                logger.exception("读取数据源清单失败")
+
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "checkpointer": {"backend": type(self.checkpointer).__name__},
+            # 工具管控全景：每个工具的角色 / 限流 / 是否审批 / 是否沙箱，近 1 分钟调用，
+            # 以及 PDP / 熔断 / 沙箱 / 审计 / 中间件开关与熔断快照。
+            "tools": broker_stats,
+            "cache": {
+                "configured_enabled": settings.cache.enabled,
+                "runtime": cache_runtime,
+            },
+            "middleware": {"items": middleware_items},
+            "pii": {"configured_enabled": settings.pii.enabled},
+            "permission": {
+                "configured_enabled": settings.permission.enabled,
+                "default_policy": getattr(settings.permission, "default_policy", None),
+                "runtime": {
+                    "pdp_enabled": broker_stats.get("pdp_enabled"),
+                    "rules": broker_stats.get("pdp_rules"),
+                    "effective_default_policy": broker_stats.get("pdp_default_policy"),
+                },
+            },
+            "auth": {"configured_enabled": settings.auth.enabled},
+            "sandbox": {
+                "configured_enabled": settings.sandbox.enabled,
+                "network_enabled": getattr(settings.sandbox, "network_enabled", None),
+                "connected": broker_stats.get("sandbox_enabled"),
+                "sandboxed_tools": [t["name"] for t in tools_view if t.get("run_in_sandbox")],
+            },
+            "circuit_breaker": {
+                "configured_enabled": settings.circuit.enabled,
+                "snapshot": broker_stats.get("circuit_breaker") or {},
+            },
+            "rate_limit": {"scope": broker_stats.get("rate_limit_scope", "process")},
+            "approval": {
+                "timeout_seconds": settings.server.approval_timeout_seconds,
+                "requires_approval_tools": [
+                    t["name"] for t in tools_view if t.get("requires_approval")
+                ],
+            },
+            "memory": memory_stats,
+            "datasources": {"names": ds_names},
+            "packages": await self.list_packages(),
+        }
+
+    async def task_metrics(self, thread_id: str) -> Optional[dict]:
+        """单会话运行指标（控制台「指标」页）；任务不存在返回 None。
+
+        各指标的**可信时间跨度不同**，逐项标 scope，前端不能把它们当成同一口径：
+        - audit：本地审计 JSONL 按 session 聚合，**持久、重启保留**（调用量 / 成败 /
+          PDP 拒绝 / 缓存命中 / 沙箱 / 审批标记 / 时延）。
+        - guard_events：全局事件观察者的**进程内**计数，覆盖 PDP 之外的全部管控层
+          （限流 / 熔断 / 行列权限 / 沙箱 / 审批），重启清零，但任务终态后仍保留。
+        - context.settled：该会话的大结果沉淀引用（进程内）；context.totals / cache /
+          tokens 是组件单例的**进程累计**，并非按会话切分（计数器本身没有会话维度）。
+        """
+        await self._ensure_ready()
+        status = await self.get_status(thread_id)
+        if status is None:
+            return None
+
+        # ---- 1) 审计：持久、按会话 ----
+        audit = getattr(self.broker, "audit", None) if self.broker else None
+        records = audit.query(session_id=thread_id) if audit is not None else []
+        agg: dict[str, Any] = {
+            "total": 0, "succeeded": 0, "failed": 0, "pdp_denied": 0,
+            "cache_hits": 0, "sandbox_used": 0, "approval_required": 0,
+            "duration_ms_total": 0, "by_tool": {},
+        }
+        for r in records:
+            agg["total"] += 1
+            if r.get("result_ok") is True:
+                agg["succeeded"] += 1
+            elif r.get("result_ok") is False:
+                agg["failed"] += 1
+            if r.get("pdp_decision") == "deny":
+                agg["pdp_denied"] += 1
+            if r.get("cache_hit"):
+                agg["cache_hits"] += 1
+            if r.get("sandbox_used"):
+                agg["sandbox_used"] += 1
+            if r.get("approval_required"):
+                agg["approval_required"] += 1
+            try:
+                agg["duration_ms_total"] += int(r.get("duration_ms") or 0)
+            except (TypeError, ValueError):
+                pass
+            tool = r.get("tool_name") or "unknown"
+            bt = agg["by_tool"].setdefault(tool, {"calls": 0, "failed": 0, "denied": 0})
+            bt["calls"] += 1
+            if r.get("result_ok") is False:
+                bt["failed"] += 1
+            if r.get("pdp_decision") == "deny":
+                bt["denied"] += 1
+        agg["duration_ms_avg"] = (
+            round(agg["duration_ms_total"] / agg["total"], 1) if agg["total"] else 0
+        )
+
+        # ---- 2) GUARD / 审批：进程内事件聚合（不随终态清空）----
+        with self._metrics_lock:
+            guard = copy.deepcopy(self._guard_metrics.get(thread_id, self._empty_guard_metrics()))
+
+        # ---- 3) 上下文沉淀（会话引用 + 进程累计计数器）----
+        cm = self.context_manager
+        settled_refs: list[dict] = []
+        context_totals: Optional[dict] = None
+        if cm is not None:
+            settled_refs = [dict(r) for r in getattr(cm, "_refs", {}).get(thread_id, [])]
+            context_totals = asdict(cm.stats)
+
+        # ---- 4) 缓存 / token：组件单例的进程累计 ----
+        cache_obj = getattr(self.broker, "cache", None) if self.broker else None
+        cache_runtime = cache_obj.stats() if cache_obj is not None else None
+        token_usage = getattr(self.llm, "usage_total", None)
+
+        return {
+            "thread_id": thread_id,
+            "status": status["status"],
+            "audit": {"scope": "persisted_local_jsonl", **agg},
+            "guard_events": {"scope": "process_since_start", **guard},
+            "context": {
+                "settled_refs": settled_refs,
+                "settled_count": len(settled_refs),
+                "totals_scope": "process",
+                "totals": context_totals,
+            },
+            "cache": {"scope": "process", "runtime": cache_runtime},
+            "tokens": {"scope": "process", "usage": dict(token_usage) if token_usage else None},
+        }
+
+    async def task_artifacts(self, thread_id: str) -> Optional[dict]:
+        """单会话产物索引（控制台「产物」页）；任务不存在返回 None。
+
+        三类产物分开列，不臆造统一结构：
+        - task_artifacts：计划里每个子任务 ``expected_artifacts`` 与工具实际回填的
+          ``artifacts``（结构化索引，内容不进图状态，通常是路径 / 类型 / 行数等标量）；
+        - settled_refs：因结果过大被上下文管理器**沉淀到 VFS** 的全文文件卡片；
+        - vfs_root：该运行 VFS 根目录的直接子项（目录 / 文件 + 大小），供逐层浏览。
+        """
+        await self._ensure_ready()
+        status = await self.get_status(thread_id)
+        if status is None:
+            return None
+
+        tasks_view: list[dict] = []
+        for t in (status.get("plan") or {}).get("tasks") or []:
+            tasks_view.append({
+                "task_id": t.get("task_id"),
+                "title": t.get("title"),
+                "status": t.get("status"),
+                "assigned_to": t.get("assigned_to"),
+                "expected_artifacts": t.get("expected_artifacts") or [],
+                "artifacts": t.get("artifacts") or {},
+            })
+
+        cm = self.context_manager
+        settled_refs: list[dict] = []
+        vfs_root: list[dict] = []
+        if cm is not None:
+            settled_refs = [dict(r) for r in getattr(cm, "_refs", {}).get(thread_id, [])]
+            vfs = getattr(cm, "vfs", None)
+            if vfs is not None:
+                try:
+                    for f in vfs.list_directory("/"):
+                        vfs_root.append({
+                            "path": getattr(f, "path", ""),
+                            "name": getattr(f, "name", ""),
+                            "type": getattr(getattr(f, "type", None), "value", str(getattr(f, "type", ""))),
+                            "size": getattr(f, "size", 0),
+                        })
+                except Exception:  # noqa: BLE001 - 观测面容错
+                    logger.exception("列举 VFS 根目录失败")
+
+        return {
+            "thread_id": thread_id,
+            "status": status["status"],
+            "task_artifacts": tasks_view,
+            "settled_refs": settled_refs,
+            "vfs_root": vfs_root,
         }
 
     async def _origin_principal(self, thread_id: str) -> str:

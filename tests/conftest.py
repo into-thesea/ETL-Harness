@@ -29,6 +29,12 @@ os.environ.setdefault("CHECKPOINT_BACKEND", "memory")
 # **鉴权本身**由 tests/test_server_auth.py 显式打开后专项覆盖（401/403/角色来源）。
 os.environ.setdefault("AUTH_ENABLED", "false")
 
+# 默认显式禁用长期记忆的 Embedding：否则每次服务装配都会加载本地 bge 模型（几百 MB、
+# 首次数秒），同一进程多次装配还会触发 torch/sentence-transformers 的原生访问违例
+# （挂账 #1）。控制台/编排/服务层用例不需要真实向量；**本地嵌入本身**由
+# tests/test_long_term_memory.py 里显式构造 LocalEmbedding 的专项用例覆盖（不读此默认）。
+os.environ.setdefault("EMBEDDING_PROVIDER", "disabled")
+
 
 def pytest_addoption(parser) -> None:
     parser.addoption(

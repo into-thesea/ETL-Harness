@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Governed 控制台</title>
+  <link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+<div class="layout">
+  <!-- ============================ 深色侧栏 ============================ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">G</div>
+      <div>
+        <div class="name">Governed</div>
+        <div class="sub">可管控 Agent 运行时</div>
+      </div>
+    </div>
+    <nav class="nav" id="nav">
+      <div class="group-label">运行</div>
+      <a class="item" data-route="tasks"><span class="ic">▤</span> 任务列表</a>
+      <a class="item" data-route="detail"><span class="ic">◷</span> 运行详情</a>
+      <a class="item" data-route="plan"><span class="ic">☰</span> 计划审批</a>
+      <a class="item" data-route="approvals"><span class="ic">⚑</span> 审批台 <span id="nav-approval-badge" class="chip warn hidden" style="margin-left:auto;"><span class="sym">●</span><span id="nav-approval-count">0</span></span></a>
+      <div class="group-label">观测</div>
+      <a class="item" data-route="control"><span class="ic">⛨</span> 管控面</a>
+      <a class="item" data-route="metrics"><span class="ic">∿</span> 运行时指标</a>
+      <a class="item" data-route="artifacts"><span class="ic">▣</span> 工作区 / 产物</a>
+      <div class="group-label">系统</div>
+      <a class="item" data-route="packages"><span class="ic">⬡</span> 插件 / 领域包</a>
+    </nav>
+    <div class="sidebar-foot">
+      <div><span class="dot idle" id="health-dot"></span><span id="health-text">健康检查中…</span></div>
+      <div style="margin-top:4px;" class="mono" id="health-version"></div>
+    </div>
+  </aside>
+
+  <!-- ============================ 浅色内容面 ============================ -->
+  <div class="main">
+    <header class="topbar">
+      <h1 id="page-title">任务列表</h1>
+      <span class="crumb" id="page-crumb"></span>
+      <span class="spacer"></span>
+      <span id="task-context" class="small muted"></span>
+    </header>
+    <main class="content" id="content">
+      <div class="empty"><span class="big">◷</span>加载中…</div>
+    </main>
+  </div>
+</div>
+
+<div id="toast"></div>
+<script src="/assets/app.js"></script>
+</body>
+</html>

@@ -31,6 +31,17 @@ logger = logging.getLogger(__name__)
 # 不需要鉴权的路径（探活）
 ANONYMOUS_PATHS = frozenset({"/health"})
 
+# 控制台**外壳**（HTML / CSS / JS）可匿名取：它是纯静态资源，本身不含任何数据 ——
+# 任务、指标、审批一律走受保护的 /api/v1（前端把令牌放在 Authorization 头里）。
+# 若连外壳都要令牌，浏览器就永远打不开填令牌的页面，令牌无处可填、控制台形同不存在。
+_SHELL_PATHS = frozenset({"/", "/index.html", "/favicon.ico"})
+_SHELL_PREFIXES = ("/assets/",)
+
+
+def _is_console_shell(path: str) -> bool:
+    """是否控制台外壳资源（静态、无数据）。"""
+    return path in _SHELL_PATHS or path.startswith(_SHELL_PREFIXES)
+
 # 401 响应头：告诉调用方用哪种认证方式
 _WWW_AUTHENTICATE = 'Bearer realm="governed"'
 
@@ -144,11 +155,19 @@ def build_authenticator(config: Any = None) -> Authenticator:
 
 
 def install_auth(app: FastAPI, auth: Authenticator) -> None:
-    """把鉴权装成 HTTP 中间件（统一覆盖业务路由与 /docs、/openapi.json）。"""
+    """把鉴权装成 HTTP 中间件（统一覆盖业务路由与 /docs、/openapi.json）。
+
+    例外只有两处：探活 ``/health``，以及控制台**外壳**（见 :func:`_is_console_shell`）。
+    两者都不含数据，页面上的数据仍要带令牌去取。
+    """
 
     @app.middleware("http")
     async def _auth_gate(request: Request, call_next):  # type: ignore[no-untyped-def]
-        if not auth.enabled or request.url.path in ANONYMOUS_PATHS:
+        if (
+            not auth.enabled
+            or request.url.path in ANONYMOUS_PATHS
+            or _is_console_shell(request.url.path)
+        ):
             return await call_next(request)
 
         principal = auth.resolve(auth.extract_token(request))

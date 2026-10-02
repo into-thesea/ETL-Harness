@@ -296,3 +296,26 @@ def test_bad_tokens_json_fails_fast(monkeypatch) -> None:
     monkeypatch.setattr(settings.auth, "tokens", "{not json")
     with pytest.raises(RuntimeError, match="AUTH_TOKENS"):
         create_app(_offline_service())
+
+
+# ----------------------------------------------------------------------
+# 6：控制台外壳匿名可取，但它取到的数据仍必须是受保护的
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("path", ["/", "/index.html", "/assets/app.css", "/assets/app.js"])
+def test_console_shell_is_anonymous(auth_env, path) -> None:
+    """开鉴权时页面与静态资源仍可匿名取 —— 否则浏览器打不开填令牌的页面。
+
+    外壳不含任何数据（数据一律走 /api/v1），所以公开它不构成信息暴露；关键是下面
+    那条：**同样的匿名请求拿不到任何数据**。
+    """
+    with _client() as client:
+        resp = client.get(path)
+    assert resp.status_code == 200, f"{path} 应匿名可取，实际 {resp.status_code}"
+
+
+@pytest.mark.parametrize("path", ["/api/v1/tasks", "/api/v1/control-plane", "/api/v1/tasks/x/metrics"])
+def test_console_endpoints_still_require_token(auth_env, path) -> None:
+    """外壳公开 ≠ 数据公开：控制台新加的只读端点一个都不能漏在鉴权外。"""
+    with _client() as client:
+        assert client.get(path).status_code == 401, f"{path} 未带令牌却可读"
+        assert client.get(path, headers=ANALYST).status_code != 401

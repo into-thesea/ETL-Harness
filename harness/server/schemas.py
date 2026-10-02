@@ -40,6 +40,21 @@ class PendingApproval(BaseModel):
     payload: dict[str, Any] = Field(..., description="审批上下文（工具 / 参数 / 风险等）")
 
 
+class TaskSummaryResponse(BaseModel):
+    """任务列表中的一行：会话级摘要（不含计划明细与最终报告全文）。"""
+
+    thread_id: str
+    status: str = Field(..., description="running / awaiting_approval / finished / failed")
+    goal: str
+    progress: Optional[float] = Field(None, description="计划进度 0~1")
+    awaiting_approval: bool = Field(False, description="当前是否停在待审批")
+    task_total: int = Field(0, description="计划中的子任务数")
+    task_completed: int = Field(0, description="已完成的子任务数")
+    has_final: bool = Field(False, description="是否已有最终报告")
+    error: Optional[str] = None
+    updated_at: Optional[str] = Field(None, description="最近一个检查点的时间（ISO）")
+
+
 class TaskStatusResponse(BaseModel):
     """任务状态查询响应。"""
 
@@ -52,6 +67,9 @@ class TaskStatusResponse(BaseModel):
     pending_approvals: list[PendingApproval] = []
     token_usage: Optional[dict[str, int]] = Field(
         None, description="累计 Token 用量（calls/prompt/completion/total）"
+    )
+    plan: Optional[dict[str, Any]] = Field(
+        None, description="计划与子任务状态机（tasks[] 含状态/分配/门结论/重试/依赖/产物索引/计时）"
     )
 
 
@@ -82,5 +100,6 @@ class PackageInfoResponse(BaseModel):
 
 __all__ = [
     "CreateTaskRequest", "CreateTaskResponse", "ApprovalRequest",
-    "PendingApproval", "TaskStatusResponse", "HealthResponse", "PackageInfoResponse",
+    "PendingApproval", "TaskSummaryResponse", "TaskStatusResponse",
+    "HealthResponse", "PackageInfoResponse",
 ]

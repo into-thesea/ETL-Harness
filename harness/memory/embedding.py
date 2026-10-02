@@ -119,6 +119,39 @@ class OpenAIEmbedding(EmbeddingProvider):
 
 
 # ===========================================================================
+# 显式禁用：零网络、零模型
+# ===========================================================================
+class DisabledEmbedding(EmbeddingProvider):
+    """主动关闭长期记忆向量能力。
+
+    与"配了 openai 但没给 key / 端点不通"不同：这是**显式禁用**
+    （``EMBEDDING_PROVIDER=disabled``），``is_available`` 恒为 False，上层
+    :meth:`LongTermMemory.probe` 直接判定降级，既不发起任何网络请求，也不加载
+    本地模型。供明确不需要长期记忆的部署，以及不该被几百 MB 模型拖慢的离线测试使用。
+    """
+
+    name = "disabled"
+
+    def __init__(self, reason: str = "Embedding 已显式禁用（EMBEDDING_PROVIDER=disabled）") -> None:
+        self._error = reason
+
+    @property
+    def dim(self) -> int:
+        return 0
+
+    @property
+    def is_available(self) -> bool:
+        return False
+
+    @property
+    def last_error(self) -> Optional[str]:
+        return self._error
+
+    def embed(self, texts: list[str], *, is_query: bool = False) -> list[list[float]]:
+        raise RuntimeError(self._error)
+
+
+# ===========================================================================
 # 本地：sentence-transformers
 # ===========================================================================
 class LocalEmbedding(EmbeddingProvider):
@@ -208,6 +241,9 @@ def build_embedding_provider(*, provider: str, model: str, api_key: str, base_ur
     """
     name = (provider or "").strip().lower()
 
+    if name in ("disabled", "off", "none", "no", "false", "0"):
+        return DisabledEmbedding()
+
     if name == "local":
         import os
 
@@ -229,6 +265,7 @@ def build_embedding_provider(*, provider: str, model: str, api_key: str, base_ur
 __all__ = [
     "EmbeddingProvider",
     "OpenAIEmbedding",
+    "DisabledEmbedding",
     "LocalEmbedding",
     "build_embedding_provider",
     "resolve_model_path",

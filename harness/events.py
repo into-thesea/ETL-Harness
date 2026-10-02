@@ -85,9 +85,14 @@ class EventSubscription:
         return items
 
     def close(self) -> None:
-        """断开订阅（幂等）。断开后不再接收事件。"""
+        """断开订阅（幂等）：此后不再接收新事件，但**已缓冲的不清**。
+
+        缓冲里躺着的是"已经投递给这个消费者"的事件。任务终态时总线会关掉订阅，
+        而消费者往往还没来得及取走最后一批 —— 清掉就等于静默丢掉整个任务的进展
+        （脚本化任务快到全部事件都堆在这一次缓冲里，早期版本正是这样丢的）。
+        消费者据此把尾巴读完再退出；缓冲随之被回收，不构成泄漏。
+        """
         self._closed = True
-        self._buffer.clear()
 
 
 class EventBus:
@@ -105,6 +110,19 @@ class EventBus:
         self._seq = 0
         self._delivered = 0
         self._recorded = 0
+        # 全局观察者：不按 thread 订阅、unbind 也不清空，用于进程内聚合管控指标
+        # （per-thread history 会在任务终态 unbind 时被清掉，无法支撑事后指标）。
+        self._global_listeners: list = []
+
+    def add_global_listener(self, fn) -> None:
+        """注册全局观察者 ``fn(event)``：每条已绑定事件（含 GUARD/审批）都会通知。
+
+        观察者必须轻量、不得抛错（发布处已 try/except 隔离）；它收到的是投递前的
+        事件副本。与按 thread 的 :meth:`subscribe` 不同，它不占订阅缓冲、不受
+        ``unbind`` 影响，适合做进程级计数（如控制台指标页的 GUARD 分类统计）。
+        """
+        with self._lock:
+            self._global_listeners.append(fn)
 
     # ------------------------------------------------------------------
     # 绑定与订阅
@@ -200,7 +218,15 @@ class EventBus:
             for sub in subs:
                 sub._offer(event)
             self._delivered += len(subs)
-            return len(subs)
+            # 全局观察者在锁外通知（可能来自工作线程的回调，避免持锁调用外部代码）
+            listeners = list(self._global_listeners)
+            delivered = len(subs)
+        for fn in listeners:
+            try:
+                fn(event)
+            except Exception:  # noqa: BLE001 - 观察者异常绝不能影响事件发布主链路
+                logger.debug("全局事件观察者回调失败（忽略）", exc_info=True)
+        return delivered
 
     def publish_span(self, kind: str, span: Any) -> int:
         """把一次 Span 的进出转成协议事件（``kind`` 取 ``"start"`` / ``"end"``）。
@@ -258,6 +284,7 @@ class EventBus:
             self._subs.clear()
             self._trace_to_thread.clear()
             self._history.clear()
+            self._global_listeners.clear()
             self._seq = 0
             self._delivered = 0
             self._recorded = 0

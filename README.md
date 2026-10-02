@@ -39,6 +39,7 @@
 
 **服务化与可观测**
 - FastAPI 提供同步与 SSE 流式接口，审批中断状态落盘、重启可续
+- 内置 Web 控制台（`/`，零构建）：任务列表、运行详情（子任务状态机 + 工具 / 子 Agent 实时事件时间线）、审批台、管控面、运行时指标、工作区与产物、插件页；原生 HTML/CSS/JS，无 npm、无构建产物，数据一律走受鉴权保护的接口
 - 全链路审计与 trace 埋点，经 Kafka 上送（带本地 spool，断网不丢）
 - 每步状态 checkpoint，崩溃后从断点恢复
 
@@ -135,6 +136,10 @@ AUTH_APPROVER_ROLES=admin
 python -m uvicorn --factory harness.server.app:create_app --host 0.0.0.0 --port 8000
 ```
 
+浏览器打开 `http://localhost:8000/` 就是控制台。它只匿名取到**外壳**（HTML/CSS/JS，
+不含数据）；首次用 `http://localhost:8000/?token=<令牌>` 打开，令牌会存进本机浏览器，
+之后的接口调用都带 `Authorization` 头。数据一律走受鉴权保护的 `/api/v1`。
+
 调用接口（角色由令牌决定，请求体里没有 role 字段）：
 
 ```bash
@@ -159,6 +164,12 @@ curl -N "http://localhost:8000/api/v1/tasks/$THREAD/stream?token=$TOKEN"
 
 # 已挂载的领域包与装载状态（能挂上哪些领域、各自贡献了什么）
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/packages
+
+# 控制台用的只读观测接口：会话枚举 / 管控面 / 单会话指标 / 单会话产物
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/tasks
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/control-plane
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/tasks/$THREAD/metrics
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/tasks/$THREAD/artifacts
 ```
 
 `/docs`、`/openapi.json` 也需要令牌，只有 `/health` 匿名。本机开发可设 `AUTH_ENABLED=false`（会打 WARNING，且只有一个 admin 身份）。
@@ -204,6 +215,7 @@ governed/
 │   ├── trace/              # tracer + Kafka 生产
 │   ├── sandbox/            # 沙箱客户端与执行器
 │   └── server/             # FastAPI（app/auth/service/schemas/run）
+│       └── static/         #   零构建控制台（index.html + assets/，原生 HTML/CSS/JS）
 ├── packages/               # 领域包（以 entry points 挂载到框架）
 │   └── data_analysis/      #   数据分析：tools / agents / skills / 离线能力
 ├── infra/                  # docker-compose、沙箱镜像、opensandbox-server
@@ -222,6 +234,7 @@ governed/
 ## Roadmap
 
 - [ ] 真实 LLM 稳定性收敛：减少幻觉文件名与多余的工具调用
+- [ ] 控制台：执行前的计划审批（当前为只读计划视图）、事件落盘与历史回放
 - [ ] 沙箱控制面纳入 docker-compose（当前用独立脚本过渡）
 - [ ] 真实 MySQL/PostgreSQL 端到端联调
 - [ ] 补充架构设计文档、提升测试覆盖率
