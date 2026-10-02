@@ -188,6 +188,27 @@ class ReActNodes:
             logger.info("Tool %s blocked before approval: %s", tool_name, authz_reason)
             return False, observation, None
 
+        # 会话豁免（"本任务内总是允许 / 总是拒绝"）：只跳过人工审批那一步。
+        # 走到这里说明 authorize 已经放行 —— 豁免**不能**越过 PDP，这一层的顺序不能挪。
+        grant = self.broker.apply_session_grant(
+            state.get("session_id") or "",
+            tool_name,
+            trace_id=state.get("trace_id"),
+            task_id=state.get("task_id"),
+            agent_id=state.get("agent_id"),
+        )
+        if grant is not None:
+            if grant["effect"] == "deny":
+                logger.info("Tool %s denied by session grant", tool_name)
+                return False, (
+                    "本任务内已豁免：该工具已被审批人一次性拒绝，不要再次请求。"
+                    "请调整方案或改做其他事。"
+                ), None
+            logger.info("Tool %s allowed by session grant", tool_name)
+            return True, "", self._make_approval_credential(
+                tool_name, state, via="session_grant", grant_id=grant["grant_id"]
+            )
+
         # 审批请求的关联 id 与过期时刻：request_id 用来把 APPROVAL_REQUIRED 与
         # 后续 APPROVAL_RESOLVED 配对（此刻还没有 LangGraph 的系统 interrupt id）；
         # expires_at 由服务层在 resume 时强制（超时只能驳回、不能批准）。
@@ -206,9 +227,26 @@ class ReActNodes:
             "trace_id": state.get("trace_id"),
         }
         raw_decision = interrupt(payload)
-        approved, comment = self._parse_approval(raw_decision)
-        logger.info("Tool %s approval: approved=%s comment=%s",
-                    tool_name, approved, comment)
+        approved, comment, remember = self._parse_approval(raw_decision)
+        logger.info("Tool %s approval: approved=%s comment=%s remember=%s",
+                    tool_name, approved, comment, remember)
+
+        # 审批人身份来自 **resume 值**（不是节点发出的 payload）—— 授予要把"谁放宽的"记下来，
+        # 否则审计只留下一条没有责任人的豁免。
+        approver = approver_role = ""
+        if isinstance(raw_decision, dict):
+            approver = str(raw_decision.get("approver") or "")
+            approver_role = str(raw_decision.get("approver_role") or "")
+
+        if remember:
+            self.broker.grant_session_approval(
+                state.get("session_id") or "", tool_name, remember,
+                granted_by=approver, granted_role=approver_role,
+                comment=comment, request_id=request_id,
+                trace_id=state.get("trace_id"), task_id=state.get("task_id"),
+                agent_id=state.get("agent_id"),
+            )
+
         if not approved:
             observation = (
                 f"工具调用被人工审批拒绝：{comment or '未说明原因'}。"
@@ -216,7 +254,17 @@ class ReActNodes:
             )
             return False, observation, None
 
-        approval = {
+        return True, "", self._make_approval_credential(tool_name, state, comment=comment)
+
+    def _make_approval_credential(
+        self, tool_name: str, state: AgentState, comment: str = "", **extra: Any
+    ) -> dict:
+        """构造审批通过凭证。
+
+        人工批准与会话豁免两条路径**必须复用本方法**：凭证字段一旦分叉，Broker 第 3.5 步的
+        凭证闸门就会只认其中一条（本项目在"节点与 Broker 字段对不上"上踩过）。
+        """
+        return {
             "id": f"apr_{uuid.uuid4().hex[:12]}",
             "approved": True,
             "tool": tool_name,
@@ -225,21 +273,35 @@ class ReActNodes:
             "session_id": state.get("session_id"),
             "agent_id": state.get("agent_id"),
             "trace_id": state.get("trace_id"),
+            **extra,
         }
-        return True, "", approval
 
     @staticmethod
-    def _parse_approval(raw: Any) -> tuple[bool, str]:
-        """解析审批人下发的 resume 值（兼容 dict / 字符串）。"""
+    def _parse_approval(raw: Any) -> tuple[bool, str, Optional[str]]:
+        """解析审批人下发的 resume 值 → ``(approved, comment, remember)``。
+
+        ``remember`` 只接受 ``None | "allow" | "deny"``，且必须与 ``approved`` **同向**
+        （allow↔True、deny↔False）；非法值或自相矛盾的组合一律归一为 ``None`` ——
+        fail closed：不认识的输入不产生任何豁免，也不报错（报错会把审批卡死）。
+        """
         if isinstance(raw, dict):
             comment = str(raw.get("comment") or raw.get("reason") or "")
             if "approved" in raw:
-                return bool(raw["approved"]), comment
-            decision = str(raw.get("decision") or raw.get("action") or "").lower()
-            return decision in ("approve", "approved", "allow", "pass", "true", "1"), comment
+                approved = bool(raw["approved"])
+            else:
+                decision = str(raw.get("decision") or raw.get("action") or "").lower()
+                approved = decision in ("approve", "approved", "allow", "pass", "true", "1")
+            remember = str(raw.get("remember") or "").strip().lower() or None
+        else:
+            text = str(raw or "").strip().lower()
+            approved = text in ("approve", "approved", "allow", "pass", "true", "1", "y", "yes")
+            comment, remember = "", None
 
-        text = str(raw or "").strip().lower()
-        return text in ("approve", "approved", "allow", "pass", "true", "1", "y", "yes"), ""
+        if remember not in ("allow", "deny"):
+            remember = None
+        elif (remember == "allow") != bool(approved):
+            remember = None                      # 不同向：不猜，直接不授予
+        return approved, comment, remember
 
     # ------------------------------------------------------------------
     # 上下文管理的两个介入时机（未注入 ContextManager 时全部为透传，零开销）

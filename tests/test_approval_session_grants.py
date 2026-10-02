@@ -15,6 +15,7 @@ import pytest
 from harness.audit import AuditLogger
 from harness.events import build_event_bus, reset_event_bus
 from harness.pdp import PDP
+from harness.nodes import ReActNodes
 from harness.server.service import HarnessService
 from tests.test_approval_gate import _guarded_broker
 
@@ -178,3 +179,122 @@ def test_scoped_broker_reads_parent_grant_but_cannot_grant(tmp_path) -> None:
     assert scoped.list_session_grants("s1")[0]["effect"] == "allow"
     assert not hasattr(scoped, "grant_session_approval"), "子 Agent 不得自我授予"
     assert not hasattr(scoped, "clear_session_grants"), "子 Agent 不得清空豁免"
+
+
+# ======================================================================
+# Task 4：节点审批闸门
+# ======================================================================
+def _nodes(broker) -> ReActNodes:
+    """只装配审批闸门所需的依赖（LLM / 中间件都不参与本组用例）。"""
+    return ReActNodes(llm=None, broker=broker)
+
+
+_STATE = {"session_id": "s1", "agent_id": "a1", "trace_id": "t1",
+          "role": "analyst", "task_id": "task-1"}
+
+
+def _interrupt_must_not_fire(payload):
+    raise AssertionError("不应弹审批卡")
+
+
+def test_parse_approval_returns_remember() -> None:
+    nodes = _nodes(None)
+    assert nodes._parse_approval({"approved": True, "comment": "ok"}) == (True, "ok", None)
+    assert nodes._parse_approval(
+        {"approved": True, "remember": "allow"}) == (True, "", "allow")
+    assert nodes._parse_approval(
+        {"approved": False, "remember": "deny"}) == (False, "", "deny")
+    # 非法值一律当 None（fail closed：不认识的值不产生豁免）
+    assert nodes._parse_approval(
+        {"approved": True, "remember": "whatever"}) == (True, "", None)
+    # 与 approved 不同向：不猜，直接不授予
+    assert nodes._parse_approval(
+        {"approved": True, "remember": "deny"}) == (True, "", None)
+    assert nodes._parse_approval(
+        {"approved": False, "remember": "allow"}) == (False, "", None)
+
+
+def test_apply_grant_allow_skips_interrupt(monkeypatch, tmp_path) -> None:
+    """有 allow 豁免：不触发 interrupt，凭证带 via 标记。"""
+    reset_event_bus()
+    broker = _broker_with_audit(tmp_path)
+    broker.grant_session_approval("s1", "danger", "allow")
+    nodes = _nodes(broker)
+    monkeypatch.setattr("harness.nodes.interrupt", _interrupt_must_not_fire)
+
+    approved, observation, credential = nodes._request_tool_approval("danger", {}, _STATE, {})
+    assert approved is True and observation == ""
+    assert credential["via"] == "session_grant"
+    assert credential["tool"] == "danger" and credential["approved"] is True
+
+
+def test_apply_grant_deny_skips_interrupt(monkeypatch, tmp_path) -> None:
+    """有 deny 豁免：不触发 interrupt，直接回驳回；换参数也一样（豁免是工具级）。"""
+    reset_event_bus()
+    broker = _broker_with_audit(tmp_path)
+    broker.grant_session_approval("s1", "danger", "deny")
+    nodes = _nodes(broker)
+    monkeypatch.setattr("harness.nodes.interrupt", _interrupt_must_not_fire)
+
+    approved, observation, credential = nodes._request_tool_approval(
+        "danger", {"code": "完全不同的代码"}, _STATE, {})
+    assert approved is False and credential is None
+    assert "豁免" in observation
+
+
+def test_no_grant_still_interrupts(monkeypatch, tmp_path) -> None:
+    """回归：没有豁免时行为与今天完全一致 —— 仍然 interrupt。"""
+    reset_event_bus()
+    broker = _broker_with_audit(tmp_path)
+    nodes = _nodes(broker)
+    calls = []
+
+    def _fake_interrupt(payload):
+        calls.append(payload)
+        return {"approved": True, "comment": "ok"}
+
+    monkeypatch.setattr("harness.nodes.interrupt", _fake_interrupt)
+    approved, _, credential = nodes._request_tool_approval("danger", {}, _STATE, {})
+    assert approved is True and len(calls) == 1
+    assert credential["approved"] is True
+    assert "via" not in credential, "人工批准不带豁免标记"
+
+
+def test_remember_grants_for_subsequent_requests(monkeypatch, tmp_path) -> None:
+    """本次人工选择"总是允许"后：本次照旧走 interrupt，后续请求不再弹卡。"""
+    reset_event_bus()
+    broker = _broker_with_audit(tmp_path)
+    nodes = _nodes(broker)
+    calls = []
+
+    def _fake_interrupt(payload):
+        calls.append(payload)
+        return {"approved": True, "comment": "可以", "remember": "allow",
+                "approver": "管理员A", "approver_role": "admin"}
+
+    monkeypatch.setattr("harness.nodes.interrupt", _fake_interrupt)
+
+    approved, _, _ = nodes._request_tool_approval("danger", {}, _STATE, {})
+    assert approved is True and len(calls) == 1, "触发豁免的那次仍走完整审批"
+    grants = broker.list_session_grants("s1")
+    assert grants[0]["effect"] == "allow"
+    assert grants[0]["granted_by"] == "管理员A", "授予人必须留痕（否则审计记不住是谁放宽的）"
+    assert grants[0]["granted_role"] == "admin"
+
+    monkeypatch.setattr("harness.nodes.interrupt", _interrupt_must_not_fire)
+    approved2, _, cred2 = nodes._request_tool_approval("danger", {}, _STATE, {})
+    assert approved2 is True and cred2["via"] == "session_grant"
+
+
+def test_remember_deny_grants_deny(monkeypatch, tmp_path) -> None:
+    """驳回时选"总是拒绝"：本次驳回，后续直接拒绝。"""
+    reset_event_bus()
+    broker = _broker_with_audit(tmp_path)
+    nodes = _nodes(broker)
+    monkeypatch.setattr("harness.nodes.interrupt", lambda payload: {
+        "approved": False, "comment": "不行", "remember": "deny"})
+
+    approved, observation, credential = nodes._request_tool_approval("danger", {}, _STATE, {})
+    assert approved is False and credential is None
+    assert "拒绝" in observation, "沿用既有驳回文案（本轮不改它的措辞）"
+    assert broker.list_session_grants("s1")[0]["effect"] == "deny"
