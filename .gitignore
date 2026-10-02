@@ -73,8 +73,10 @@ desktop.ini
 # superpowers SDD 工作区（临时草稿，勿提交）
 .superpowers/
 
-# docs 全部仅本地保留（设计/计划/学习/求职资料，不进版本库）
-docs/
+# docs 默认仅本地保留（设计/计划/学习/求职资料，不进版本库）。
+# 例外：下面这一份是**明确要对外发布**的，放行它一个人 —— 见 docs/接手指引.md。
+docs/*
+!docs/审批策略设计_对外版.md
 
 # HuggingFace 模型缓存（本地 embedding 模型，体积以 GB 计）
 models--*/
