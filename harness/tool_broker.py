@@ -875,6 +875,20 @@ class ScopedBroker:
             ctx["role"] = self.force_role
         return self._inner.authorize(tool_name, ctx)
 
+    # ---- 会话豁免：只读转发 ----
+    # 子 Agent 必须读得到父任务授予的豁免（键是 session_id，与是否受限视图无关）；
+    # 但**不转发** grant_session_approval / clear_session_grants —— 授予只发生在节点层
+    # （人类决定的落点），子 Agent 不得给自己开豁免、也不得清空父任务的豁免。
+    def apply_session_grant(
+        self, session_id: str, tool_name: str, **kwargs: Any
+    ) -> Optional[dict[str, Any]]:
+        if not self._is_allowed(tool_name):
+            return None
+        return self._inner.apply_session_grant(session_id, tool_name, **kwargs)
+
+    def list_session_grants(self, session_id: str) -> list[dict[str, Any]]:
+        return self._inner.list_session_grants(session_id)
+
     def invoke(
         self,
         tool_name: str,

@@ -14,6 +14,7 @@ import pytest
 
 from harness.audit import AuditLogger
 from harness.events import build_event_bus, reset_event_bus
+from harness.pdp import PDP
 from harness.server.service import HarnessService
 from tests.test_approval_gate import _guarded_broker
 
@@ -140,3 +141,40 @@ def test_clear_session_grants(tmp_path) -> None:
     assert broker.list_session_grants("s1") == []
     assert broker.apply_session_grant("s1", "danger") is None
     assert broker.list_session_grants("s2"), "别的会话不受影响"
+
+
+# ======================================================================
+# Task 3：安全边界 —— 豁免不越过 PDP；子 Agent 只读
+# ======================================================================
+def test_grant_cannot_override_pdp_denial(tmp_path) -> None:
+    """命门：给一个被 PDP 拒绝的工具授予 allow 豁免，调用仍必须被拒。"""
+    reset_event_bus()
+    pdp = PDP(default_policy="deny")          # 默认拒绝：danger 不在白名单里
+    broker = _guarded_broker(pdp=pdp)
+    broker.audit = AuditLogger(local_dir=str(tmp_path), enabled=True)
+
+    broker.grant_session_approval("s1", "danger", "allow")
+    ctx = {"role": "analyst", "session_id": "s1"}
+
+    allowed, reason = broker.authorize("danger", ctx)
+    assert allowed is False, "豁免不得越过 PDP 授权"
+    assert "不允许" in reason
+
+    ok, text, _ = broker.invoke("danger", {}, {**ctx, "approval": {
+        "id": "apr_x", "approved": True, "tool": "danger"}})
+    assert ok is False, "持有凭证 + 有豁免，也不能越过 PDP"
+
+
+def test_scoped_broker_reads_parent_grant_but_cannot_grant(tmp_path) -> None:
+    """子 Agent 读得到父任务的豁免；但它自己不能授予（授予是节点层的事）。"""
+    reset_event_bus()
+    from harness.tool_broker import ScopedBroker
+
+    broker = _broker_with_audit(tmp_path)
+    broker.grant_session_approval("s1", "danger", "allow")
+    scoped = ScopedBroker(broker, ["danger"])
+
+    assert scoped.apply_session_grant("s1", "danger") is not None
+    assert scoped.list_session_grants("s1")[0]["effect"] == "allow"
+    assert not hasattr(scoped, "grant_session_approval"), "子 Agent 不得自我授予"
+    assert not hasattr(scoped, "clear_session_grants"), "子 Agent 不得清空豁免"
