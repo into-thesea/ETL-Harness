@@ -421,3 +421,58 @@ def test_status_exposes_session_grants_and_control_plane_counts() -> None:
         assert cp["approval"]["session_grants_active"] == 1
 
     asyncio.run(scenario())
+
+
+# ======================================================================
+# Task 6：HTTP 层
+# ======================================================================
+def test_http_approval_accepts_remember_field() -> None:
+    """端点必须能吃下 remember 字段（否则控制台的两个新按钮 422 / 静默失效）。"""
+    from harness.server.schemas import ApprovalRequest
+
+    req = ApprovalRequest.model_validate(
+        {"approved": True, "comment": "免问", "remember": "allow"})
+    assert req.remember == "allow"
+
+    default = ApprovalRequest.model_validate({"approved": False})
+    assert default.remember is None
+
+
+def test_task_status_schema_carries_session_grants() -> None:
+    """`session_grants` 必须能被 HTTP 响应带出去。
+
+    `get_status` 返回的 dict 会经 `TaskStatusResponse` 序列化 —— schema 里没有这个字段，
+    pydantic 会把它丢掉，控制台就永远看不到"哪些工具已豁免"。
+    """
+    from harness.server.schemas import TaskStatusResponse
+
+    resp = TaskStatusResponse(
+        thread_id="t1", status="running", goal="g", pending_approvals=[],
+        session_grants=[{"tool": "danger", "effect": "allow"}],
+    )
+    assert resp.session_grants == [{"tool": "danger", "effect": "allow"}]
+    assert resp.model_dump()["session_grants"], "HTTP 响应里必须带得出去"
+
+
+def test_http_approval_endpoint_forwards_remember() -> None:
+    """端点把 remember 交给 service（否则按钮是哑的）。"""
+    from fastapi.testclient import TestClient
+
+    from harness.server.app import create_app
+
+    svc = HarnessService(checkpointer=_memory_saver(), llm=ApprovalLLM(), auto_assemble=False)
+    seen: dict = {}
+
+    async def _submit(thread_id, approved, comment="", **kwargs):
+        seen["thread_id"] = thread_id
+        seen["approved"] = approved
+        seen.update(kwargs)
+        return {"thread_id": thread_id, "status": "running", "goal": "g",
+                "pending_approvals": []}
+
+    svc.submit_approval = _submit
+    with TestClient(create_app(svc)) as client:
+        r = client.post("/api/v1/tasks/x/approval",
+                        json={"approved": True, "comment": "免问", "remember": "allow"})
+    assert r.status_code == 200, r.text
+    assert seen.get("remember") == "allow"

@@ -31,6 +31,11 @@ class ApprovalRequest(BaseModel):
 
     approved: bool = Field(..., description="是否批准该操作")
     comment: str = Field("", description="审批意见（拒绝时建议填写原因）")
+    remember: Optional[str] = Field(
+        None,
+        description='本任务内的常驻决定："allow" / "deny"；不传表示只对本次生效。'
+                    "必须与 approved 同向，服务层会把非法值归一为不授予。",
+    )
 
 
 class PendingApproval(BaseModel):
@@ -70,6 +75,10 @@ class TaskStatusResponse(BaseModel):
     )
     plan: Optional[dict[str, Any]] = Field(
         None, description="计划与子任务状态机（tasks[] 含状态/分配/门结论/重试/依赖/产物索引/计时）"
+    )
+    session_grants: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="本任务内生效的审批豁免（tool / effect / granted_by / granted_at）",
     )
 
 
