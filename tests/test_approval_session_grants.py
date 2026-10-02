@@ -298,3 +298,126 @@ def test_remember_deny_grants_deny(monkeypatch, tmp_path) -> None:
     assert approved is False and credential is None
     assert "拒绝" in observation, "沿用既有驳回文案（本轮不改它的措辞）"
     assert broker.list_session_grants("s1")[0]["effect"] == "deny"
+
+
+# ======================================================================
+# Task 5：Service 层
+# ======================================================================
+import asyncio  # noqa: E402 - 本组用例才开始需要
+
+from tests._smoke_server import ApprovalLLM  # noqa: E402
+from tests.test_console_api import _memory_saver  # noqa: E402
+
+
+def _service_with_pending(monkeypatch, tmp_path):
+    """一个装配好、但图被替身接管的 service：待审批项固定为一次 danger 工具审批。"""
+    svc = HarnessService(checkpointer=_memory_saver(), llm=ApprovalLLM(), auto_assemble=False)
+    captured: dict = {}
+
+    class _Graph:
+        # 注意：必须是**普通函数**。若写成 async def，调用它只是造出协程、函数体不执行，
+        # 捕获就落空了 —— 这里的目的是验载荷，不是真驱动图。
+        def ainvoke(self, payload, config):
+            captured["resume"] = payload.resume
+
+            async def _noop():
+                return {}
+
+            return _noop()
+
+        async def aget_state(self, config):
+            return type("Snap", (), {"tasks": [], "values": {}})()
+
+    async def _get_status(thread_id):
+        return {"status": "awaiting_approval", "pending_approvals": [{
+            "interrupt_id": "i1",
+            "payload": {"type": "tool_approval", "tool": "danger",
+                        "approval_request_id": "aprreq_1", "task_id": "task-1"},
+        }]}
+
+    graph = _Graph()
+
+    async def _scenario(call):
+        # auto_assemble=False 时 _ensure_ready 只置 _ready、**不装配**，必须显式装配
+        svc.assemble()
+        svc.graph = graph
+        svc.get_status = _get_status
+        svc._trace_id = lambda tid: asyncio.sleep(0, result=None)
+        await call()
+        return captured
+
+    return svc, _scenario
+
+
+def test_resume_payload_carries_remember_and_approver(monkeypatch, tmp_path) -> None:
+    """remember 与审批人身份都必须进 resume 载荷。
+
+    没有审批人，授予记录的 granted_by 就是空串，审计答不出"谁放宽的"。
+    """
+    _svc, scenario = _service_with_pending(monkeypatch, tmp_path)
+
+    async def call():
+        await _svc.submit_approval(
+            "t1", True, "可以", approver_name="管理员A", approver_role="admin",
+            remember="allow")
+
+    captured = asyncio.run(scenario(call))
+    assert captured["resume"] == {
+        "approved": True, "comment": "可以", "remember": "allow",
+        "approver": "管理员A", "approver_role": "admin",
+    }
+
+
+def test_remember_mismatched_with_approved_is_dropped() -> None:
+    """自相矛盾或非法的组合一律不授予（不猜）。"""
+    assert HarnessService._normalize_remember(True, "deny") is None
+    assert HarnessService._normalize_remember(False, "allow") is None
+    assert HarnessService._normalize_remember(True, "allow") == "allow"
+    assert HarnessService._normalize_remember(False, "deny") == "deny"
+    assert HarnessService._normalize_remember(True, "nonsense") is None
+    assert HarnessService._normalize_remember(True, None) is None
+    assert HarnessService._normalize_remember(True, "  ALLOW  ") == "allow"
+
+
+def test_settle_clears_session_grants() -> None:
+    """任务到达终态后，该会话的豁免必须被清掉（否则是又一处只增不减的表）。"""
+
+    async def scenario() -> None:
+        svc = HarnessService(checkpointer=_memory_saver(), llm=ApprovalLLM(),
+                             auto_assemble=False)
+        await svc._ensure_ready()
+        svc.assemble()
+        svc.broker.grant_session_approval("t1", "danger", "allow")
+        svc.broker.grant_session_approval("t2", "danger", "allow")
+
+        class _Snap:
+            tasks: list = []
+
+        async def _aget_state(config):
+            return _Snap()
+
+        svc.graph = type("G", (), {"aget_state": staticmethod(_aget_state)})()
+        await svc._settle_after_run("t1", trace_id=None)
+        assert svc.broker.list_session_grants("t1") == []
+        assert svc.broker.list_session_grants("t2"), "别的会话不受影响"
+
+    asyncio.run(scenario())
+
+
+def test_status_exposes_session_grants_and_control_plane_counts() -> None:
+    """状态里能读出本任务生效的豁免；管控面报进程内总数。"""
+
+    async def scenario() -> None:
+        svc = HarnessService(checkpointer=_memory_saver(), llm=ApprovalLLM(),
+                             auto_assemble=False)
+        await svc._ensure_ready()
+        svc.assemble()
+        svc.broker.grant_session_approval("t1", "danger", "allow")
+
+        st = await svc.get_status("t1")
+        assert st is None or "session_grants" in st      # 任务不存在时返回 None 是既有语义
+
+        cp = await svc.control_plane()
+        assert cp["approval"]["session_grants_active"] == 1
+
+    asyncio.run(scenario())

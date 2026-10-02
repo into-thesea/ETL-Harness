@@ -364,6 +364,9 @@ class HarnessService:
             awaiting = False
         if awaiting:
             return
+        if self.broker is not None:
+            # 任务结束即作废该会话的审批豁免：豁免是"本任务内"的，留着就是跨任务放宽
+            self.broker.clear_session_grants(thread_id)
         if trace_id:
             # 任务结束才释放该链路的 Tracer（不释放它持有的 Span 会在进程内常驻）
             cleanup_tracer(trace_id)
@@ -463,6 +466,10 @@ class HarnessService:
             # 计划与子任务状态机（运行详情 / 计划页的数据源）：含每个 TaskStep 的
             # 状态、分配、门结论、重试、依赖、验收标准、产物索引、计时。
             "plan": self._plan_to_dict(plan),
+            # 本任务当前生效的审批豁免（控制台据此显示"哪些工具已经不再询问"）
+            "session_grants": (
+                self.broker.list_session_grants(thread_id) if self.broker is not None else []
+            ),
         }
 
     @staticmethod
@@ -634,6 +641,10 @@ class HarnessService:
                 "requires_approval_tools": [
                     t["name"] for t in tools_view if t.get("requires_approval")
                 ],
+                # 进程内当前生效的会话豁免总条数（按会话清，故只能报总数）
+                "session_grants_active": (
+                    self.broker.session_grants_total if self.broker is not None else None
+                ),
             },
             "memory": memory_stats,
             "datasources": {"names": ds_names},
@@ -811,6 +822,18 @@ class HarnessService:
         except (ValueError, TypeError):
             return False
 
+    @staticmethod
+    def _normalize_remember(approved: bool, remember: Optional[str]) -> Optional[str]:
+        """归一 ``remember``：只接受与 ``approved`` 同向的 allow / deny，其余一律 None。
+
+        手写请求可能给出自相矛盾的组合（``approved=true`` + ``remember="deny"``）；不做猜测
+        —— 猜错就是一次权限提升。非法值也不报错，只是不授予：报错会把整张审批卡卡死。
+        """
+        value = (remember or "").strip().lower() or None
+        if value not in ("allow", "deny"):
+            return None
+        return value if (value == "allow") == bool(approved) else None
+
     async def submit_approval(
         self,
         thread_id: str,
@@ -819,6 +842,7 @@ class HarnessService:
         approver_principal: str = "",
         approver_name: str = "",
         approver_role: str = "",
+        remember: Optional[str] = None,
     ) -> dict:
         """提交审批决策并恢复图，返回提交后的状态快照。
 
@@ -828,7 +852,11 @@ class HarnessService:
         Args:
             approver_principal: 提交审批者的身份指纹（令牌 hash）。与任务**发起者身份**
                 相同则拒绝（职责分离：发起人不能自己批准自己触发的高危操作）。
-            approver_name/approver_role: 审批人展示名与角色，写入 APPROVAL_RESOLVED 事件。
+            approver_name/approver_role: 审批人展示名与角色，写入 APPROVAL_RESOLVED 事件；
+                同时随 resume 载荷交给节点 —— 节点据此记录"谁授予了会话豁免"。
+            remember: ``"allow"`` / ``"deny"`` 表示本任务内不再询问该工具；``None`` 表示只对
+                本次生效。必须与 ``approved`` 同向，否则按 ``None`` 处理（见
+                :meth:`_normalize_remember`）。
 
         Raises:
             PermissionError: 发起人试图审批自己发起的任务。
@@ -863,6 +891,9 @@ class HarnessService:
             task_id = payload.get("task_id")
             expires_at = payload.get("expires_at")
             trace_id = await self._trace_id(thread_id)
+            # 归一"本任务内不再询问"：非法值 / 与 approved 不同向一律当作只对本次生效。
+            # 放在过期判定之前 —— 过期的审批即便带了 remember 也不能放宽，由下面的分支拦。
+            remember = self._normalize_remember(approved, remember)
 
             # 图在 interrupt 时首个后台任务即结束并在 _done 里 unbind；resume 是新的
             # 一次 ainvoke，必须先重新绑定事件路由，否则下面的 RESOLVED 及恢复阶段的
@@ -894,7 +925,12 @@ class HarnessService:
                 comment=comment, expires_at=expires_at,
             )
 
-            resume = {"approved": approved, "comment": comment}
+            resume = {
+                "approved": approved, "comment": comment, "remember": remember,
+                # 审批人身份随载荷交给节点：授予会话豁免时要记下"谁放宽的"，
+                # 否则审计里只留下一条没有责任人的放宽记录。
+                "approver": approver_name or "", "approver_role": approver_role or "",
+            }
             # 后台驱动恢复（恢复后可能再次 interrupt 或跑完）；收尾协程会在再次暂停
             # 时保留绑定、到达终态时释放 tracer / 事件路由。
             resume_coro = self.graph.ainvoke(Command(resume=resume), self._config(thread_id))
