@@ -640,31 +640,22 @@ class HarnessService:
             "packages": await self.list_packages(),
         }
 
-    async def task_metrics(self, thread_id: str) -> Optional[dict]:
-        """单会话运行指标（控制台「指标」页）；任务不存在返回 None。
+    @staticmethod
+    def _aggregate_audit(records: list[dict]) -> dict:
+        """把审计记录聚合成指标页用的统计。
 
-        各指标的**可信时间跨度不同**，逐项标 scope，前端不能把它们当成同一口径：
-        - audit：本地审计 JSONL 按 session 聚合，**持久、重启保留**（调用量 / 成败 /
-          PDP 拒绝 / 缓存命中 / 沙箱 / 审批标记 / 时延）。
-        - guard_events：全局事件观察者的**进程内**计数，覆盖 PDP 之外的全部管控层
-          （限流 / 熔断 / 行列权限 / 沙箱 / 审批），重启清零，但任务终态后仍保留。
-        - context.settled：该会话的大结果沉淀引用（进程内）；context.totals / cache /
-          tokens 是组件单例的**进程累计**，并非按会话切分（计数器本身没有会话维度）。
+        只统计**工具调用**记录：``approval_grant`` 是会话豁免的授予 / 使用留痕，不是一次
+        调用，计进去会让 ``succeeded + failed == total`` 破掉。缺 ``event`` 字段的行按
+        工具调用处理 —— 升级前写下的审计行没有这个字段。
         """
-        await self._ensure_ready()
-        status = await self.get_status(thread_id)
-        if status is None:
-            return None
-
-        # ---- 1) 审计：持久、按会话 ----
-        audit = getattr(self.broker, "audit", None) if self.broker else None
-        records = audit.query(session_id=thread_id) if audit is not None else []
         agg: dict[str, Any] = {
             "total": 0, "succeeded": 0, "failed": 0, "pdp_denied": 0,
             "cache_hits": 0, "sandbox_used": 0, "approval_required": 0,
             "duration_ms_total": 0, "by_tool": {},
         }
         for r in records:
+            if r.get("event", "tool_call") != "tool_call":
+                continue
             agg["total"] += 1
             if r.get("result_ok") is True:
                 agg["succeeded"] += 1
@@ -692,6 +683,28 @@ class HarnessService:
         agg["duration_ms_avg"] = (
             round(agg["duration_ms_total"] / agg["total"], 1) if agg["total"] else 0
         )
+        return agg
+
+    async def task_metrics(self, thread_id: str) -> Optional[dict]:
+        """单会话运行指标（控制台「指标」页）；任务不存在返回 None。
+
+        各指标的**可信时间跨度不同**，逐项标 scope，前端不能把它们当成同一口径：
+        - audit：本地审计 JSONL 按 session 聚合，**持久、重启保留**（调用量 / 成败 /
+          PDP 拒绝 / 缓存命中 / 沙箱 / 审批标记 / 时延）。
+        - guard_events：全局事件观察者的**进程内**计数，覆盖 PDP 之外的全部管控层
+          （限流 / 熔断 / 行列权限 / 沙箱 / 审批），重启清零，但任务终态后仍保留。
+        - context.settled：该会话的大结果沉淀引用（进程内）；context.totals / cache /
+          tokens 是组件单例的**进程累计**，并非按会话切分（计数器本身没有会话维度）。
+        """
+        await self._ensure_ready()
+        status = await self.get_status(thread_id)
+        if status is None:
+            return None
+
+        # ---- 1) 审计：持久、按会话 ----
+        audit = getattr(self.broker, "audit", None) if self.broker else None
+        records = audit.query(session_id=thread_id) if audit is not None else []
+        agg = self._aggregate_audit(records)
 
         # ---- 2) GUARD / 审批：进程内事件聚合（不随终态清空）----
         with self._metrics_lock:

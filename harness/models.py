@@ -196,6 +196,9 @@ class AuditRecord(BaseModel):
     approval_required: bool = False                # 是否需要审批
     approval_id: Optional[str] = None              # 关联的审批请求 ID
     cache_hit: bool = False                        # 结果是否来自工具结果缓存
+    #: 记录类型：``tool_call``（默认）| ``approval_grant``（会话豁免的授予 / 使用）。
+    #: 指标聚合按它分流 —— 豁免不是一次调用，不该计入调用数与成败比。
+    event: str = "tool_call"
     timestamp: datetime = Field(default_factory=datetime.now)
 
 

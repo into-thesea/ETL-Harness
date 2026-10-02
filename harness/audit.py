@@ -183,12 +183,65 @@ class AuditLogger:
             approval_required=approval_required,
             approval_id=approval_id,
             cache_hit=cache_hit,
+            event="tool_call",
         )
 
         # Pydantic 模型序列化为可 JSON 化的 dict（datetime 转 ISO 字符串）
         data = record.model_dump(mode="json")
 
         # 本地始终落地，Kafka 尽力上报；两者都不允许抛出影响主流程
+        self._write_local(data)
+        self._send_kafka(data)
+        return record.audit_id
+
+    def record_approval_grant(
+        self,
+        *,
+        tool_name: str,
+        session_id: str,
+        effect: str,
+        applied: bool = False,
+        granted_by: str = "",
+        granted_role: str = "",
+        comment: str = "",
+        request_id: str = "",
+        grant_id: str = "",
+        agent_id: str = "unknown",
+        role: str = "default",
+        trace_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """记录一次会话豁免的**授予**（``applied=False``）或**使用**（``applied=True``）。
+
+        与工具调用分成两种记录类型（``event="approval_grant"``），因为聚合口径不同：
+        它不是一次调用，不计入调用数与成败比（聚合处按 ``event`` 分流）。
+
+        豁免不涉及参数，因此连哈希都不带 —— 沿用"审计不存参数原文"的纪律。
+        """
+        if not self.enabled:
+            return None
+
+        record = AuditRecord(
+            trace_id=trace_id,
+            session_id=session_id or "unknown",
+            agent_id=agent_id or "unknown",
+            tool_name=tool_name,
+            args_hash=self.hash_args(None),
+            pdp_decision="allow" if effect == "allow" else "deny",
+            approval_required=True,
+            approval_id=grant_id or None,
+            event="approval_grant",
+        )
+        data = record.model_dump(mode="json")
+        # 以下几项不在 AuditRecord 上：授予/使用的区分与归因，按需落在记录里
+        data.update({
+            "applied": bool(applied),
+            "grant_effect": effect,
+            "granted_by": granted_by,
+            "granted_role": granted_role,
+            "comment": comment,
+            "request_id": request_id,
+            "role": role,
+        })
         self._write_local(data)
         self._send_kafka(data)
         return record.audit_id
