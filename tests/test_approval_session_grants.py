@@ -476,3 +476,39 @@ def test_http_approval_endpoint_forwards_remember() -> None:
                         json={"approved": True, "comment": "免问", "remember": "allow"})
     assert r.status_code == 200, r.text
     assert seen.get("remember") == "allow"
+
+
+# ======================================================================
+# Task 7：端到端 —— 第二次不再弹卡
+# ======================================================================
+def test_end_to_end_second_request_skips_interrupt(monkeypatch, tmp_path) -> None:
+    """同任务内同一高危工具提请两次：第一次弹卡并授予 allow，第二次不再弹卡。"""
+    reset_event_bus()
+    broker = _broker_with_audit(tmp_path)
+    nodes = _nodes(broker)
+    interrupts: list[dict] = []
+
+    def _fake_interrupt(payload):
+        interrupts.append(payload)
+        return {"approved": True, "comment": "免问", "remember": "allow",
+                "approver": "管理员A", "approver_role": "admin"}
+
+    monkeypatch.setattr("harness.nodes.interrupt", _fake_interrupt)
+    state = {"session_id": "thread-1", "agent_id": "a1", "trace_id": "t1",
+             "role": "analyst", "task_id": "task-1"}
+
+    # 第一次：弹卡 + 授予
+    ok1, _, cred1 = nodes._request_tool_approval("danger", {"code": "print(1)"}, state, {})
+    assert ok1 is True and len(interrupts) == 1
+    assert "via" not in cred1, "本次是人工批准，不是豁免放行"
+
+    # 第二次：同一工具、不同参数 —— 豁免是工具级，仍然不再问
+    ok2, _, cred2 = nodes._request_tool_approval("danger", {"code": "print(2)"}, state, {})
+    assert ok2 is True
+    assert len(interrupts) == 1, "第二次不应该再弹卡"
+    assert cred2["via"] == "session_grant"
+
+    # 凭证能真正解锁 Broker 的凭证闸门
+    ok3, text, _ = broker.invoke("danger", {"code": "print(2)"}, {
+        "role": "analyst", "session_id": "thread-1", "approval": cred2})
+    assert ok3 is True, text

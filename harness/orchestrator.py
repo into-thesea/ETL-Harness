@@ -606,7 +606,9 @@ class PlanExecuteNodes:
             description=conclusion_head[:200],
         )
         raw_decision = interrupt(payload)
-        approved, comment = ReActNodes._parse_approval(raw_decision)
+        # 质量门没有"工具"这一维，会话豁免（键 = (session_id, tool)）不适用，
+        # 因此这里刻意丢弃 remember —— 它只对工具审批有意义。
+        approved, comment, _remember = ReActNodes._parse_approval(raw_decision)
 
         if approved:
             self.store.mark_completed(
