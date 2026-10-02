@@ -875,16 +875,29 @@ class ScopedBroker:
             ctx["role"] = self.force_role
         return self._inner.authorize(tool_name, ctx)
 
-    # ---- 会话豁免：只读转发 ----
-    # 子 Agent 必须读得到父任务授予的豁免（键是 session_id，与是否受限视图无关）；
-    # 但**不转发** grant_session_approval / clear_session_grants —— 授予只发生在节点层
-    # （人类决定的落点），子 Agent 不得给自己开豁免、也不得清空父任务的豁免。
+    # ---- 会话豁免 ----
+    # 子 Agent 的子图里跑的也是 ReActNodes，它的 self.broker 就是这个受限视图 ——
+    # 所以授予**必须**经这里透传，否则节点层根本授予不了（异常还会被图运行器吞掉，
+    # 表现为"每次重新弹卡"）。这不会让子 Agent 给自己开豁免：授予的入参只来自
+    # `interrupt()` 返回的人工决定，模型的输出到不了这个方法。
+    # 受限之处在于作用域：只能授予本视图白名单内的工具。
     def apply_session_grant(
         self, session_id: str, tool_name: str, **kwargs: Any
     ) -> Optional[dict[str, Any]]:
         if not self._is_allowed(tool_name):
             return None
         return self._inner.apply_session_grant(session_id, tool_name, **kwargs)
+
+    def grant_session_approval(
+        self, session_id: str, tool_name: str, effect: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        if not self._is_allowed(tool_name):
+            allowed = "*" if self._all else ", ".join(sorted(self._allowed)) or "(无)"
+            raise PermissionError(
+                f"工具 '{tool_name}' 不在当前子 Agent 的白名单内（可用：{allowed}），"
+                "不能为它授予会话豁免"
+            )
+        return self._inner.grant_session_approval(session_id, tool_name, effect, **kwargs)
 
     def list_session_grants(self, session_id: str) -> list[dict[str, Any]]:
         return self._inner.list_session_grants(session_id)

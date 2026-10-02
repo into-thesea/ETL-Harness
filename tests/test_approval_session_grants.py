@@ -10,6 +10,9 @@ PDP（``authorize``）与沙箱永不被豁免；豁免按 ``(session_id, tool)`
 
 from __future__ import annotations
 
+import json
+import time
+
 import pytest
 
 from harness.audit import AuditLogger
@@ -166,8 +169,9 @@ def test_grant_cannot_override_pdp_denial(tmp_path) -> None:
     assert ok is False, "持有凭证 + 有豁免，也不能越过 PDP"
 
 
-def test_scoped_broker_reads_parent_grant_but_cannot_grant(tmp_path) -> None:
-    """子 Agent 读得到父任务的豁免；但它自己不能授予（授予是节点层的事）。"""
+def test_scoped_broker_reads_and_grants_within_scope_only(tmp_path) -> None:
+    """受限视图：读得到父任务的豁免；授予**必须**透传（节点层就在子图里跑），
+    但只能授予白名单内的工具。"""
     reset_event_bus()
     from harness.tool_broker import ScopedBroker
 
@@ -177,8 +181,15 @@ def test_scoped_broker_reads_parent_grant_but_cannot_grant(tmp_path) -> None:
 
     assert scoped.apply_session_grant("s1", "danger") is not None
     assert scoped.list_session_grants("s1")[0]["effect"] == "allow"
-    assert not hasattr(scoped, "grant_session_approval"), "子 Agent 不得自我授予"
-    assert not hasattr(scoped, "clear_session_grants"), "子 Agent 不得清空豁免"
+
+    # 白名单内可授予（子图的 ReActNodes 靠它把人工决定落成豁免）
+    scoped.grant_session_approval("s1", "danger", "deny")
+    assert broker.list_session_grants("s1")[0]["effect"] == "deny"
+
+    # 白名单外不得授予：受限视图不能给越界工具开豁免
+    with pytest.raises(PermissionError):
+        scoped.grant_session_approval("s1", "echo", "allow")
+    assert not hasattr(scoped, "clear_session_grants"), "清理只在任务收尾（service 层）"
 
 
 # ======================================================================
@@ -512,3 +523,130 @@ def test_end_to_end_second_request_skips_interrupt(monkeypatch, tmp_path) -> Non
     ok3, text, _ = broker.invoke("danger", {"code": "print(2)"}, {
         "role": "analyst", "session_id": "thread-1", "approval": cred2})
     assert ok3 is True, text
+
+
+# ======================================================================
+# Task 8：图级别端到端（真实 HTTP + 真实 LangGraph interrupt）
+# ======================================================================
+class _TwiceApprovalLLM(ApprovalLLM):
+    """像 ApprovalLLM，但在同一个子任务里**连问两次** code_executor。
+
+    既有 ApprovalLLM 每任务只问一次，覆盖不到"第二次不再弹卡"。
+    """
+
+    def chat(self, messages, temperature=None):
+        system = messages[0]["content"] if messages else ""
+        if "报告汇总者" in system:
+            return "最终报告：代码环节已处理。"
+
+        n_obs = sum(
+            1 for m in messages
+            if isinstance(m, dict) and m.get("role") == "user"
+            and str(m.get("content", "")).startswith("Observation")
+        )
+        if "（analyst）" in system and n_obs < 2:
+            return json.dumps(
+                {"thought": "再跑一次代码", "action": "code_executor",
+                 "action_input": {"code": f"print({n_obs})"}},
+                ensure_ascii=False,
+            )
+
+        last = ""
+        for m in reversed(messages):
+            if (isinstance(m, dict) and m.get("role") == "user"
+                    and str(m.get("content", "")).startswith("Observation")):
+                last = str(m["content"])
+                break
+        return json.dumps({"final_answer": last[:500]}, ensure_ascii=False)
+
+
+def _poll_http(client, tid: str, timeout: float = 90.0):
+    """轮询任务状态，返回 (最终快照, 是否又停在了审批)。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st = client.get(f"/api/v1/tasks/{tid}").json()
+        if st["status"] == "awaiting_approval":
+            return st, True
+        if st["status"] in ("finished", "failed"):
+            return st, False
+        time.sleep(0.2)
+    raise AssertionError("轮询超时")
+
+
+def test_http_end_to_end_second_call_not_asked(monkeypatch, tmp_path) -> None:
+    """整条链路：同一任务里 code_executor 被请两次 —— 授予"总是允许"后第二次不再弹卡。
+
+    这条走真实 HTTP（TestClient / ASGI）+ 真实 LangGraph interrupt，是本功能最强的
+    自动化验证。沙箱不可用时 code_executor 会 fail closed，但**不影响**审批闸门的观测：
+    两种情况下"第二次是否弹卡"都由豁免决定。
+    """
+    from fastapi.testclient import TestClient
+
+    from harness.server.app import create_app
+
+    # 不注入 checkpointer：让首次请求在应用循环内装配（与既有服务用例一致）
+    svc = HarnessService(llm=_TwiceApprovalLLM())
+    with TestClient(create_app(svc)) as client:
+        tid = client.post("/api/v1/tasks", json={"goal": "运行代码"}).json()["thread_id"]
+
+        first, paused = _poll_http(client, tid)
+        assert paused, f"第一次调用应停在审批，实际 {first['status']}"
+        payload = first["pending_approvals"][0]["payload"]
+        assert payload["tool"] == "code_executor"
+
+        r = client.post(f"/api/v1/tasks/{tid}/approval",
+                        json={"approved": True, "comment": "本任务内免问", "remember": "allow"})
+        assert r.status_code == 200, r.text
+
+        # resume 是异步的：先等状态**离开**暂停态，否则会把"还没恢复"误读成"又弹了一次卡"
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if client.get(f"/api/v1/tasks/{tid}").json()["status"] != "awaiting_approval":
+                break
+            time.sleep(0.1)
+
+        final, paused_again = _poll_http(client, tid)
+        assert not paused_again, "授予豁免后，第二次调用仍然弹了审批卡"
+        assert final["status"] == "finished", final
+
+    # 审计留痕：一次"授予" + 至少一次"命中使用"
+    rows = svc.broker.audit.query(session_id=tid)
+    granted = [r for r in rows if r.get("event") == "approval_grant" and not r.get("applied")]
+    used = [r for r in rows if r.get("event") == "approval_grant" and r.get("applied")]
+    assert granted and granted[0]["tool_name"] == "code_executor"
+    assert granted[0]["grant_effect"] == "allow"
+    assert used, "第二次调用是靠豁免放行的，必须留下一条命中的痕"
+
+
+def test_http_end_to_end_without_effective_grant_asks_again(monkeypatch) -> None:
+    """反向对照：豁免**没生效**时，第二次仍然弹卡。
+
+    没有这条，"第二次不弹卡"的正向断言可能只是因为流程根本没走到第二次调用 ——
+    它证明这条链路上确实存在第二次提请。
+    """
+    from fastapi.testclient import TestClient
+
+    from harness.server.app import create_app
+    from harness.tool_broker import ToolBroker
+
+    # 让豁免永远读不命中：等价于"授予没生效"
+    monkeypatch.setattr(ToolBroker, "apply_session_grant",
+                        lambda self, session_id, tool_name, **kw: None)
+
+    svc = HarnessService(llm=_TwiceApprovalLLM())
+    with TestClient(create_app(svc)) as client:
+        tid = client.post("/api/v1/tasks", json={"goal": "运行代码"}).json()["thread_id"]
+        _first, paused = _poll_http(client, tid)
+        assert paused, "对照组本身就应当先停一次审批"
+
+        client.post(f"/api/v1/tasks/{tid}/approval",
+                    json={"approved": True, "comment": "免问", "remember": "allow"})
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if client.get(f"/api/v1/tasks/{tid}").json()["status"] != "awaiting_approval":
+                break
+            time.sleep(0.1)
+
+        _final, paused_again = _poll_http(client, tid)
+        assert paused_again, "豁免未生效时应当再次弹卡 —— 否则正向用例是空转的"

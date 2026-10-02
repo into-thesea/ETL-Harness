@@ -383,6 +383,15 @@
       ].filter(function (kv) { return kv[1]; })
         .map(function (kv) { return "<dt>" + esc(kv[0]) + '</dt><dd class="mono">' + esc(kv[1]) + "</dd>"; }).join("");
       var card = el("div", "approval");
+      // "本任务内不再询问"只对**工具审批**有意义：豁免的键是 (会话, 工具)，质量门没有
+      // 工具这一维（服务端也会丢弃它的 remember）。所以 gate 卡片不给这两个按钮 ——
+      // 给了就是点了没用。
+      var rememberRow = kind === "gate" ? "" :
+        '<div class="row" style="margin-top:6px">' +
+          '<span class="small dim" style="flex:1">本任务内不再询问 <code class="mono">' +
+            esc(p.tool || "该动作") + '</code>：</span>' +
+          '<button class="btn ghost sm" data-act="always-allow">总是允许</button>' +
+          '<button class="btn ghost sm" data-act="always-deny">总是拒绝</button></div>';
       card.innerHTML =
         '<div class="h">' + kindChip + "<strong>" + esc(title) + "</strong>" +
         '<span class="spacer"></span><span class="small dim">会话 ' + esc(id.slice(0, 8)) + "</span></div>" +
@@ -391,16 +400,27 @@
         (args ? "<pre>" + esc(typeof args === "string" ? args : JSON.stringify(args, null, 2)) + "</pre>" : "") +
         '<div class="row"><input class="input grow" placeholder="审批意见（驳回时建议填写原因）" />' +
         '<button class="btn success" data-act="approve">✓ 批准执行</button>' +
-        '<button class="btn danger" data-act="reject">✕ 驳回</button></div>';
+        '<button class="btn danger" data-act="reject">✕ 驳回</button></div>' +
+        rememberRow;
       var input = card.querySelector("input");
-      card.querySelector('[data-act="approve"]').onclick = function () { decide(id, true, input.value, card); };
-      card.querySelector('[data-act="reject"]').onclick = function () { decide(id, false, input.value, card); };
+      card.querySelector('[data-act="approve"]').onclick = function () { decide(id, true, input.value, card, null); };
+      card.querySelector('[data-act="reject"]').onclick = function () { decide(id, false, input.value, card, null); };
+      ['always-allow', 'always-deny'].forEach(function (act) {
+        var b = card.querySelector('[data-act="' + act + '"]');
+        if (b) b.onclick = function () {
+          decide(id, act === "always-allow", input.value, card,
+                 act === "always-allow" ? "allow" : "deny");
+        };
+      });
       return card;
     }
 
-    function decide(id, approved, comment, card) {
+    function decide(id, approved, comment, card, remember) {
       card.querySelectorAll("button").forEach(function (b) { b.disabled = true; });
-      api("/tasks/" + encodeURIComponent(id) + "/approval", { method: "POST", body: { approved: approved, comment: comment } })
+      api("/tasks/" + encodeURIComponent(id) + "/approval", {
+        method: "POST",
+        body: { approved: approved, comment: comment, remember: remember || null },
+      })
         .then(function () { toast(approved ? "已批准，任务继续执行" : "已驳回", "info"); load(); })
         .catch(function (e) {
           toast("审批提交失败：" + e.message, "err");
@@ -475,6 +495,7 @@
     var c = $("#content");
     c.innerHTML =
       '<div class="tiles" id="head-tiles"></div>' +
+      '<div id="grants"></div>' +
       '<div class="panel"><div class="panel-head"><h2>子任务状态机</h2><span class="spacer"></span>' +
         '<span class="small dim" id="plan-progress"></span></div><div class="panel-body" id="steps"><div class="empty">加载中…</div></div></div>' +
       '<div class="panel hidden" id="approval-panel"><div class="panel-head"><h2>待审批</h2></div><div class="panel-body" id="approvals"></div></div>' +
@@ -526,6 +547,19 @@
           $("#approvals").appendChild(card);
         });
       } else { ap.classList.add("hidden"); }
+
+      // 本任务内已生效的审批豁免：一次静默放宽，必须一眼可见（不是藏在卡片里的开关）
+      var grantsBox = $("#grants");
+      if (grantsBox) {
+        var grants = s.session_grants || [];
+        grantsBox.innerHTML = grants.length
+          ? '<div class="banner info"><strong>本任务内已豁免：</strong>' + grants.map(function (g) {
+              return '<code class="mono">' + esc(g.tool) + "</code>（" +
+                (g.effect === "allow" ? "不再询问，直接放行" : "不再询问，直接拒绝") +
+                (g.granted_by ? "，由 " + esc(g.granted_by) + " 授予" : "") + "）";
+            }).join("、") + "</div>"
+          : "";
+      }
       $("#final").innerHTML =
         s.final_answer ? '<pre class="json" style="white-space:pre-wrap;font-family:var(--sans);max-height:none">' + esc(s.final_answer) + "</pre>"
         : s.error ? '<div class="banner err">' + esc(s.error) + "</div>"
