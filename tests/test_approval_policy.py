@@ -276,6 +276,114 @@ def test_illegal_threshold_config_fails_at_startup() -> None:
     assert tuned.approval_deny_threshold == "high", "部署方可以调低拒绝线"
 
 
+# ======================================================================
+# Task 4：无人审批的两个问题
+# ======================================================================
+def _service_with_approval_tool(monkeypatch, **server_overrides):
+    """一个装配后会挂上『需审批工具』的服务（用于启动一致性检查）。"""
+    from harness.config import settings
+    from harness.server.service import HarnessService
+    from tests._smoke_server import ApprovalLLM
+    from tests.test_console_api import _memory_saver
+
+    for key, value in server_overrides.items():
+        monkeypatch.setattr(settings.server, key, value)
+    return HarnessService(checkpointer=_memory_saver(), llm=ApprovalLLM(), auto_assemble=False)
+
+
+def test_missing_approval_channel_fails_at_assembly(monkeypatch) -> None:
+    """有需审批工具却没回答"这个部署有没有人审" → 直接装配失败。"""
+    svc = _service_with_approval_tool(monkeypatch, approval_channel=None)
+    with pytest.raises(RuntimeError, match="SERVER_APPROVAL_CHANNEL"):
+        svc.assemble()
+
+
+def test_channel_none_with_approval_tools_is_a_contradiction(monkeypatch) -> None:
+    """声明无人值守、却挂着需审批的工具 —— 自相矛盾，别启。"""
+    svc = _service_with_approval_tool(monkeypatch, approval_channel="none")
+    with pytest.raises(RuntimeError, match="自相矛盾"):
+        svc.assemble()
+
+
+def test_channel_http_assembles_normally(monkeypatch) -> None:
+    svc = _service_with_approval_tool(monkeypatch, approval_channel="http")
+    assert svc.assemble() is not None
+
+
+def test_illegal_approval_channel_fails_fast() -> None:
+    from pydantic import ValidationError
+
+    from harness.config import ServerSettings
+
+    with pytest.raises(ValidationError):
+        ServerSettings(approval_channel="yes")
+
+
+def test_illegal_unattended_mode_fails_at_startup() -> None:
+    """配置写错必须启动即报错，不能静默回落到某种行为。"""
+    from pydantic import ValidationError
+
+    from harness.config import ServerSettings
+
+    with pytest.raises(ValidationError):
+        ServerSettings(approval_unattended="never")
+
+
+def _sweep_scenario(expires_at: str):
+    """装配一个 service，把待审批项固定为一条 expires_at 给定的记录。"""
+    import asyncio
+    from harness.server.service import HarnessService
+    from tests._smoke_server import ApprovalLLM
+    from tests.test_console_api import _memory_saver
+
+    async def scenario():
+        svc = HarnessService(checkpointer=_memory_saver(), llm=ApprovalLLM(),
+                             auto_assemble=False)
+        await svc._ensure_ready()
+        svc.assemble()
+        calls = []
+
+        async def _list_tasks(limit=100):
+            return [{"thread_id": "t1", "status": "awaiting_approval"}]
+
+        async def _get_status(tid):
+            return {"thread_id": tid, "status": "awaiting_approval",
+                    "pending_approvals": [{"interrupt_id": "i1",
+                                           "payload": {"expires_at": expires_at, "tool": "danger"}}]}
+
+        async def _submit(tid, approved, comment="", **kw):
+            calls.append((tid, approved, comment))
+            return {"thread_id": tid, "status": "running", "goal": "g", "pending_approvals": []}
+
+        svc.list_tasks, svc.get_status, svc.submit_approval = _list_tasks, _get_status, _submit
+        return await svc.sweep_expired_approvals(), calls
+
+    return asyncio.run(scenario())
+
+
+def test_sweep_auto_rejects_expired_approval() -> None:
+    """挂账 #16：没人处理的审批，超时后必须**由系统自己**驳回并推进。"""
+    from datetime import datetime, timedelta
+
+    past = (datetime.now() - timedelta(seconds=1)).isoformat()
+    handled, calls = _sweep_scenario(past)
+
+    assert handled == 1
+    assert calls and calls[0][0] == "t1" and calls[0][1] is False, "必须自动驳回，不是批准"
+    assert "超时" in calls[0][2]
+
+
+def test_sweep_leaves_unexpired_alone() -> None:
+    """没到期的不能动 —— 否则人工审批就被系统抢答了。"""
+    from datetime import datetime, timedelta
+
+    future = (datetime.now() + timedelta(hours=1)).isoformat()
+    handled, calls = _sweep_scenario(future)
+
+    assert handled == 0
+    assert calls == []
+
+
 @pytest.fixture
 def bus():
     fresh = EventBus()

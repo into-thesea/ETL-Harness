@@ -19,7 +19,24 @@
 | Kafka | 不启用（审计落 `audit.jsonl`） | 不启用 | 启用（审计 + trace 上送） |
 | Trace 出口 | `local`（JSONL + 轮转） | `local` | `kafka` |
 | Milvus / MinIO | 不启用 | 不启用 | 启用 |
+| 审批通道 | `SERVER_APPROVAL_CHANNEL=http` | `http` | `http` |
 | 适用 | 开发、演示、单机交付 | 小规模生产 | 多租户 / 大规模 |
+
+### 审批通道（三档都要回答）
+
+挂有需审批工具（`requires_approval=True`，本仓库自带的是 `code_executor`）时，
+`SERVER_APPROVAL_CHANNEL` **没有默认值** —— 不配置（或配成 `none`）会**启动即失败**。
+这不是拦人：它把"将来会不会有人来审"这个不可知的问题，换成"有没有接审批通道"
+这个可声明的配置事实。三档的取值：
+
+- **Dev**：`http` —— 本机开发也要有人审，别把高风险工具放成无人值守；
+- **Standard**：`http` —— 服务的审批端点已随 FastAPI 起在同一进程；
+- **Scale**：`http`（多副本同样接审批端点）。若确实要跑无人值守的批处理，
+  则该部署不应挂需审批工具，或把它们改成可自动放行的（注册风险策略 + 沙箱兜底）。
+
+`SERVER_APPROVAL_UNATTENDED` 默认 `auto_reject`：超过 `expires_at` 仍无人处理，
+后台清扫会**自动驳回**并推进任务。**不要图省事改成 `block`** —— 没人处理时任务会永远
+停在 `awaiting_approval`（进程活着、日志干净、不结束），这是最难被发现的一类失败。
 
 ---
 

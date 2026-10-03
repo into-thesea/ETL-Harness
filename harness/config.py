@@ -173,6 +173,49 @@ class ServerSettings(BaseSettings):
             )
         return value
 
+    # ------------------------------------------------------------------
+    # 无人值守：两个问题、两个配置
+    # ------------------------------------------------------------------
+    approval_channel: Optional[str] = None
+    """这个部署**有没有**审批通道：``"http"``（有人审）| ``"none"``（明确无人值守）。
+
+    **不设默认值** —— 默认值一旦存在，就等于没人回答过"这个部署有没有人审"。
+    存在需审批工具却未配置（或配成 ``none``）时**装配即失败**。
+    """
+
+    approval_unattended: str = "auto_reject"
+    """有通道但一直没人应怎么办：``auto_reject``（超时自动驳回并推进图）| ``block``（一直等）。
+
+    默认不是 ``block``：没人处理时任务会永远停在 ``awaiting_approval``（进程活着、
+    日志干净、不结束），这是最难被发现的一类失败。选 ``block`` 会打 WARNING。
+    """
+
+    approval_sweep_seconds: int = 30
+    """``auto_reject`` 的清扫间隔（秒）。"""
+
+    @field_validator("approval_channel")
+    @classmethod
+    def _check_approval_channel(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        v = str(value).strip().lower()
+        if v not in ("http", "none"):
+            raise ValueError(
+                f"SERVER_APPROVAL_CHANNEL 取值非法：{value!r}（只支持 http | none，或不配置）"
+            )
+        return v
+
+    @field_validator("approval_unattended")
+    @classmethod
+    def _check_approval_unattended(cls, value: str) -> str:
+        allowed = ("auto_reject", "block")
+        v = str(value).strip().lower()
+        if v not in allowed:
+            raise ValueError(
+                f"SERVER_APPROVAL_UNATTENDED 取值非法：{value!r}（只支持 {' | '.join(allowed)}）"
+            )
+        return v
+
 
 class SandboxSettings(BaseSettings):
     """安全沙箱配置（OpenSandbox 控制面 + Docker 容器隔离）。

@@ -186,6 +186,9 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/tasks/$THREA
 | PII 脱敏 | `PII_ENABLED` | 开 | 识别身份证/手机号/银行卡并替换为占位符 |
 | 数据质量门 | `QUALITY_DATA_CHECK_ENABLED` | 开 | 缺失率/重复率超红线即暂停待确认，子任务由 Critic 质检 |
 | 审批持久化 | `CHECKPOINT_BACKEND` | sqlite | 中断状态落盘，重启可续；`memory` 则重启即丢 |
+| 审批通道 | `SERVER_APPROVAL_CHANNEL` | **无默认** | `http`（有人审）/ `none`（无人值守）。挂有需审批工具时**必填**，否则启动失败 —— 强迫把"这个部署有没有人审"说出口 |
+| 无人应审批 | `SERVER_APPROVAL_UNATTENDED` | `auto_reject` | 超时无人处理时自动驳回并推进；`block` 则一直等（会打 WARNING） |
+| 风险阈值 | `SERVER_APPROVAL_THRESHOLD` / `SERVER_APPROVAL_DENY_THRESHOLD` | `medium` / `critical` | 高过前者问人，达到后者直接拒；两条线都由部署方配 |
 | 多数据源 | `DATASOURCE_SOURCES` | 空 | 配置命名 MySQL/PG 源，`sql_query` 按需切换 |
 | 对象存储 | `MINIO_ENABLED` | 关 | VFS 大文件落 MinIO；默认落本地磁盘（`VFS_LOCAL_ROOT`） |
 

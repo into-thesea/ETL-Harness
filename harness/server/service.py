@@ -108,6 +108,19 @@ class HarnessService:
         else:
             self._ready = True
 
+        # 无人处理的审批必须有个**非人触发**的判定点，否则任务永远停在 awaiting_approval
+        # （进程活着、日志干净、不结束 —— 最难被发现的一类失败）。
+        from harness.config import settings
+
+        if settings.server.approval_unattended == "auto_reject":
+            # 守护任务：进程退出随之结束，不需要单独取消
+            asyncio.create_task(self._sweeper_loop())
+        else:
+            logger.warning(
+                "SERVER_APPROVAL_UNATTENDED=block：无人处理审批时任务会一直等待。"
+                "仅限有人值守的部署使用。"
+            )
+
     # ------------------------------------------------------------------
     # 装配（D16：服务层是正式装配点）
     # ------------------------------------------------------------------
@@ -225,9 +238,84 @@ class HarnessService:
             bus.add_global_listener(self._on_metric_event)
             self._metrics_bus = bus
 
+        # 领域包挂完了才知道有没有需审批的工具 —— 一致性检查必须在这之后。
+        self._check_approval_channel()
+
         self._ready = True
         logger.info("HarnessService assembled (checkpointer=%s)", type(self.checkpointer).__name__)
         return self.graph
+
+    def _check_approval_channel(self) -> None:
+        """启动一致性检查：有需审批工具，就必须明确回答"这个部署有没有审批通道"。
+
+        把"将来会不会有人来审"（**不可知**）换成"有没有接审批通道"（**可声明的配置事实**）。
+        默认值一旦存在就等于没人回答过这个问题，所以 ``SERVER_APPROVAL_CHANNEL`` 不设默认。
+        """
+        from harness.config import settings
+
+        approval_tools = [t.name for t in self.broker.list_tools() if t.requires_approval]
+        if not approval_tools:
+            return
+        channel = settings.server.approval_channel
+        if channel == "http":
+            return
+        if channel == "none":
+            raise RuntimeError(
+                f"存在需人工审批的工具 {approval_tools}，但 SERVER_APPROVAL_CHANNEL=none"
+                "（声明为无人值守）—— 二者自相矛盾：这些工具永远等不到审批。"
+                "请改为 http（本部署有人审），或去掉这些工具的 requires_approval / "
+                "为它们注册风险策略使其可自动放行。"
+            )
+        raise RuntimeError(
+            f"存在需人工审批的工具 {approval_tools}，但未配置 SERVER_APPROVAL_CHANNEL。"
+            '请明确回答这个部署有没有人审：设为 "http"（有人审）或 "none"（无人值守）。'
+        )
+
+    async def sweep_expired_approvals(self) -> int:
+        """扫一遍：把已过期仍无人处理的待审批项**自动驳回**（返回处理条数）。
+
+        一次调用只做一遍，不做调度 —— 便于测试直接驱动；调度在 :meth:`_sweeper_loop`。
+        判据复用 ``_is_approval_expired``，与"晚到的审批人想批准会被 409"同源。
+        """
+        if self.broker is None:
+            return 0
+        handled = 0
+        try:
+            rows = await self.list_tasks()
+        except Exception:  # noqa: BLE001 - 清扫失败不该影响主流程
+            logger.exception("清扫过期审批：列举任务失败")
+            return 0
+        for row in rows:
+            tid = row.get("thread_id")
+            try:
+                status = await self.get_status(tid)
+                if not status or status.get("status") != "awaiting_approval":
+                    continue
+                pending = status.get("pending_approvals") or []
+                if not pending:
+                    continue
+                expires_at = (pending[0].get("payload") or {}).get("expires_at")
+                if not self._is_approval_expired(expires_at):
+                    continue
+                await self.submit_approval(
+                    tid, False,
+                    comment="超时无人处理，系统自动驳回（SERVER_APPROVAL_UNATTENDED=auto_reject）",
+                )
+                handled += 1
+            except Exception:  # noqa: BLE001 - 单个任务出错不拖垮其余
+                logger.exception("清扫过期审批失败：%s", tid)
+        if handled:
+            logger.info("自动驳回了 %d 个超时未处理的审批", handled)
+        return handled
+
+    async def _sweeper_loop(self) -> None:
+        """按配置间隔反复清扫；仅在 ``auto_reject`` 模式下启动。"""
+        from harness.config import settings
+
+        interval = max(1, int(settings.server.approval_sweep_seconds))
+        while True:
+            await asyncio.sleep(interval)
+            await self.sweep_expired_approvals()
 
     def _empty_guard_metrics(self) -> dict:
         return {

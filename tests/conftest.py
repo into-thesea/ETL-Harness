@@ -29,6 +29,11 @@ os.environ.setdefault("CHECKPOINT_BACKEND", "memory")
 # **鉴权本身**由 tests/test_server_auth.py 显式打开后专项覆盖（401/403/角色来源）。
 os.environ.setdefault("AUTH_ENABLED", "false")
 
+# 审批通道默认按"有人审"装配：这条检查的价值在于**强迫真实部署把它说出口**，
+# 而测试环境本来就有人（或有意无人）—— 逐条用例若都要先回答一次，噪声大于收益。
+# **检查本身**由 tests/test_approval_policy.py 显式改这两个值后专项覆盖。
+os.environ.setdefault("SERVER_APPROVAL_CHANNEL", "http")
+
 # 默认显式禁用长期记忆的 Embedding：否则每次服务装配都会加载本地 bge 模型（几百 MB、
 # 首次数秒），同一进程多次装配还会触发 torch/sentence-transformers 的原生访问违例
 # （挂账 #1）。控制台/编排/服务层用例不需要真实向量；**本地嵌入本身**由
