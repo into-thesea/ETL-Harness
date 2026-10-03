@@ -114,8 +114,16 @@ def real_llm_factory() -> LLMFactory:
 # ----------------------------------------------------------------------
 # 图构建（同步，与 examples.data_analysis_demo 同一装配方式）
 # ----------------------------------------------------------------------
-def build_graph(llm: Any) -> Any:
-    """构造一次完整的顶层 Plan-and-Execute 编译图（同步内核）。"""
+_DEFAULT_CM = object()   # 哨兵：区分"没传"（用默认配置造一个）与"显式传 None"（禁用）
+
+
+def build_graph(llm: Any, *, context_manager: Any = _DEFAULT_CM) -> Any:
+    """构造一次完整的顶层 Plan-and-Execute 编译图（同步内核）。
+
+    ``context_manager``：不传 = 按默认配置造一个；传 ``None`` = **禁用**（对照实验的
+    对照组）；传实例 = 用这个（调用方拿得到它的 :class:`ContextStats`）。
+    对照实验见 ``scripts/context_ab.py``。
+    """
     broker = ToolBroker(audit_logger=get_audit_logger())
     register_builtin_tools(broker)
     # 角色由领域包声明（框架不内置）；评测跑的是数据分析领域的用例
@@ -129,7 +137,8 @@ def build_graph(llm: Any) -> Any:
         available_agents=registry.names(),
         agent_descriptions={d.name: d.description for d in registry.list_defs()},
     )
-    context_manager = ContextManager(vfs=VirtualFileSystem())
+    if context_manager is _DEFAULT_CM:
+        context_manager = ContextManager(vfs=VirtualFileSystem())
 
     from harness.config import settings
 
