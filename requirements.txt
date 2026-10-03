@@ -98,3 +98,6 @@ matplotlib>=3.7.0
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
 pytest-cov>=4.1.0
+# 安全静态扫描（评价体系 D12.5）：`python -m bandit -r harness packages -q`。
+# 只用它，不引依赖漏洞扫描 —— 那个要联网取漏洞库。
+bandit>=1.7.0

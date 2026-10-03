@@ -349,6 +349,28 @@ class TestWiringIntoOrchestration:
 
 
 # ======================================================================
+# 表名是拼进 SQL 的标识符 —— 必须在构造处就拦住非标识符
+# ======================================================================
+class TestPgVectorTableNameGuard:
+    """表名没法参数化，只能拼进 SQL；既然要拼，就必须先保证它真的是标识符。
+
+    不需要数据库：校验发生在构造时（连接是惰性的）。
+    """
+
+    @pytest.mark.parametrize("bad", [
+        "vectors; DROP TABLE users", "vectors--", "my table", "1vectors", "",
+        "vectors)", 'a"b', "向量表", "public.vectors",
+    ])
+    def test_non_identifier_table_is_rejected(self, bad: str) -> None:
+        with pytest.raises(ValueError, match="标识符"):
+            PgVectorStore("postgresql://ignored/db", bad, 3)
+
+    def test_plain_identifier_is_accepted(self) -> None:
+        store = PgVectorStore("postgresql://ignored/db", "governed_vectors_2", 3)
+        assert store.table == "governed_vectors_2"
+
+
+# ======================================================================
 # 真实 PostgreSQL + pgvector
 # ======================================================================
 @pytest.mark.needs_db

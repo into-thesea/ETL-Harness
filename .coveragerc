@@ -1,12 +1,19 @@
 [run]
-source = harness,tools
+# 领域能力已迁到 packages/（原 tools/ 目录已不存在），口径跟着搬 —— 否则覆盖率会
+# 静默把领域那半边漏掉，而"漏掉"在报告上和"100% 覆盖"长得一模一样。
+source = harness,packages
 branch = True
 omit =
     tests/*
     harness/server/run.py
+    scripts/*
 
 [report]
 show_missing = True
+# 门槛：低于 80% 直接失败。**只在显式带 --cov 跑全量时生效** —— 本项目惯用的
+# "逐文件隔离跑"（挂账 #1 的 torch 规避）不带 --cov，不会误伤。
+# 现状 82%（2026-10-04，563 passed）。
+fail_under = 80
 exclude_lines =
     pragma: no cover
     if __name__ == .__main__.:

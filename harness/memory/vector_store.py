@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -266,6 +267,13 @@ class PgVectorStore(VectorStore):
     backend_name = "pgvector"
 
     def __init__(self, dsn: str, table: str, dim: int, *, index: str = "hnsw") -> None:
+        # 表名是**标识符**，没法参数化，只能拼进 SQL 文本（本类有 8 处这么拼）。
+        # 既然要拼，就必须先保证它真的是标识符 —— 配置里一个手滑的分号或空格就是
+        # 注入面。校验放在这里，后面每一处拼接都因此变得安全。
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table or ""):
+            raise ValueError(
+                f"向量表名必须是合法 SQL 标识符（字母/下划线开头，只含字母数字下划线）：{table!r}"
+            )
         self.dsn = dsn
         self.table = table
         self.dim = dim
