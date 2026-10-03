@@ -152,6 +152,28 @@ class TestMountUnmount:
         # 状态收敛
         assert manager.get_info("fake").state is PackageState.DISPOSED
 
+    def test_unmount_clears_risk_policies(self, framework) -> None:
+        """风险策略随包回收 —— 否则禁用的包还能左右别处工具的审批判法。"""
+        ctx = PackageContext("fake", framework)
+        ctx.register_tools([_tool("t1")])
+        ctx.register_risk_policy("t1", lambda args: "low")
+        assert framework.tools.risk_policy_for("t1") is not None
+
+        ctx.dispose()
+        assert framework.tools.risk_policy_for("t1") is None
+
+    def test_unmount_restores_overridden_risk_policy(self, framework) -> None:
+        """撤销是**还原**，不是无差别删除：覆盖前已有的策略要放回去。"""
+        original = lambda args: "high"
+        framework.tools.register(*_tool("t1"))
+        framework.tools.register_risk_policy("t1", original)
+
+        ctx = PackageContext("fake", framework)
+        ctx.register_risk_policy("t1", lambda args: "low")
+        ctx.dispose()
+
+        assert framework.tools.risk_policy_for("t1") is original
+
     def test_unmount_is_idempotent(self, manager, tmp_path) -> None:
         manager.register_package(FakePackage(tmp_path))
         manager.mount("fake")
@@ -235,6 +257,8 @@ class TestDisposedContext:
             ctx.register_agents([_agent("a")])
         with pytest.raises(PackageDisposedError):
             ctx.add_skill_directory(_skill_dir(tmp_path, "s"))
+        with pytest.raises(PackageDisposedError):
+            ctx.register_risk_policy("t1", lambda args: "low")
         with pytest.raises(PackageDisposedError):
             ctx.effect(lambda: None)
 

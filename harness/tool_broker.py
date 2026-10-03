@@ -173,6 +173,11 @@ class ToolBroker:
         # 不到终态（进程被杀 / 被遗弃），条目留到进程结束。真要更严就加 TTL 清扫或按会话数封顶。
         self._session_grants: dict[tuple[str, str], dict[str, Any]] = {}
         self._grant_lock = threading.Lock()
+        # 按工具的风险策略：领域包声明"多危险"，框架决定"要不要问人"。
+        # 与工具定义分开放 —— `ToolDef` 是纯数据（要渲染给 LLM、可能被序列化），
+        # 而策略是 (args) -> str 的**代码**（决策见 docs/技术选型决策.md D-006）。
+        # 与豁免表同类：读多写少、随包回收，共用 _grant_lock。
+        self._risk_policies: dict[str, Callable[[dict], str]] = {}
         self.middleware = middleware_manager
         self.pdp = pdp
         # 显式传 False = 关闭沙箱，归一成 None。不能把 False 直接存进来：invoke 与
@@ -415,6 +420,26 @@ class ToolBroker:
             )
         except Exception:  # noqa: BLE001 - 观测面绝不拖垮主流程
             logger.exception("记录会话豁免审计失败")
+
+    # ------------------------------------------------------------------
+    # 风险策略（领域包声明"多危险"，框架决定"要不要问"）
+    # ------------------------------------------------------------------
+    def register_risk_policy(self, tool_name: str, policy: Callable[[dict], str]) -> None:
+        """注册某工具的风险策略 ``(args) -> "low"|"medium"|"high"|"unknown"``。
+
+        策略只回答"多危险"，**不回答"要不要问人"** —— 后者由阈值与兜底断言决定
+        （见 ``harness.approval_policy``）。不注册 = 默认按需审批（与今天一致）。
+        """
+        with self._grant_lock:
+            self._risk_policies[tool_name] = policy
+
+    def risk_policy_for(self, tool_name: str) -> Optional[Callable[[dict], str]]:
+        with self._grant_lock:
+            return self._risk_policies.get(tool_name)
+
+    def clear_risk_policy(self, tool_name: str) -> bool:
+        with self._grant_lock:
+            return self._risk_policies.pop(tool_name, None) is not None
 
     # ------------------------------------------------------------------
     # 授权预检（人工审批之前先判"准不准做"）
@@ -901,6 +926,14 @@ class ScopedBroker:
 
     def list_session_grants(self, session_id: str) -> list[dict[str, Any]]:
         return self._inner.list_session_grants(session_id)
+
+    # ---- 风险策略读取 ----
+    # 只读转发：策略由**包**注册在底层 Broker 上，子 Agent 只是恰好读不到就需要它
+    # （子图里跑的也是 ReActNodes）。白名单外的工具不暴露，与 get() 同一口径。
+    def risk_policy_for(self, tool_name: str):
+        if not self._is_allowed(tool_name):
+            return None
+        return self._inner.risk_policy_for(tool_name)
 
     def invoke(
         self,

@@ -217,6 +217,24 @@ class PackageContext:
 
         self._disposers.append(_undo)
 
+    def register_risk_policy(self, tool_name: str, policy: Callable[[dict], str]) -> None:
+        """为某工具声明风险策略（``(args) -> "low"|"medium"|"high"|"unknown"``）。
+
+        与 ``register_tools`` 分开：策略是**代码**（随调用实参变），工具定义是数据。
+        撤销是**还原**而非删除 —— 覆盖掉别的包的策略，卸载时要放回去。
+        """
+        self._guard("注册风险策略")
+        broker = self.handles.tools
+        previous = broker.risk_policy_for(tool_name)
+        broker.register_risk_policy(tool_name, policy)
+
+        def _undo() -> None:
+            broker.clear_risk_policy(tool_name)
+            if previous is not None:
+                broker.register_risk_policy(tool_name, previous)
+
+        self._disposers.append(_undo)
+
     def add_skill_directory(self, directory: str) -> int:
         """加载一个技能目录，返回加载数量。"""
         self._guard("加载技能目录")
