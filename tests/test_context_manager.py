@@ -218,6 +218,40 @@ def test_nodes_pass_session_id_into_compaction() -> None:
     assert not cm.settled_refs("default"), "不该落到 default（那是多任务串历史的入口）"
 
 
+def _nodes(context_manager):
+    from harness.nodes import ReActNodes
+    from harness.tool_broker import ToolBroker
+
+    return ReActNodes(
+        llm=None,
+        broker=ToolBroker(sandbox_executor=False, circuit_breaker=False, cache=False),
+        context_manager=context_manager,
+    )
+
+
+def test_nodes_sink_large_observation_and_hand_back_a_readable_path() -> None:
+    """节点层→上下文管理器的接线：大结果经节点沉淀，卡片里的路径必须真能读回原文。"""
+    vfs = VirtualFileSystem()
+    cm = ContextManager(vfs=vfs)
+    big = "E" * 2000
+
+    out = _nodes(cm)._settle_observation("eda", big, {"session_id": "sess-7"})
+
+    assert "已沉淀" in out and len(out) < 500, "进入提示的应当是卡片而不是原文"
+    refs = cm.settled_refs("sess-7")
+    assert refs, "沉淀必须登记在本会话名下"
+    assert refs[0]["path"] in out and vfs.read_text(refs[0]["path"]) == big
+
+
+def test_nodes_pass_through_when_no_context_manager() -> None:
+    """没注入上下文管理器时是**零开销透传** —— 这是框架的默认态，不能偷偷改行为。"""
+    big = "x" * 5000
+    nodes = _nodes(None)
+    assert nodes._settle_observation("eda", big, {}) == big
+    history = [{"role": "user", "content": "任务"}]
+    assert nodes._compact_history(history, {}) == history
+
+
 def test_budget_violation_is_counted_when_folding_is_not_enough() -> None:
     """折叠后仍超预算才走"丢最旧"的最后防线，且必须计数（否则没人知道发生了硬丢）。"""
     cm = ContextManager(

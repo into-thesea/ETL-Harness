@@ -70,13 +70,47 @@ class _CountingLLM:
 
 def _run_once(*, use_cm: bool, goal: str) -> tuple[_CountingLLM, Any]:
     llm = _CountingLLM(build_offline_llm())
-    cm = ContextManager(vfs=VirtualFileSystem()) if use_cm else None
+    cm = _MeasuringCM(vfs=VirtualFileSystem()) if use_cm else None
     graph = build_graph(llm, context_manager=cm)
     graph.invoke(
         make_plan_execute_state(goal, session_id=f"ctxab_{uuid.uuid4().hex[:8]}"),
         config={"recursion_limit": 120},
     )
     return llm, cm
+
+
+class _MeasuringCM(ContextManager):
+    """顺手记录每条观察值的长度 —— 用来回答"沉淀阈值定得对不对"。
+
+    阈值这种事**不该拍脑袋**：先知道真实负载下观察值有多大，再谈定多少合适。
+    这个测量就是为了拿这个分布。真实记录透传，不改任何行为。
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.observation_sizes: list[int] = []
+
+    def settle_observation(self, tool_name, observation, session_id="default"):
+        self.observation_sizes.append(len(observation or ""))
+        return super().settle_observation(tool_name, observation, session_id)
+
+
+def _distribution(cm: _MeasuringCM) -> None:
+    sizes = sorted(cm.observation_sizes)
+    if not sizes:
+        print("\n  没采到任何观察值。")
+        return
+    threshold = cm.budget.sink_threshold_chars
+    over = [s for s in sizes if s > threshold]
+    p50 = sizes[len(sizes) // 2]
+
+    print(f"\n  真实负载下的观察值分布（n={len(sizes)}）")
+    print(f"    最小 {sizes[0]} / 中位 {p50} / 最大 {sizes[-1]} 字符")
+    print(f"    超过沉淀阈值（{threshold}）的：{len(over)} 条")
+    if not over:
+        print(f"    → 阈值比**本负载的最大观察值（{sizes[-1]}）还高**，所以一次都不触发。")
+        print("      这不能直接推出「阈值该调小」：它只说明这个负载用不上沉淀 ——")
+        print("      要么负载本来就小，要么阈值确实高于实际（需要更多真实负载才能分辨）。")
 
 
 def _sink_table() -> None:
@@ -129,6 +163,7 @@ def main() -> int:
                   f"{cm.budget.max_history_chars} 字符的折叠上限。"
                   "差值 0 是「没触发」，不是「没效果」—— 这两个结论天差地别。")
 
+    _distribution(cm)
     _sink_table()
     return 0
 
