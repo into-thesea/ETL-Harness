@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from harness.models import ToolDef
 from harness.tool_broker import ToolBroker
 
@@ -55,6 +57,23 @@ def _sandbox_tool() -> ToolDef:
 # ======================================================================
 # 关闭沙箱
 # ======================================================================
+class TestSwitchSemantics:
+    """三个可注入/可关闭的组件共用一套开关语义：实例 / None（按配置）/ False（关闭）。
+
+    传 `True` 是很自然的写法但不在语义内。早先会被原样存下去，直到 invoke 深处才炸成
+    `AttributeError: 'bool' object has no attribute 'fingerprint'` —— 错得离原因很远。
+    """
+
+    @pytest.mark.parametrize("kwarg", ["sandbox_executor", "circuit_breaker", "cache"])
+    def test_true_is_rejected_at_construction(self, kwarg: str) -> None:
+        with pytest.raises(TypeError, match="没有意义"):
+            ToolBroker(**{kwarg: True})
+
+    def test_false_and_none_still_work(self) -> None:
+        assert ToolBroker(sandbox_executor=False).sandbox is None
+        assert ToolBroker(sandbox_executor=None).sandbox is not None   # 按配置自动构造
+
+
 class TestSandboxDisabled:
     def test_fails_closed_with_explicit_message(self) -> None:
         """沙箱关闭时给出那条写好的 fail-closed 提示，而不是 AttributeError。"""

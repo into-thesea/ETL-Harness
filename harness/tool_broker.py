@@ -188,6 +188,22 @@ class ToolBroker:
         # 审批的两条线：都是**部署方配置**，不是领域包能改的。
         self.approval_threshold = approval_threshold
         self.approval_deny_threshold = approval_deny_threshold
+        # 三个"可注入或关闭"的组件都是同一套开关语义：**实例 = 用这个 / None = 按配置
+        # 自动构造 / False = 关闭**。传 True 是很自然的写法，但它不在这套语义里 ——
+        # 早先会被原样存下去，直到 invoke 深处才炸成
+        # `AttributeError: 'bool' object has no attribute 'fingerprint'`，离真正的原因
+        # 十万八千里。当场拒绝并说清三种写法，比让人从调用栈里倒推便宜得多。
+        for name, value in (
+            ("sandbox_executor", sandbox_executor),
+            ("circuit_breaker", circuit_breaker),
+            ("cache", cache),
+        ):
+            if value is True:
+                raise TypeError(
+                    f"{name}=True 没有意义：不传或传 None = 按配置自动构造，"
+                    f"传实例 = 用该实例，传 False = 关闭。"
+                )
+
         self.middleware = middleware_manager
         self.pdp = pdp
         # 显式传 False = 关闭沙箱，归一成 None。不能把 False 直接存进来：invoke 与
