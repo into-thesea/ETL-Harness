@@ -38,6 +38,35 @@
 后台清扫会**自动驳回**并推进任务。**不要图省事改成 `block`** —— 没人处理时任务会永远
 停在 `awaiting_approval`（进程活着、日志干净、不结束），这是最难被发现的一类失败。
 
+### 监控抓取（`/metrics`）
+
+服务暴露 Prometheus 文本格式的 `/metrics`（不引 `prometheus_client`，手写格式）。
+**它在鉴权之内** —— 指标暴露的是内部运行状况，和业务数据一样不该匿名可读。
+抓取端能带请求头，所以直接用 Bearer：
+
+```yaml
+scrape_configs:
+  - job_name: governed
+    scrape_interval: 15s
+    metrics_path: /metrics
+    authorization:
+      credentials: "<你的令牌>"
+    static_configs:
+      - targets: ["governed.internal:8000"]
+```
+
+最该配告警的两条：
+
+- `governed_tool_calls_total{ok="false"}` —— 工具失败率。**注意口径**：只统计**执行过**的
+  调用；被管控拦下的（PDP 拒绝、审批未过、沙箱不可用）不会进这里，它们体现在
+  `governed_guard_decisions_total{layer=...,decision=...}`。两者相加才是"尝试过的次数"。
+- `governed_context_budget_violations_total` —— 非零说明历史折叠后仍超预算、被迫丢过最旧
+  消息，是"上下文预算定小了"的信号。
+
+**多副本**：这些是**进程内**累计量，各副本各报一份，`sum by (job)` 是查询端的活 ——
+这是 Prometheus 的标准模型，不需要额外处理。但要知道重启会让计数器归零（`rate()` 能识别
+counter 重置，所以不影响速率类查询）。
+
 ---
 
 ## Dev：零外部依赖

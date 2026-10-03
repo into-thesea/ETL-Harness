@@ -185,6 +185,10 @@ class ToolBroker:
         # 而策略是 (args) -> str 的**代码**（决策见 docs/技术选型决策.md D-006）。
         # 与豁免表同类：读多写少、随包回收，共用 _grant_lock。
         self._risk_policies: dict[str, Callable[[dict], str]] = {}
+        # 累计调用次数，键 (工具名, 是否成功)。**累计**而不是窗口：`_call_log` 那个
+        # 一分钟窗口是给限流用的，它会涨也会落，当监控指标用是错的。这一份只增不减，
+        # 供 /metrics 导出（Prometheus 的 counter 语义，重启归零由 rate() 处理）。
+        self._call_counts: dict[tuple[str, bool], int] = {}
         # 审批的两条线：都是**部署方配置**，不是领域包能改的。
         self.approval_threshold = approval_threshold
         self.approval_deny_threshold = approval_deny_threshold
@@ -467,6 +471,15 @@ class ToolBroker:
         with self._grant_lock:
             return self._risk_policies.pop(tool_name, None) is not None
 
+    def call_counts(self) -> dict[tuple[str, bool], int]:
+        """累计调用次数 ``{(工具名, 是否成功): 次数}``（进程内，只增不减）。
+
+        与 ``get_stats()["tools"][*]["recent_calls_1min"]`` 的区别：那是**滚动窗口**，
+        会涨也会落，当监控的 counter 用是错的。这一份是给 ``/metrics`` 的口径。
+        """
+        with self._rate_lock:
+            return dict(self._call_counts)
+
     def approval_fallback(self, tool_name: str) -> Optional[str]:
         """这一次调用可依靠的确定性兜底机制名；没有则 None。
 
@@ -478,9 +491,9 @@ class ToolBroker:
         tool_def = entry[0] if entry else None
         if tool_def is None or not tool_def.run_in_sandbox:
             return None
-        return "sandbox" if self._sandbox_really_available() else None
+        return "sandbox" if self.sandbox_available() else None
 
-    def _sandbox_really_available(self) -> bool:
+    def sandbox_available(self) -> bool:
         """向沙箱要一个**运行时**的可用性结论（带缓存，见 ``SandboxExecutor.available``）。"""
         executor = self.sandbox
         if executor is None:
@@ -758,6 +771,13 @@ class ToolBroker:
         # 的泄漏面。命中时不重复写入（值本就来自缓存）。失败结果不进缓存。
         if cache_key is not None and cached is None:
             self.cache.put(cache_key, tool_name, (ok, text, artifacts))
+
+        # ---- 9.8 累计计数 ----
+        # 与审计同一处取终值：`ok` 到这一步才定（中间件可能改写结果），口径必须与审计
+        # 一致，否则"指标说 3 次失败、审计里 5 条"这种对不上会让人先怀疑监控再怀疑代码。
+        with self._rate_lock:
+            key = (tool_name, bool(ok))
+            self._call_counts[key] = self._call_counts.get(key, 0) + 1
 
         # ---- 10. 审计：记录本次调用的最终结果（成功/执行异常） ----
         sandbox_used = bool(tool_def.run_in_sandbox and self.sandbox is not None)

@@ -9,11 +9,12 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
 from harness.events import build_event_bus, read_persisted_events
+from harness.server.metrics import CONTENT_TYPE, render_metrics
 from harness.server import schemas
 from harness.server.auth import build_authenticator, install_auth, principal_of
 from harness.server.service import VERSION, HarnessService
@@ -268,6 +269,17 @@ def create_app(service: Optional[HarnessService] = None) -> FastAPI:
     @app.get("/health", response_model=schemas.HealthResponse, tags=["meta"])
     async def health() -> schemas.HealthResponse:
         return schemas.HealthResponse(status="ok", version=VERSION)
+
+    @app.get("/metrics", tags=["meta"])
+    async def metrics() -> Response:
+        """Prometheus 抓取端点。
+
+        **在鉴权之内**（不在 ``ANONYMOUS_PATHS`` 里）：这些数字暴露的是内部运行状况，
+        和业务数据一样不该匿名可读。抓取端能带请求头，配 ``authorization: Bearer``
+        即可 —— 不像 SSE 那样非用 ``?token=`` 不可（那是 ``EventSource`` 的限制，
+        抓取端没有）。示例见 ``deploy/README.md``。
+        """
+        return Response(content=render_metrics(svc), media_type=CONTENT_TYPE)
 
     # 控制台零构建静态页：挂在所有 /api、/health 显式路由**之后**做兜底，html=True
     # 让 "/" 直接返回 index.html；前端用 hash 路由（#/tasks 等），因此不需要服务端

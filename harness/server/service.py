@@ -365,6 +365,34 @@ class HarnessService:
                 else:
                     resolved["rejected"] += 1
 
+    def guard_totals(self) -> dict:
+        """把**按会话**聚合的管控计数塌成**进程级**总量（给 ``/metrics`` 用）。
+
+        控制台的指标页要按会话看，所以 ``_guard_metrics`` 的键是 thread_id；
+        而监控系统绝不能吃这个键 —— 每个任务新增一条时间序列，**只增不减**，
+        是 Prometheus 被单个应用拖垮的经典方式，且不会报错、只会在很久以后炸。
+        导出前把它加总掉，label 只留**有界**的 layer / decision。
+        """
+        with self._metrics_lock:
+            by_layer: dict[tuple[str, str], int] = {}
+            required = approved = rejected = expired = 0
+            for m in self._guard_metrics.values():
+                for layer, bucket in m["guard_by_layer"].items():
+                    for decision, n in bucket.items():
+                        key = (layer, decision)
+                        by_layer[key] = by_layer.get(key, 0) + n
+                required += m["approval_required"]
+                resolved = m["approval_resolved"]
+                approved += resolved["approved"]
+                rejected += resolved["rejected"]
+                expired += resolved["expired"]
+        return {
+            "by_layer": by_layer,
+            "approval_required": required,
+            "approval_resolved": {"approved": approved, "rejected": rejected,
+                                  "expired": expired},
+        }
+
     def _select_llm(self) -> Any:
         """真实 LLM 优先；未配置 Key 时退回领域包贡献的脚本化 Mock。"""
         from harness.config import settings
