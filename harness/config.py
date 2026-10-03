@@ -280,6 +280,29 @@ class TraceSettings(BaseSettings):
     max_spans_per_trace: int = 2000
 
 
+class EventSettings(BaseSettings):
+    """事件落盘配置（供控制台历史回放）。
+
+    一个任务一个 append-only JSONL（``<dir>/<thread_id>.jsonl``）。决策见
+    ``docs/技术选型决策.md`` D-008。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="EVENT_", extra="ignore")
+
+    enabled: bool = True
+    """是否落盘。关掉则控制台只能看正在跑的任务（跑完即无历史可回放）。"""
+
+    dir: str = "data/events"
+    """落盘目录。"""
+
+    retention_days: int = 30
+    """保留天数，超龄的任务文件在启动时清理。``<=0`` 表示不清理。"""
+
+    max_file_bytes: int = 33554432
+    """单个任务文件的封顶（32MB）。**封顶不是轮转**：超过后不再写，
+    以便"回放 = 读一个文件"这个前提始终成立。"""
+
+
 class VFSSettings(BaseSettings):
     """虚拟文件系统配置。"""
 
@@ -598,6 +621,7 @@ class Settings(BaseSettings):
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
     circuit: CircuitBreakerSettings = Field(default_factory=CircuitBreakerSettings)
     trace: TraceSettings = Field(default_factory=TraceSettings)
+    event: EventSettings = Field(default_factory=EventSettings)
     vfs: VFSSettings = Field(default_factory=VFSSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     context: ContextSettings = Field(default_factory=ContextSettings)

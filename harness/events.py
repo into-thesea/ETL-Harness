@@ -27,7 +27,10 @@ import logging
 import threading
 import time
 from collections import deque
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from harness.event_store import EventStore
 
 from .models import SpanStatus
 
@@ -101,8 +104,14 @@ class EventBus:
     线程安全：埋点可能来自执行器的工作线程，而订阅来自 HTTP 的异步侧。
     """
 
-    def __init__(self, history: int = DEFAULT_HISTORY) -> None:
+    def __init__(
+        self,
+        history: int = DEFAULT_HISTORY,
+        store: Optional["EventStore"] = None,
+    ) -> None:
         self._lock = threading.Lock()
+        # 事件落盘（供控制台历史回放）。None 表示不落盘 —— 内存历史照旧。
+        self.store = store
         self._subs: dict[str, list[EventSubscription]] = {}
         self._trace_to_thread: dict[str, str] = {}
         self._history: dict[str, deque[dict[str, Any]]] = {}
@@ -147,6 +156,14 @@ class EventBus:
             subs = self._subs.pop(thread_id, [])
         for sub in subs:
             sub.close()
+
+    def is_bound(self, thread_id: str) -> bool:
+        """该 thread 是否还挂在总线上（任务终态 ``unbind`` 之后为 False）。
+
+        控制台据此决定回放走内存还是磁盘 —— 已解绑的任务，内存历史已经清掉了。
+        """
+        with self._lock:
+            return thread_id in self._trace_to_thread.values()
 
     def subscribe(
         self, thread_id: str, buffer: int = DEFAULT_BUFFER, replay: bool = True
@@ -213,6 +230,11 @@ class EventBus:
                 self._history.setdefault(
                     thread_id, deque(maxlen=self.history_size)
                 ).append(event)
+            if self.store is not None:
+                # 持锁写盘：换来的是**文件里的顺序 == seq 顺序**，读回即可直接回放。
+                # ponytail: publish 路径上的同步 IO。量级是"每次工具调用几条"，够用；
+                # 若被量出来成为瓶颈，改成有界队列 + 单写线程（代价见 D-008「何时该回头」）。
+                self.store.append(event)
             self._recorded += 1
             subs = [s for s in self._subs.get(thread_id, []) if not s.closed]
             for sub in subs:
@@ -294,13 +316,39 @@ _bus: Optional[EventBus] = None
 _bus_lock = threading.Lock()
 
 
+def build_event_store() -> Optional["EventStore"]:
+    """按配置构造事件落盘器；未启用时返回 None。
+
+    配置导入放在函数里：``harness.config`` 在首次 import 时成型，而事件模块会被
+    很早导入（tracer → events），模块级导入容易撞上初始化顺序。
+    """
+    from harness.config import settings
+    from harness.event_store import EventStore
+
+    cfg = settings.event
+    if not cfg.enabled:
+        return None
+    return EventStore(
+        cfg.dir,
+        enabled=True,
+        retention_days=cfg.retention_days,
+        max_file_bytes=cfg.max_file_bytes,
+    )
+
+
+def read_persisted_events(thread_id: str) -> list[dict[str, Any]]:
+    """读回某任务已落盘的事件（任务已终态、内存历史已清时回放用）。"""
+    store = build_event_bus().store
+    return store.read(thread_id) if store is not None else []
+
+
 def build_event_bus() -> EventBus:
     """取全局事件总线单例。"""
     global _bus
     if _bus is None:
         with _bus_lock:
             if _bus is None:
-                _bus = EventBus()
+                _bus = EventBus(store=build_event_store())
     return _bus
 
 

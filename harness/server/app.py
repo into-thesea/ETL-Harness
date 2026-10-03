@@ -13,7 +13,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
-from harness.events import build_event_bus
+from harness.events import build_event_bus, read_persisted_events
 from harness.server import schemas
 from harness.server.auth import build_authenticator, install_auth, principal_of
 from harness.server.service import VERSION, HarnessService
@@ -166,6 +166,13 @@ async def _event_stream(service: HarnessService, thread_id: str):
 
     bus = build_event_bus()
     sub = bus.subscribe(thread_id)
+
+    # 任务已终态（总线里没有它的绑定）→ 内存历史已随 unbind 清掉，回放改走磁盘。
+    # 事件与控制台实时的**同形**，前端不必知道数据从哪来 —— 这是"回放不另开接口"的关键。
+    if not bus.is_bound(thread_id):
+        for event in read_persisted_events(thread_id):
+            yield {"event": event.get("type", "message"), "data": _json(event)}
+
     last_sig: Any = None
     seen_approval_ids: set[str] = set()
     reported_dropped = 0
@@ -242,6 +249,11 @@ def create_app(service: Optional[HarnessService] = None) -> FastAPI:
             落盘 SQLite；LLM 自动选择）。
     """
     svc = service or HarnessService()
+    # 事件落盘：启动时清一次超龄的任务文件（保留策略只在启动点跑，不做后台定时器 ——
+    # 一个任务的旧事件没人看，晚几天清掉没有任何影响）。
+    store = build_event_bus().store
+    if store is not None:
+        store.cleanup()
     # 鉴权器先构造：配置缺失/非法时**启动即失败**（不要静默放行）
     auth = build_authenticator()
     app = FastAPI(

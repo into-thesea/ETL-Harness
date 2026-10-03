@@ -34,6 +34,10 @@ os.environ.setdefault("AUTH_ENABLED", "false")
 # **检查本身**由 tests/test_approval_policy.py 显式改这两个值后专项覆盖。
 os.environ.setdefault("SERVER_APPROVAL_CHANNEL", "http")
 
+# 事件落盘默认关掉：绝大多数用例不关心它，开着只会往仓库的 data/events/ 里写文件。
+# **落盘本身**由 tests/test_event_store.py 显式打开并指向 tmp_path 后专项覆盖。
+os.environ.setdefault("EVENT_ENABLED", "false")
+
 # 默认显式禁用长期记忆的 Embedding：否则每次服务装配都会加载本地 bge 模型（几百 MB、
 # 首次数秒），同一进程多次装配还会触发 torch/sentence-transformers 的原生访问违例
 # （挂账 #1）。控制台/编排/服务层用例不需要真实向量；**本地嵌入本身**由

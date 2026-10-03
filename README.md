@@ -193,6 +193,7 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/tasks/$THREA
 | 风险阈值 | `SERVER_APPROVAL_THRESHOLD` / `SERVER_APPROVAL_DENY_THRESHOLD` | `medium` / `critical` | 高过前者问人，达到后者直接拒；两条线都由部署方配 |
 | 多数据源 | `DATASOURCE_SOURCES` | 空 | 配置命名 MySQL/PG 源，`sql_query` 按需切换 |
 | 对象存储 | `MINIO_ENABLED` | 关 | VFS 大文件落 MinIO；默认落本地磁盘（`VFS_LOCAL_ROOT`） |
+| 事件落盘 | `EVENT_ENABLED` | 开 | 一个任务一个 append-only JSONL（`EVENT_DIR`）。控制台据此**回放已结束的任务**；不落盘则跑完就只剩状态快照。保留 `EVENT_RETENTION_DAYS` 天，启动时清理 |
 
 完整取值见 [`.env.example`](.env.example)，规则 JSON 写法见 `harness/config.py` 各 Settings 类的 docstring。安全相关能力均为 fail closed。
 
