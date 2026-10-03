@@ -7,9 +7,11 @@
 
 装配点模式（D16）：本包是服务化后的正式装配点，负责构造 Broker / LLM /
 Registry / ContextManager / Checkpointer 并编译图（见 service.HarnessService）。
+
+**本模块刻意不转发 `create_app` / `HarnessService`**（原先有，没人用）：
+包 ``__init__`` 去 import 自己的子模块，会和"子模块 import 本包"构成导入环
+（``harness.server`` ↔ ``harness.server.app``），而这层环只换来两个没人用的别名。
+调用方直接 ``from harness.server.app import create_app`` 即可。
 """
 
-from harness.server.app import create_app
-from harness.server.service import HarnessService
-
-__all__ = ["create_app", "HarnessService"]
+__all__: list[str] = []
