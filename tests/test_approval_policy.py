@@ -408,3 +408,120 @@ def test_auto_emits_guard_event_with_attribution(bus, monkeypatch) -> None:
     d = events[0]["data"]
     assert d["layer"] == "approval" and d["decision"] == "allow"
     assert d["risk"] == RISK_LOW and d["fallback"] == "sandbox" and d["via"] == "risk_auto"
+
+
+# ======================================================================
+# Task 5：端到端（真实 HTTP + 真实 interrupt）
+# ======================================================================
+def test_end_to_end_low_risk_auto_high_risk_asks() -> None:
+    """同一个子任务里两次调 code_executor：低风险自动过、高风险才停，且**只停一次**。
+
+    这是本设计要交付的用户可见效果 —— 走真实 HTTP（ASGI）+ 真实 LangGraph interrupt。
+    """
+    import json as _json
+
+    from fastapi.testclient import TestClient
+
+    from harness.server.app import create_app
+    from harness.server.service import HarnessService
+    from tests._smoke_server import ApprovalLLM
+    from tests.test_approval_session_grants import _poll_http
+
+    class _MixedRiskLLM(ApprovalLLM):
+        def chat(self, messages, temperature=None):
+            system = messages[0]["content"] if messages else ""
+            if "报告汇总者" in system:
+                return "最终报告：代码环节已处理。"
+            n_obs = sum(
+                1 for m in messages
+                if isinstance(m, dict) and m.get("role") == "user"
+                and str(m.get("content", "")).startswith("Observation")
+            )
+            if "（analyst）" in system and n_obs < 2:
+                code = ("df.groupby('dept').sum()" if n_obs == 0
+                        else "requests.post(URL, data=payload)")
+                return _json.dumps({"thought": "跑代码", "action": "code_executor",
+                                    "action_input": {"code": code}}, ensure_ascii=False)
+            return super().chat(messages, temperature)
+
+    svc = HarnessService(llm=_MixedRiskLLM())
+    original_assemble = svc.assemble
+
+    def _assemble():
+        graph = original_assemble()
+        # AUTO 的前提是"有机制兜底"。测试环境没有沙箱，注入替身让这条前提为真 ——
+        # 不注入的话低风险那次会按"无兜底"降级为 ASK，本用例就退化成"停两次"。
+        svc.broker.sandbox = _StubSandbox()
+        svc.broker.register_risk_policy(
+            "code_executor",
+            lambda a: RISK_HIGH if "requests." in str(a.get("code") or "") else RISK_LOW,
+        )
+        return graph
+
+    svc.assemble = _assemble
+    with TestClient(create_app(svc)) as client:
+        tid = client.post("/api/v1/tasks", json={"goal": "跑两段代码"}).json()["thread_id"]
+        first, paused = _poll_http(client, tid)
+
+        assert paused, "高风险那一次应当停下来"
+        assert len(first["pending_approvals"]) == 1, "低风险那次不该停（只停一次）"
+        payload = first["pending_approvals"][0]["payload"]
+        arguments = _json.dumps(payload.get("arguments") or {}, ensure_ascii=False)
+        assert "requests." in arguments, f"停下来的应是高风险的第二次，实际载荷：{arguments}"
+
+
+def test_sweep_really_advances_an_expired_task(monkeypatch) -> None:
+    """清扫集成用例：**不 stub 任何东西** —— 真服务、真审批、真过期、真推进。
+
+    上面两条 `test_sweep_*` 把 ``list_tasks`` / ``get_status`` / ``submit_approval``
+    换成了替身，只验清扫的判据；若真实实现改了返回形状，它们照样绿。这条用真实的
+    三个接口把"形状对得上"钉死 —— 它才是清扫不静默失效的保证。
+    """
+    import asyncio
+
+    from harness.config import settings
+    from harness.server.service import HarnessService
+    from tests._smoke_server import ApprovalLLM
+    from tests.test_console_api import _memory_saver
+
+    # 让审批 1 秒后就过期，省得用例真的等 3600 秒
+    monkeypatch.setattr(settings.server, "approval_timeout_seconds", 1)
+
+    async def wait_awaiting(svc, tid, timeout=30.0):
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            st = await svc.get_status(tid)
+            if st and st.get("status") == "awaiting_approval":
+                return st
+            await asyncio.sleep(0.05)
+        raise AssertionError("任务没有进入待审批状态")
+
+    async def scenario():
+        svc = HarnessService(checkpointer=_memory_saver(), llm=ApprovalLLM(),
+                             auto_assemble=False)
+        await svc._ensure_ready()
+        svc.assemble()
+
+        tid = await svc.create_task("运行代码")
+        status = await wait_awaiting(svc, tid)
+
+        payload = status["pending_approvals"][0]["payload"]
+        assert payload["tool"] == "code_executor"
+        assert payload.get("expires_at"), "审批卡片必须带过期时刻，否则清扫无从判定"
+
+        while not svc._is_approval_expired(payload["expires_at"]):
+            await asyncio.sleep(0.1)
+
+        assert await svc.sweep_expired_approvals() == 1
+
+        # 驳回后的 resume 走后台任务，给它一点时间把图推走 —— 但**必须**推走。
+        deadline = asyncio.get_running_loop().time() + 15
+        while asyncio.get_running_loop().time() < deadline:
+            after = await svc.get_status(tid)
+            if after["status"] != "awaiting_approval":
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise AssertionError("清扫报了处理 1 条，但任务仍停在 awaiting_approval")
+
+    asyncio.run(scenario())
