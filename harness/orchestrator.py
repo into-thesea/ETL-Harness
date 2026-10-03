@@ -158,8 +158,12 @@ class PlanExecuteNodes:
         long_term_memory: Any = None,
         max_parallel: Optional[int] = None,
         subgraph_cache: Optional[SubgraphCache] = None,
+        plan_review: bool = False,
     ) -> None:
         self.llm = llm
+        # 执行前计划审批（默认关）。关掉时 plan_review_node 是纯直通，
+        # **图拓扑不随它变化** —— 否则开关一改，已落盘的 checkpoint 就对不上了。
+        self.plan_review = plan_review
         self.broker = broker
         self.registry = registry or AgentRegistry()
         self.store = store or TaskStore(backend="memory")
@@ -281,6 +285,69 @@ class PlanExecuteNodes:
         except Exception as e:  # noqa: BLE001 - 记忆是增强项，不得影响任务
             logger.warning("长期记忆检索失败（忽略，继续规划）：%s", e)
             return ""
+
+    # ------------------------------------------------------------------
+    # 节点：执行前计划审批（可选，默认关）
+    # ------------------------------------------------------------------
+    def plan_review_node(self, state: PlanExecuteState) -> dict:
+        """动手之前把计划摆给审批人过一眼。关掉时是**纯直通**（图拓扑不变）。
+
+        拒绝**不是失败**：把审批意见当作 feedback 交回 ``replan``，让规划者改一版再来。
+        这条回路受 ``max_replans`` 约束 —— 改不出来时 ``replan_node`` 会明确失败，
+        不会无限问下去。
+        """
+        if not self.plan_review:
+            return {}
+
+        plan = state["plan"]
+        request_id = f"aprreq_{uuid.uuid4().hex[:12]}"
+        expires_at = _approval_expires_at()
+        payload = {
+            "type": "plan_review",
+            "approval_request_id": request_id,
+            "expires_at": expires_at,
+            # 只带审批人要看的字段 —— 整个 TaskPlan 里还塞着执行期的产物索引与计时
+            "plan": {
+                "plan_id": plan.plan_id,
+                "goal": plan.goal,
+                "version": plan.version,
+                "tasks": [
+                    {
+                        "task_id": t.task_id,
+                        "title": t.title,
+                        "description": t.description,
+                        "assigned_to": t.assigned_to,
+                        "depends_on": list(t.depends_on),
+                        "acceptance_criteria": list(t.acceptance_criteria),
+                        "expected_artifacts": list(t.expected_artifacts),
+                    }
+                    for t in plan.tasks
+                ],
+            },
+        }
+        # 第三类人工卡点（设计 §3.6）：执行前计划审批，与工具审批、质量门 HUMAN 并列
+        emit_approval_required(
+            state.get("trace_id"),
+            kind="plan",
+            request_id=request_id,
+            expires_at=expires_at,
+            session_id=state.get("session_id"),
+            description=f"计划 v{plan.version}，共 {len(plan.tasks)} 个子任务，待批准后执行",
+        )
+        raw_decision = interrupt(payload)
+        # 计划没有"工具"这一维，会话豁免不适用 —— 这里刻意丢弃 remember
+        approved, comment, _remember = ReActNodes._parse_approval(raw_decision)
+
+        if approved:
+            logger.info("计划已获批：%s", plan.plan_id)
+            return {"last_decision": "approved", "feedback": ""}
+
+        reason = comment or "未说明原因"
+        logger.info("计划被驳回，退回重规划：%s", reason)
+        return {
+            "last_decision": "rejected",
+            "feedback": f"审批人驳回了这份计划：{reason}。请据此调整方案后重新提交。",
+        }
 
     # ------------------------------------------------------------------
     # 节点：调度（取下一个依赖已满足的子任务）
@@ -705,8 +772,19 @@ class PlanExecuteNodes:
             return "human"
         return "end"  # FAIL
 
+    def route_plan_review(self, state: PlanExecuteState) -> str:
+        # 关着时直接放行，**不读 last_decision** —— 那个字段可能还留着上一轮的结果
+        # （例如质量门 HUMAN 写过 "rejected"），拿它做判据会在开关关掉时误路由。
+        if not self.plan_review:
+            return "dispatch"
+        return "replan" if state.get("last_decision") == "rejected" else "dispatch"
+
     def route_replan(self, state: PlanExecuteState) -> str:
-        return "end" if state.get("status") == "failed" else "dispatch"
+        if state.get("status") == "failed":
+            return "end"
+        # 开着计划审批时，**改出来的新计划同样要过审** —— 否则驳回一次就等于放行。
+        # 这不会无限循环：replan_node 在 replan_count 超限时直接判失败。
+        return "plan_review" if self.plan_review else "dispatch"
 
     def route_human(self, state: PlanExecuteState) -> str:
         return "end" if state.get("status") == "failed" else "dispatch"
@@ -732,6 +810,7 @@ def build_plan_execute_graph(
     long_term_memory: Any = None,
     max_parallel: Optional[int] = None,
     subgraph_cache: Optional[SubgraphCache] = None,
+    plan_review: bool = False,
 ):
     """编译顶层 Plan-and-Execute 图并返回（compiled graph）。
 
@@ -763,10 +842,12 @@ def build_plan_execute_graph(
         long_term_memory=long_term_memory,
         max_parallel=max_parallel,
         subgraph_cache=subgraph_cache,
+        plan_review=plan_review,
     )
 
     g = StateGraph(PlanExecuteState)
     g.add_node("plan", nodes.plan_node)
+    g.add_node("plan_review", nodes.plan_review_node)
     g.add_node("dispatch", nodes.dispatch_node)
     g.add_node("execute", nodes.execute_node)
     g.add_node("gate", nodes.gate_node)
@@ -775,7 +856,11 @@ def build_plan_execute_graph(
     g.add_node("synthesize", nodes.synthesize_node)
 
     g.add_edge(START, "plan")
-    g.add_edge("plan", "dispatch")
+    g.add_edge("plan", "plan_review")
+    g.add_conditional_edges(
+        "plan_review", nodes.route_plan_review,
+        {"dispatch": "dispatch", "replan": "replan"},
+    )
     g.add_conditional_edges(
         "dispatch", nodes.route_dispatch,
         {"execute": "execute", "replan": "replan", "human": "human",
@@ -787,7 +872,8 @@ def build_plan_execute_graph(
         {"dispatch": "dispatch", "replan": "replan", "human": "human", "end": END},
     )
     g.add_conditional_edges(
-        "replan", nodes.route_replan, {"dispatch": "dispatch", "end": END}
+        "replan", nodes.route_replan,
+        {"dispatch": "dispatch", "plan_review": "plan_review", "end": END},
     )
     g.add_conditional_edges(
         "human", nodes.route_human, {"dispatch": "dispatch", "end": END}

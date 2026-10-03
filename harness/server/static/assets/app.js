@@ -149,6 +149,23 @@
   function led(on, kind) {
     return '<span class="led ' + (on ? (kind || "on") : "off") + '"></span>';
   }
+  // 计划表格：计划审批页与审批台的计划卡片共用一份渲染（同一份数据两处看，样式必须一致）
+  function planTable(plan) {
+    var rows = (plan.tasks || []).map(function (t) {
+      return "<tr>" +
+        "<td>" + esc(t.task_id) + "</td>" +
+        "<td>" + esc(t.title || "") + '<div class="small dim">' + esc(t.description || "") + "</div></td>" +
+        "<td>" + chip(t.status) + "</td>" +
+        '<td class="mono small">' + esc(t.assigned_to || "") + "</td>" +
+        '<td class="small">' + (t.depends_on || []).map(esc).join("、") + "</td>" +
+        '<td class="small">' + (t.acceptance_criteria || []).map(esc).join("；") + "</td>" +
+        '<td class="small">' + (t.expected_artifacts || []).map(esc).join("、") + "</td>" +
+      "</tr>";
+    }).join("");
+    return '<div class="panel-body flush"><table class="grid"><thead><tr>' +
+      "<th>ID</th><th>子任务</th><th>状态</th><th>分配给</th><th>依赖</th><th>验收标准</th><th>预期产物</th>" +
+      "</tr></thead><tbody>" + rows + "</tbody></table></div>";
+  }
   function boolChip(v, onText, offText) {
     return v
       ? '<span class="chip ok"><span class="sym">✓</span>' + esc(onText || "开") + "</span>"
@@ -323,36 +340,65 @@
     }).join("") + "</ol>";
   }
 
-  /* ---------------- 页 2：计划审批（执行前；当前为只读计划视图） ---------------- */
+  /* ---------------- 页 2：计划审批（执行前） ---------------- */
   function renderPlan(id) {
     if (!needId(id)) return;
     var c = $("#content");
     c.innerHTML =
-      '<div class="banner warn"><strong>执行前计划审批开关当前未启用。</strong>' +
-      "本页只读呈现 <code>TaskPlan</code>；运行过程中的「工具审批」与「质量门 HUMAN」请在审批台处理。</div>" +
-      '<div class="panel"><div class="panel-head"><h2>任务计划</h2></div><div class="panel-body" id="plan-body"><div class="empty">加载中…</div></div></div>';
-    fetchStatus(id).then(function (s) {
-      var plan = s.plan;
+      '<div id="plan-banner"></div>' +
+      '<div class="panel"><div class="panel-head"><h2>任务计划</h2></div>' +
+      '<div class="panel-body" id="plan-actions"></div>' +
+      '<div id="plan-body"><div class="empty">加载中…</div></div></div>';
+
+    // 开关状态取自管控面（配置事实）—— 页面不能对着一个开着的开关说"未启用"
+    api("/control-plane").then(function (cp) {
+      var on = !!((cp.approval || {}).plan_approval);
+      $("#plan-banner").innerHTML = on
+        ? '<div class="banner ok">执行前计划审批<b>已启用</b>：计划生成后停在这里，批准了才开始执行；驳回则带着意见退回重规划。</div>'
+        : '<div class="banner warn"><strong>执行前计划审批当前未启用（<code class="mono">SERVER_PLAN_APPROVAL</code>）。</strong>' +
+          "本页只读呈现 <code>TaskPlan</code>；运行过程中的「工具审批」与「质量门 HUMAN」请在审批台处理。</div>";
+      return fetchStatus(id).then(function (s) { return { s: s }; });
+    }).then(function (r) {
+      var s = r.s, plan = s.plan;
       if (!plan) { $("#plan-body").innerHTML = '<div class="empty">该会话还没有计划。</div>'; return; }
-      var rows = (plan.tasks || []).map(function (t) {
-        return "<tr>" +
-          "<td>" + esc(t.task_id) + "</td>" +
-          "<td>" + esc(t.title || "") + '<div class="small dim">' + esc(t.description || "") + "</div></td>" +
-          "<td>" + chip(t.status) + "</td>" +
-          '<td class="mono small">' + esc(t.assigned_to || "") + "</td>" +
-          '<td class="small">' + (t.depends_on || []).map(esc).join("、") + "</td>" +
-          '<td class="small">' + (t.acceptance_criteria || []).map(esc).join("；") + "</td>" +
-          '<td class="small">' + (t.expected_artifacts || []).map(esc).join("、") + "</td>" +
-        "</tr>";
-      }).join("");
       $("#plan-body").innerHTML =
-        '<dl class="kv" style="margin-bottom:14px">' +
+        '<dl class="kv" style="margin:14px 0">' +
           "<dt>目标</dt><dd>" + esc(plan.goal) + "</dd>" +
           "<dt>版本 / 重规划</dt><dd class='mono'>v" + esc(plan.version) + " · replan " + fmtNum(plan.replan_count) + " · 进度 " + pct(plan.progress) + "</dd>" +
         "</dl>" +
-        '<div class="panel-body flush"><table class="grid"><thead><tr>' +
-          "<th>ID</th><th>子任务</th><th>状态</th><th>分配给</th><th>依赖</th><th>验收标准</th><th>预期产物</th>" +
-        "</tr></thead><tbody>" + rows + "</tbody></table></div>";
+        planTable(plan);
+
+      // 正等着计划审批 → 就地批准/驳回（同一个决定，不必再跳审批台）
+      var pending = (s.pending_approvals || []).filter(function (a) {
+        return ((a.payload || {}).type === "plan_review");
+      })[0];
+      if (!pending) return;
+      var box = $("#plan-actions");
+      box.innerHTML =
+        '<div class="row"><input class="input grow" id="plan-comment" ' +
+          'placeholder="审批意见（驳回时建议填写原因，会作为反馈交给重规划）" />' +
+        '<button class="btn success" id="plan-approve">✓ 批准计划</button>' +
+        '<button class="btn danger" id="plan-reject">✕ 驳回并退回重规划</button></div>' +
+        '<div class="small dim" style="margin-top:6px">驳回不是把任务判死：意见会交给规划者改一版，改出来的计划同样要过审。</div>';
+      function send(approved) {
+        var btns = box.querySelectorAll("button");
+        btns.forEach(function (b) { b.disabled = true; });
+        api("/tasks/" + encodeURIComponent(id) + "/approval", {
+          method: "POST",
+          body: { approved: approved, comment: $("#plan-comment").value, remember: null },
+        }).then(function () {
+          toast(approved ? "计划已批准，开始执行" : "计划已驳回，退回重规划", "info");
+          renderPlan(id);
+        }).catch(function (e) {
+          toast("审批提交失败：" + e.message, "err");
+          btns.forEach(function (b) { b.disabled = false; });
+        });
+      }
+      $("#plan-approve").onclick = function () { send(true); };
+      $("#plan-reject").onclick = function () { send(false); };
+    }).catch(function (e) {
+      var b = $("#plan-banner");
+      if (b) b.innerHTML = '<div class="banner err">' + esc(e.message) + "</div>";
     });
   }
 
@@ -370,6 +416,8 @@
       var kind = p.kind || p.type || "tool";
       var kindChip = kind === "gate"
         ? '<span class="chip info"><span class="sym">⛨</span>质量门审查</span>'
+        : kind === "plan_review"
+        ? '<span class="chip info"><span class="sym">≡</span>计划审批</span>'
         : '<span class="chip warn"><span class="sym">⚑</span>工具审批</span>';
       var title = p.task_title || p.tool || p.description || "待审批动作";
       var args = p.arguments || p.arguments_preview || p.code || null;
@@ -386,7 +434,10 @@
       // "本任务内不再询问"只对**工具审批**有意义：豁免的键是 (会话, 工具)，质量门没有
       // 工具这一维（服务端也会丢弃它的 remember）。所以 gate 卡片不给这两个按钮 ——
       // 给了就是点了没用。
-      var rememberRow = kind === "gate" ? "" :
+      // 计划审批同样没有"工具"这一维（豁免的键是 (会话, 工具)），服务端也会丢弃它的
+      // remember —— 给按钮就是点了没用。
+      var planBlock = p.plan ? planTable(p.plan) : "";
+      var rememberRow = (kind === "gate" || kind === "plan_review") ? "" :
         '<div class="row" style="margin-top:6px">' +
           '<span class="small dim" style="flex:1">本任务内不再询问 <code class="mono">' +
             esc(p.tool || "该动作") + '</code>：</span>' +
@@ -396,6 +447,7 @@
         '<div class="h">' + kindChip + "<strong>" + esc(title) + "</strong>" +
         '<span class="spacer"></span><span class="small dim">会话 ' + esc(id.slice(0, 8)) + "</span></div>" +
         (p.description ? '<div class="small muted">' + esc(p.description) + "</div>" : "") +
+        planBlock +
         (dl ? '<dl class="kv" style="margin-top:8px">' + dl + "</dl>" : "") +
         (args ? "<pre>" + esc(typeof args === "string" ? args : JSON.stringify(args, null, 2)) + "</pre>" : "") +
         '<div class="row"><input class="input grow" placeholder="审批意见（驳回时建议填写原因）" />' +
@@ -535,7 +587,8 @@
           var args = p.arguments || p.code || null;
           var card = el("div", "approval");
           card.innerHTML =
-            '<div class="h"><strong>' + esc(p.task_title || p.tool || "待审批动作") + "</strong><span class=\"spacer\"></span>" +
+            '<div class="h"><strong>' + esc(p.task_title || p.tool ||
+              (p.type === "plan_review" ? "计划待批准" : "待审批动作")) + "</strong><span class=\"spacer\"></span>" +
               '<span class="small dim mono">' + esc(a.interrupt_id) + "</span></div>" +
             (p.description ? '<div class="small muted">' + esc(p.description) + "</div>" : "") +
             (args ? "<pre>" + esc(typeof args === "string" ? args : JSON.stringify(args, null, 2)) + "</pre>" : "") +
@@ -630,6 +683,7 @@
       var mwItems = (cp.middleware && cp.middleware.items) || [];
       // 限流没有全局开关，配额是逐工具声明的：有配额的工具有几个，才是这一行的真实状态。
       var rateLimited = (tools.tools || []).filter(function (t) { return (t.rate_limit_per_min || 0) > 0; }).length;
+      var apv = cp.approval || {};
 
       c.innerHTML =
         '<div class="tiles">' +
@@ -643,6 +697,11 @@
 
         '<div class="panel"><div class="panel-head"><h2>管控组件开关（配置 vs 运行时）</h2></div><div class="panel-body flush">' +
           sw("鉴权 Auth", "请求身份与角色来源", (cp.auth || {}).configured_enabled) +
+          sw("审批通道", "这个部署有没有人审（SERVER_APPROVAL_CHANNEL）",
+             apv.channel === "http", "有人审",
+             apv.channel === "none" ? "明确无人值守" : "未回答") +
+          sw("执行前计划审批", "计划先过审再动手（SERVER_PLAN_APPROVAL）",
+             apv.plan_approval, "已启用", "未启用") +
           sw("PDP 权限判定", "存在性 + 角色 / 子 Agent 白名单", permRt.pdp_enabled, "运行中", "未运行") +
           sw("行列级权限", "SQL 改写 / 行级过滤（与 PDP 共用 PERMISSION_* 开关）", perm.configured_enabled, "已接入", "未启用") +
           sw("熔断器", "错误率 / 超阈自动断路", cb.configured_enabled, JSON.stringify(cb.snapshot || {}) !== "{}" ? "有快照" : "已启用", "未启用") +

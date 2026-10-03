@@ -193,6 +193,14 @@ class ServerSettings(BaseSettings):
     approval_sweep_seconds: int = 30
     """``auto_reject`` 的清扫间隔（秒）。"""
 
+    plan_approval: bool = False
+    """是否在**执行前**把计划摆给审批人过一眼（默认关，零回归）。
+
+    打开后图会在 `plan` 与 `dispatch` 之间停下，等人批准了才动手。它与
+    ``approval_channel`` 是绑定关系：**没有人审的部署不该开它**（开了就是给自己挖
+    一个永远等不到的坑），装配期会直接失败。
+    """
+
     @field_validator("approval_channel")
     @classmethod
     def _check_approval_channel(cls, value: Optional[str]) -> Optional[str]:

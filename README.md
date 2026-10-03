@@ -36,6 +36,7 @@
 - 高风险操作走 LangGraph interrupt，暂停等人审批后再继续
 - 审批支持「本任务内不再询问」：对某个高危工具一次性给出常驻的允许或拒绝，免去同一任务里反复弹同一张卡；豁免**只跳过审批这一步**，权限判定与沙箱照旧，授予与每次生效都落审计并推到控制台
 - 审批按**调用**分级：领域包声明工具的风险策略（只回答"多危险"），部署方配置阈值（回答"问还是放"）。低风险**且**有沙箱等确定性机制兜底时自动放行，高风险才停下来问人，触及红线的直接拒。自动放行的前提是"有机制兜底"而非"判断它安全"，每次放行都带风险等级与兜底机制名留痕
+- 执行前计划审批（可选）：计划生成后**停下来**摆给审批人，批准了才开始动手；驳回则带着意见退回重规划，改出来的计划同样要过审 —— 驳回不会把任务判死
 - 无人值守是**说出口**的选择：挂有需审批工具的部署必须声明自己有没有审批通道（`SERVER_APPROVAL_CHANNEL`，不配置则启动失败），超时无人处理的审批由后台自动驳回并推进任务 —— 不会静默卡在等待里
 - 中文 PII 识别（身份证 / 手机号 / 银行卡，校验位防误报）与数据质量红线
 - 代码执行进隔离沙箱：非 root 运行 + Capability 剥离（9 项）+ `no_new_privileges` + seccomp（Docker 官方默认 profile）+ 进程数上限，文件只经 Filesystem API 与宿主显式交换（禁止宿主路径 bind mount）；沙箱不可用或凭据缺失时 fail closed，绝不在本机直接跑
@@ -191,6 +192,7 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/tasks/$THREA
 | 审批通道 | `SERVER_APPROVAL_CHANNEL` | **无默认** | `http`（有人审）/ `none`（无人值守）。挂有需审批工具时**必填**，否则启动失败 —— 强迫把"这个部署有没有人审"说出口 |
 | 无人应审批 | `SERVER_APPROVAL_UNATTENDED` | `auto_reject` | 超时无人处理时自动驳回并推进；`block` 则一直等（会打 WARNING） |
 | 风险阈值 | `SERVER_APPROVAL_THRESHOLD` / `SERVER_APPROVAL_DENY_THRESHOLD` | `medium` / `critical` | 高过前者问人，达到后者直接拒；两条线都由部署方配 |
+| 执行前计划审批 | `SERVER_PLAN_APPROVAL` | 关 | 计划生成后停下来等人批准再执行；驳回则带着意见退回重规划，改出来的计划同样过审。**需要有人审**：通道不是 `http` 时开了它启动即失败 |
 | 多数据源 | `DATASOURCE_SOURCES` | 空 | 配置命名 MySQL/PG 源，`sql_query` 按需切换 |
 | 对象存储 | `MINIO_ENABLED` | 关 | VFS 大文件落 MinIO；默认落本地磁盘（`VFS_LOCAL_ROOT`） |
 | 事件落盘 | `EVENT_ENABLED` | 开 | 一个任务一个 append-only JSONL（`EVENT_DIR`）。控制台据此**回放已结束的任务**；不落盘则跑完就只剩状态快照。保留 `EVENT_RETENTION_DAYS` 天，启动时清理 |

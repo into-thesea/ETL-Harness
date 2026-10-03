@@ -230,6 +230,7 @@ class HarnessService:
             skill_registry=skill_registry,
             datasources=datasources,
             long_term_memory=long_term_memory,
+            plan_review=settings.server.plan_approval,
         )
         # 注册进程级管控事件聚合观察者。按 bus 实例去重：测试 reset_event_bus 后总线
         # 换新，需在重新装配时挂到新 bus；同一 bus 不重复注册（否则计数翻倍）。
@@ -253,8 +254,16 @@ class HarnessService:
         """
         from harness.config import settings
 
+        if settings.server.plan_approval and settings.server.approval_channel != "http":
+            raise RuntimeError(
+                "SERVER_PLAN_APPROVAL=true（执行前计划审批）但 SERVER_APPROVAL_CHANNEL"
+                f"={settings.server.approval_channel!r} —— 计划审批**需要有人**，"
+                '没有人审的部署开它等于给自己挖一个永远等不到的坑。'
+                '请设 SERVER_APPROVAL_CHANNEL="http"，或关掉计划审批。'
+            )
+
         approval_tools = [t.name for t in self.broker.list_tools() if t.requires_approval]
-        if not approval_tools:
+        if not approval_tools and not settings.server.plan_approval:
             return
         channel = settings.server.approval_channel
         if channel == "http":
@@ -729,6 +738,10 @@ class HarnessService:
             "rate_limit": {"scope": broker_stats.get("rate_limit_scope", "process")},
             "approval": {
                 "timeout_seconds": settings.server.approval_timeout_seconds,
+                # 这个部署有没有人审、没人应怎么办、以及执行前计划审批开没开
+                "channel": settings.server.approval_channel,
+                "unattended": settings.server.approval_unattended,
+                "plan_approval": settings.server.plan_approval,
                 "requires_approval_tools": [
                     t["name"] for t in tools_view if t.get("requires_approval")
                 ],
@@ -975,8 +988,11 @@ class HarnessService:
             item = pending[0]
             interrupt_id = item.get("interrupt_id")
             payload = item.get("payload") or {}
-            # 两类人工卡点（设计 §3.6）：高危工具审批 vs 质量门 HUMAN 结论审查
-            kind = "gate" if payload.get("type") == "gate_review" else "tool"
+            # 三类人工卡点（设计 §3.6）：高危工具审批 / 质量门 HUMAN 结论审查 / 执行前计划审批
+            kind = {
+                "gate_review": "gate",
+                "plan_review": "plan",
+            }.get(payload.get("type"), "tool")
             tool = payload.get("tool")
             request_id = payload.get("approval_request_id")
             task_id = payload.get("task_id")
