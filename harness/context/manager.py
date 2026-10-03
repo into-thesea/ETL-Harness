@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -37,6 +38,9 @@ MessageTypes = str | tuple[str, ...] | None
 
 # 摘要器：把若干条旧消息压缩成一段"前期操作回顾"（生产中通常接 LLM）
 Summarizer = Callable[[list[Message]], str]
+
+#: 折叠回顾的包头。单独拎出来是因为它要参与"回顾不得比原文更长"的额度计算。
+_REVIEW_HEADER = "【前期操作回顾（更早的中间过程已压缩）】\n"
 
 
 @dataclass
@@ -191,24 +195,11 @@ class ContextManager:
 
         # 1) 大结果沉淀到 VFS，提示里只留摘要 + 路径
         if self.vfs is not None and len(text) > b.sink_threshold_chars:
-            try:
-                summary = text[: b.observation_head_chars]
-                if len(text) > b.observation_head_chars:
-                    summary += "..."
-                vfs_path, _ = self.vfs.sink_large_result(
-                    tool_name, text, session_id=session_id, summary=summary
-                )
-                ref = {
-                    "tool": tool_name,
-                    "path": vfs_path,
-                    "chars": len(text),
-                    "session_id": session_id,
-                }
-                self._refs.setdefault(session_id, []).append(ref)
-                logger.info(
-                    "Settled large %s result (%d chars) -> %s",
-                    tool_name, len(text), vfs_path,
-                )
+            summary = text[: b.observation_head_chars]
+            if len(text) > b.observation_head_chars:
+                summary += "..."
+            vfs_path = self._sink_and_register(tool_name, text, session_id, summary)
+            if vfs_path is not None:
                 returned = (
                     f"【工具 {tool_name} 返回结果较长（{len(text)} 字符），完整内容已沉淀到 "
                     f"{vfs_path}；需要原始细节时可用文件工具按该路径读取。】\n"
@@ -218,8 +209,7 @@ class ContextManager:
                 self.stats.sink_chars_original += len(text)
                 self.stats.sink_chars_returned += len(returned)
                 return returned
-            except Exception as e:  # noqa: BLE001 - 沉淀失败不得中断执行，降级为截断
-                logger.warning("VFS sink failed, fallback to truncation: %s", e)
+            # 落盘失败：落到下面的截断兜底
 
         # 2) 无 VFS 或沉淀失败：硬截断兜底
         if len(text) > b.observation_char_limit:
@@ -237,6 +227,7 @@ class ContextManager:
         long_term_context: str = "",
         start_on: MessageTypes = ("user", "assistant"),
         end_on: MessageTypes = None,
+        session_id: str = "default",
     ) -> list[Message]:
         """按预算压缩对话历史，返回可直接拼到 system 之后的消息列表。
 
@@ -305,10 +296,15 @@ class ContextManager:
         if older:
             self.stats.compact_messages_folded += len(older)
             review = self._summarize(older)
-            packed.append({
-                "role": "user",
-                "content": f"【前期操作回顾（更早的中间过程已压缩，需要细节可调文件）】\n{review}",
-            })
+            header = self._sink_folded(older, session_id) or _REVIEW_HEADER
+            # 回顾（含包头）**不得比它替换掉的内容更长** —— 触发压缩的可能是"条数超了"
+            # 而非"字符超了"；原文都是短消息时，逐条取头再加前缀的摘要会把提示**变大**，
+            # 模型多花 token 却看到更少细节。按被折叠内容的实际字符数封顶，杜绝反向压缩。
+            allowance = max(0, self._total_chars(older) - len(header))
+            if len(review) > allowance:
+                # 省略号自己占一个字符，要一起算进额度（差这一个就会让"压缩"仍略增）
+                review = review[: max(0, allowance - 1)] + "…"
+            packed.append({"role": "user", "content": header + review})
         packed.extend(recent)
 
         # 最后防线：仍超预算则丢弃最旧的非锚点消息
@@ -322,6 +318,49 @@ class ContextManager:
     # ------------------------------------------------------------------
     # 内部方法
     # ------------------------------------------------------------------
+    def _sink_and_register(
+        self,
+        tool_name: str,
+        text: str,
+        session_id: str,
+        summary: str = "",
+    ) -> Optional[str]:
+        """落盘并**登记引用**，返回路径；失败返回 None。
+
+        登记不能省：``settled_refs`` / 快照恢复 / 控制台的产物视图都读 ``self._refs``。
+        绕过它直接调 VFS，文件虽然写了，但在"这个会话沉淀了什么"这件事上等于没发生
+        （踩过一次：折叠历史时直接调 VFS，回头按引用找文件找不到）。
+        """
+        if self.vfs is None:
+            return None
+        try:
+            path, _ = self.vfs.sink_large_result(
+                tool_name, text, session_id=session_id, summary=summary,
+            )
+        except Exception as e:  # noqa: BLE001 - 落盘是增强项，失败必须可降级
+            logger.warning("VFS sink failed for %s, degrade: %s", tool_name, e)
+            return None
+        self._refs.setdefault(session_id, []).append({
+            "tool": tool_name, "path": path, "chars": len(text), "session_id": session_id,
+        })
+        logger.info("Settled %s (%d chars) -> %s", tool_name, len(text), path)
+        return path
+
+    def _sink_folded(self, older: list[Message], session_id: str) -> str:
+        """把被折叠的原文落到 VFS，返回写明路径的回顾包头；落不了盘则返回空串。
+
+        **为什么要落**：回顾文本会告诉模型"更早的过程已压缩"。若只给一句摘要、
+        不给回头路，模型在需要核对早前结论时只能靠猜。沉淀的大结果有文件可读，
+        被折叠的历史没有理由不同 —— 这是同一件事的两半。落盘失败时返回空串，
+        走不含路径的包头，**不给出一个不存在的路径**（那会诱使模型去读一个
+        注定失败的文件）。
+        """
+        payload = json.dumps(older, ensure_ascii=False)
+        path = self._sink_and_register("history", payload, session_id, "早期对话原文")
+        if path is None:
+            return ""
+        return f"【前期操作回顾（更早的中间过程已压缩；完整原文见 {path}，需要细节可读回）】\n"
+
     def _summarize(self, older: list[Message]) -> str:
         """把旧消息压缩成回顾文本：优先 LLM 摘要器，失败/缺省走确定性规则。"""
         if self.summarizer is not None:

@@ -356,7 +356,11 @@ class ReActNodes:
         if self.context_manager is None:
             return history
         return self.context_manager.compact_history(
-            history, long_term_context=state.get("long_term_context") or ""
+            history,
+            long_term_context=state.get("long_term_context") or "",
+            # 会话 id 必须传：被折叠的原文会落进 `VFS/<session>/`，不传就全挤在 default
+            # 目录下 —— 多任务并行时彼此的历史会串到一起，而且没人会立刻发现。
+            session_id=state.get("session_id") or "default",
         )
 
     def _skill_guidance(self, state: AgentState) -> str:
