@@ -55,6 +55,27 @@ TOOL_DEF = ToolDef(
 _executor = SandboxExecutor()
 
 
+# 出网 / 装包 / 起子进程的代码：风险不再是"算错一个数"，而是"把宿主或外网牵进来"。
+# 只回答"多危险"，不回答"要不要问人" —— 后者是部署方的阈值与拒绝线的事
+# （见 docs/审批策略设计.md §3.4）。
+_RISKY_MARKERS = (
+    "requests.", "urllib", "httpx", "socket", "subprocess", "os.system",
+    "pip install", "shutil.rmtree", "open('/etc", 'open("/etc',
+)
+
+
+def risk_of_code(args: dict) -> str:
+    """这一次调用的风险档：出网 / 装包 / 起子进程 → ``high``，其余纯计算 → ``low``。
+
+    ``low`` 并不等于"放行" —— 它只在**沙箱真的可用**时才自动放行（沙箱就是那个
+    确定性兜底机制）。沙箱没起来时，判成 ``low`` 也照样问人。
+    """
+    from harness.approval_policy import RISK_HIGH, RISK_LOW
+
+    code = str(args.get("code") or "")
+    return RISK_HIGH if any(m in code for m in _RISKY_MARKERS) else RISK_LOW
+
+
 def handle(args: dict, context: dict):
     """工具的直接调用入口 —— 同样走沙箱，不存在裸跑路径。
 
@@ -65,4 +86,4 @@ def handle(args: dict, context: dict):
     return _executor.execute(TOOL_DEF, args, context, None)
 
 
-__all__ = ["TOOL_DEF", "handle", "static_guard"]
+__all__ = ["TOOL_DEF", "handle", "risk_of_code", "static_guard"]

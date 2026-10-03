@@ -16,6 +16,7 @@ from harness.domain import PackageContext
 
 from .agents import build_agents
 from .tools import BUILTIN_TOOLS
+from .tools.code_executor import risk_of_code
 
 # 技能库目录（本包自带：清洗 SOP、图表选型、口径对齐、异常值处理…）
 SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
@@ -53,6 +54,9 @@ class DataAnalysisPackage:
         ctx.register_tools(list(BUILTIN_TOOLS.values()))
         ctx.register_agents(list(build_agents().values()))
         ctx.add_skill_directory(SKILLS_DIR)
+        # 声明"跑代码"多危险：领域包只回答这个，要不要问人由部署方的阈值决定。
+        # 有了它，纯计算类代码在**沙箱真可用**时不再打扰审批人；出网/装包仍然要问。
+        ctx.register_risk_policy("code_executor", risk_of_code)
 
 
 __all__ = ["SKILLS_DIR", "DataAnalysisPackage"]

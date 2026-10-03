@@ -454,14 +454,34 @@ class ToolBroker:
     def approval_fallback(self, tool_name: str) -> Optional[str]:
         """这一次调用可依靠的确定性兜底机制名；没有则 None。
 
-        必须看**运行时**状态：配置说开沙箱、但沙箱实际没连上（``self.sandbox is None``），
-        就不算可用 —— 自动放行的理由只能是"有机制兜底"，不能是"我判断它安全"。
+        必须看**运行时**状态，而且是**真的可用**，不是"配置里开了"：沙箱客户端
+        构造时不碰网络，所以"``self.sandbox`` 非空"只说明配置开着 —— 服务端没起时
+        照样是空的兜底。自动放行的理由只能是"有机制兜底"，不能是"我判断它安全"。
         """
         entry = self._tools.get(tool_name)
         tool_def = entry[0] if entry else None
-        if tool_def is not None and tool_def.run_in_sandbox and self.sandbox is not None:
-            return "sandbox"
-        return None
+        if tool_def is None or not tool_def.run_in_sandbox:
+            return None
+        return "sandbox" if self._sandbox_really_available() else None
+
+    def _sandbox_really_available(self) -> bool:
+        """向沙箱要一个**运行时**的可用性结论（带缓存，见 ``SandboxExecutor.available``）。"""
+        executor = self.sandbox
+        if executor is None:
+            return False
+        probe = getattr(executor, "available", None)
+        if probe is None:
+            # 替身或第三方执行器没有探测口：按"存在即可用"处理，与旧行为一致。
+            # 真实的 SandboxExecutor 有 available()，走下面的真探测。
+            return True
+        try:
+            ok, reason = probe()
+        except Exception:  # noqa: BLE001 - 探测失败按不可用处理（fail closed）
+            logger.debug("沙箱可用性探测异常，按不可用处理", exc_info=True)
+            return False
+        if not ok:
+            logger.info("沙箱当前不可用，自动放行降级为按需审批：%s", reason)
+        return bool(ok)
 
     # ------------------------------------------------------------------
     # 授权预检（人工审批之前先判"准不准做"）

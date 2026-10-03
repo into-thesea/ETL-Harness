@@ -21,6 +21,7 @@ import ast
 import logging
 import os
 import threading
+import time
 from datetime import datetime
 from typing import Any, Callable
 
@@ -128,6 +129,35 @@ class SandboxExecutor:
         self._slots = threading.Semaphore(self._limit) if self._limit > 0 else None
         self._in_use = 0
         self._in_use_lock = threading.Lock()
+        # 可用性探测的缓存：探测是一次带 5 秒超时的健康检查，而审批闸门在每次
+        # "有风险策略"的调用前都会问 —— 不能每次都打。
+        self._probe: tuple[bool, str] = (False, "尚未探测")
+        self._probe_at: float | None = None
+        self._probe_lock = threading.Lock()
+
+    #: 探测结论的缓存时长（秒）。
+    _PROBE_TTL_SECONDS = 30.0
+
+    def available(self) -> tuple[bool, str]:
+        """沙箱**现在**是否真的可用 —— 不是"配置里开了"。
+
+        构造 executor 不碰网络，所以"非空"只能说明**配置**开着；服务端没起时
+        ``self.client.available()`` 会给出 False。审批闸门据此判断"有没有兜底机制"：
+        配置开着但服务是死的，**不算兜底**（否则自动放行的理由就是假的）。
+        """
+        now = time.monotonic()
+        with self._probe_lock:
+            if self._probe_at is not None and now - self._probe_at < self._PROBE_TTL_SECONDS:
+                return self._probe
+        result = self.client.available()
+        with self._probe_lock:
+            self._probe, self._probe_at = result, now
+        return result
+
+    def invalidate_availability(self) -> None:
+        """丢掉探测缓存，让下一次 :meth:`available` 重新探（探测结论变化后调用）。"""
+        with self._probe_lock:
+            self._probe_at = None
 
     def stats(self) -> dict[str, int]:
         """并发闸门的运行状态（供运维观察是否长期排队）。"""

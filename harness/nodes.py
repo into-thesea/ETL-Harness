@@ -213,12 +213,19 @@ class ReActNodes:
 
         # 风险分级：领域包只回答"多危险"，这里回答"要不要问人"。
         # 放在 authorize 之后 —— 自动放行**绝不能**越过 PDP（与豁免同一条）。
+        # 没有风险策略时**不去探沙箱**：那条路径的结论必然是 ASK（零回归），而探测是
+        # 一次带超时的健康检查，没必要为它花网络往返。也免得"无策略"这条最常见的路径
+        # 依赖一个它根本用不到的运行时结论。
+        risk_policy = self.broker.risk_policy_for(tool_name)
+        fallback = (
+            self.broker.approval_fallback(tool_name) if risk_policy is not None else None
+        )
         decision = decide_approval(
             tool_name, args,
-            risk_policy=self.broker.risk_policy_for(tool_name),
+            risk_policy=risk_policy,
             threshold=self.broker.approval_threshold,
             deny_threshold=self.broker.approval_deny_threshold,
-            fallback=self.broker.approval_fallback(tool_name),
+            fallback=fallback,
         )
         if decision.decision in (DECISION_AUTO, DECISION_DENY):
             # 自动档是"静默放宽"，比弹卡更需要可见（挂账 #13 的定位）

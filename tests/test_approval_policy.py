@@ -221,6 +221,72 @@ def test_auto_downgraded_when_sandbox_actually_unavailable(monkeypatch) -> None:
     assert len(called) == 1, "沙箱不可用时必须降级为按需审批"
 
 
+class _DeadSandbox:
+    """配置里开着、但**服务端是死的**沙箱：有探测口，探测结论是"不可用"。"""
+
+    def __init__(self) -> None:
+        self.probes = 0
+
+    def execute(self, tool_def, args, context, sandbox_config):
+        return False, "sandbox down", {}
+
+    def available(self):
+        self.probes += 1
+        return False, "OpenSandbox 服务端不可达"
+
+
+def test_fallback_consults_the_sandbox_not_the_config() -> None:
+    """"非空"只能说明配置开着 —— 兜底结论必须来自**运行时**探测。"""
+    broker = ToolBroker(sandbox_executor=_DeadSandbox(), circuit_breaker=False, cache=False)
+    broker.register(_tool_def_sandboxed(), lambda a, c: (True, "ok", {}))
+    assert broker.approval_fallback("sandboxed") is None
+
+
+def test_configured_but_dead_sandbox_is_not_a_fallback(monkeypatch) -> None:
+    """Review Focus 5 的真身：沙箱开着但服务死了 → 不算兜底 → 降级为按需审批。
+
+    这条是**补**的：原先那条用例拿 ``sandbox_executor=False``（沙箱直接是 None）当替身，
+    恰好绕开了真实场景 —— "非空但不可用"。接上真探测口之后才照得出来。
+    """
+    broker = ToolBroker(sandbox_executor=_DeadSandbox(), circuit_breaker=False, cache=False)
+    broker.register(_tool_def_sandboxed(), lambda a, c: (True, "ok", {}))
+    broker.register_risk_policy("sandboxed", lambda a: RISK_LOW)
+    nodes = _nodes(broker)
+    called = []
+    monkeypatch.setattr("harness.nodes.interrupt",
+                        lambda payload: called.append(payload) or {"approved": True})
+
+    nodes._request_tool_approval("sandboxed", {}, _POLICY_STATE, {})
+    assert len(called) == 1, "沙箱服务是死的 → 没有兜底 → 必须降级为按需审批"
+
+
+def test_sandbox_probe_is_cached() -> None:
+    """探测带超时，不能每次调用都打 —— 缓存窗口内复用上次结论。"""
+    from harness.sandbox.executor import SandboxExecutor
+
+    probe = _DeadSandbox()
+    executor = SandboxExecutor(client=probe)
+    for _ in range(5):
+        assert executor.available() == (False, "OpenSandbox 服务端不可达")
+    assert probe.probes == 1, "同一窗口内不该重复探测"
+
+    executor.invalidate_availability()
+    executor.available()
+    assert probe.probes == 2, "显式失效后应重新探测"
+
+
+def test_no_policy_never_probes_the_sandbox(monkeypatch) -> None:
+    """没有风险策略时结论必然是 ASK —— 别为它花一次带超时的健康检查。"""
+    dead = _DeadSandbox()
+    broker = ToolBroker(sandbox_executor=dead, circuit_breaker=False, cache=False)
+    broker.register(_tool_def_sandboxed(), lambda a, c: (True, "ok", {}))
+    nodes = _nodes(broker)
+    monkeypatch.setattr("harness.nodes.interrupt", lambda payload: {"approved": True})
+
+    nodes._request_tool_approval("sandboxed", {}, _POLICY_STATE, {})
+    assert dead.probes == 0
+
+
 def test_auto_never_overrides_pdp(monkeypatch) -> None:
     """命门：AUTO 档 + 被 PDP 拒绝的工具 → 仍必须被拒（与豁免同一条）。"""
     pdp = PDP(default_policy="deny")
@@ -525,3 +591,35 @@ def test_sweep_really_advances_an_expired_task(monkeypatch) -> None:
             raise AssertionError("清扫报了处理 1 条，但任务仍停在 awaiting_approval")
 
     asyncio.run(scenario())
+
+
+# ======================================================================
+# 领域包第一次真的用上它（data_analysis 声明 code_executor 的风险）
+# ======================================================================
+def test_domain_package_classifies_code_risk() -> None:
+    """领域包自己回答"多危险"：纯计算 low，出网/装包/起子进程 high。"""
+    from packages.data_analysis.tools.code_executor import risk_of_code
+
+    assert risk_of_code({"code": "df.groupby('dept').sum()"}) == RISK_LOW
+    assert risk_of_code({"code": "import requests; requests.get(URL)"}) == RISK_HIGH
+    assert risk_of_code({"code": "subprocess.run(['ls'])"}) == RISK_HIGH
+    assert risk_of_code({}) == RISK_LOW
+
+
+def test_mounted_package_actually_registers_the_policy() -> None:
+    """策略要真的挂到运行链路上 —— 不是只在包代码里躺着（"已接入"三档口径）。"""
+    import asyncio
+
+    from harness.server.service import HarnessService
+    from tests._smoke_server import ApprovalLLM
+    from tests.test_console_api import _memory_saver
+
+    async def scenario():
+        svc = HarnessService(checkpointer=_memory_saver(), llm=ApprovalLLM(),
+                             auto_assemble=False)
+        await svc._ensure_ready()
+        svc.assemble()
+        return svc.broker
+
+    broker = asyncio.run(scenario())
+    assert broker.risk_policy_for("code_executor") is not None, "挂了包却没注册风险策略"
