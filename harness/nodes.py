@@ -22,6 +22,8 @@ from typing import Any, Optional
 from langchain_core.messages import BaseMessage
 from langgraph.types import interrupt
 
+from harness.approval_policy import DECISION_AUTO, DECISION_DENY, decide_approval
+from harness.events import GUARD_LAYER_APPROVAL, emit_guard_decision
 from harness.llm_client import (
     LLMClient,
     _try_extract_json,
@@ -207,6 +209,34 @@ class ReActNodes:
             logger.info("Tool %s allowed by session grant", tool_name)
             return True, "", self._make_approval_credential(
                 tool_name, state, via="session_grant", grant_id=grant["grant_id"]
+            )
+
+        # 风险分级：领域包只回答"多危险"，这里回答"要不要问人"。
+        # 放在 authorize 之后 —— 自动放行**绝不能**越过 PDP（与豁免同一条）。
+        decision = decide_approval(
+            tool_name, args,
+            risk_policy=self.broker.risk_policy_for(tool_name),
+            threshold=self.broker.approval_threshold,
+            deny_threshold=self.broker.approval_deny_threshold,
+            fallback=self.broker.approval_fallback(tool_name),
+        )
+        if decision.decision in (DECISION_AUTO, DECISION_DENY):
+            # 自动档是"静默放宽"，比弹卡更需要可见（挂账 #13 的定位）
+            logger.info("Tool %s decision=%s risk=%s: %s",
+                        tool_name, decision.decision, decision.risk, decision.reason)
+            emit_guard_decision(
+                state.get("trace_id"), layer=GUARD_LAYER_APPROVAL,
+                decision="allow" if decision.decision == DECISION_AUTO else "deny",
+                reason=decision.reason, tool=tool_name,
+                task_id=state.get("task_id"), agent_id=state.get("agent_id"),
+                via="risk_auto", risk=decision.risk, policy=decision.policy,
+                fallback=decision.fallback,
+            )
+            if decision.decision == DECISION_DENY:
+                return False, f"该操作被审批策略拒绝：{decision.reason}", None
+            return True, "", self._make_approval_credential(
+                tool_name, state, via="risk_auto", risk=decision.risk,
+                policy=decision.policy, fallback=decision.fallback,
             )
 
         # 审批请求的关联 id 与过期时刻：request_id 用来把 APPROVAL_REQUIRED 与

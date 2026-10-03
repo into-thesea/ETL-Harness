@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 把 .env 注入 os.environ 后再实例化任何 Settings。
@@ -146,6 +146,32 @@ class ServerSettings(BaseSettings):
     拒绝，避免对早已过时的现场放行），但始终可以**驳回**让 Agent 重新提请。
     设为 0 或负数表示不过期。
     """
+
+    approval_threshold: str = "medium"
+    """风险高过这条线就问人（``low`` / ``medium`` / ``high`` / ``critical``）。
+
+    与 ``approval_deny_threshold`` 一样是**部署方的旋钮**：领域包只声明风险档，
+    "问还是放"由这里拍板（见 ``docs/技术选型决策.md`` D-007）。
+    """
+
+    approval_deny_threshold: str = "critical"
+    """风险达到这条线**直接拒**，连问都不问。默认只有红线档触发。
+
+    调低它会让更低的档位也直接拒（例如设成 ``high``）。**写错会在启动时报错**，
+    不会静默回落 —— 这条线关系到"什么不问就毙掉"，必须响亮。
+    """
+
+    @field_validator("approval_threshold", "approval_deny_threshold")
+    @classmethod
+    def _check_risk_threshold(cls, value: str) -> str:
+        from harness.approval_policy import RISK_CRITICAL, RISK_HIGH, RISK_LOW, RISK_MEDIUM
+
+        allowed = (RISK_LOW, RISK_MEDIUM, RISK_HIGH, RISK_CRITICAL)
+        if value not in allowed:
+            raise ValueError(
+                f"风险阈值取值非法：{value!r}（只支持 {' | '.join(allowed)}）"
+            )
+        return value
 
 
 class SandboxSettings(BaseSettings):

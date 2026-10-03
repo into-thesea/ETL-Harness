@@ -37,6 +37,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Callable, Optional
 
+from harness.approval_policy import RISK_CRITICAL, RISK_MEDIUM
 from harness.audit import AuditLogger
 from harness.circuit_breaker import CircuitBreaker, build_circuit_breaker
 from harness.events import (
@@ -142,6 +143,8 @@ class ToolBroker:
         audit_logger: Optional[AuditLogger] = None,
         circuit_breaker: Optional[Any] = None,
         cache: Optional[Any] = None,
+        approval_threshold: str = RISK_MEDIUM,
+        approval_deny_threshold: str = RISK_CRITICAL,
     ):
         """初始化 Tool Broker。
 
@@ -157,6 +160,10 @@ class ToolBroker:
                 构造；显式传 False 表示关闭熔断。
             cache: 工具结果缓存（``harness.cache.ToolResultCache``）。缺省按
                 cache.enabled 自动构造；显式传 False 表示关闭缓存。
+            approval_threshold: 风险高过这条线就问人（默认 ``medium``）。
+            approval_deny_threshold: 风险达到这条线**直接拒**，连问都不问（默认
+                ``critical``）。这是**部署方**的旋钮 —— 领域包只能声明风险档，
+                拒还是问由这条线拍板（见 ``docs/技术选型决策.md`` D-007）。
         """
         self._tools: dict[str, tuple[ToolDef, ToolHandler]] = {}
         self._call_log: dict[str, list[float]] = {}
@@ -178,6 +185,9 @@ class ToolBroker:
         # 而策略是 (args) -> str 的**代码**（决策见 docs/技术选型决策.md D-006）。
         # 与豁免表同类：读多写少、随包回收，共用 _grant_lock。
         self._risk_policies: dict[str, Callable[[dict], str]] = {}
+        # 审批的两条线：都是**部署方配置**，不是领域包能改的。
+        self.approval_threshold = approval_threshold
+        self.approval_deny_threshold = approval_deny_threshold
         self.middleware = middleware_manager
         self.pdp = pdp
         # 显式传 False = 关闭沙箱，归一成 None。不能把 False 直接存进来：invoke 与
@@ -440,6 +450,18 @@ class ToolBroker:
     def clear_risk_policy(self, tool_name: str) -> bool:
         with self._grant_lock:
             return self._risk_policies.pop(tool_name, None) is not None
+
+    def approval_fallback(self, tool_name: str) -> Optional[str]:
+        """这一次调用可依靠的确定性兜底机制名；没有则 None。
+
+        必须看**运行时**状态：配置说开沙箱、但沙箱实际没连上（``self.sandbox is None``），
+        就不算可用 —— 自动放行的理由只能是"有机制兜底"，不能是"我判断它安全"。
+        """
+        entry = self._tools.get(tool_name)
+        tool_def = entry[0] if entry else None
+        if tool_def is not None and tool_def.run_in_sandbox and self.sandbox is not None:
+            return "sandbox"
+        return None
 
     # ------------------------------------------------------------------
     # 授权预检（人工审批之前先判"准不准做"）
@@ -934,6 +956,19 @@ class ScopedBroker:
         if not self._is_allowed(tool_name):
             return None
         return self._inner.risk_policy_for(tool_name)
+
+    def approval_fallback(self, tool_name: str) -> Optional[str]:
+        if not self._is_allowed(tool_name):
+            return None
+        return self._inner.approval_fallback(tool_name)
+
+    @property
+    def approval_threshold(self) -> str:
+        return self._inner.approval_threshold
+
+    @property
+    def approval_deny_threshold(self) -> str:
+        return self._inner.approval_deny_threshold
 
     def invoke(
         self,

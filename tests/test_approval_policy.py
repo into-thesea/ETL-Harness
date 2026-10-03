@@ -15,6 +15,10 @@ from harness.approval_policy import (
     DECISION_ASK, DECISION_AUTO, DECISION_DENY, RISK_CRITICAL, RISK_HIGH, RISK_LOW,
     RISK_MEDIUM, RISK_UNKNOWN, decide_approval,
 )
+from harness.events import EventBus, reset_event_bus
+from harness.models import ToolDef
+from harness.pdp import PDP
+from harness.tool_broker import ToolBroker
 from tests.test_approval_gate import _guarded_broker
 
 
@@ -143,3 +147,156 @@ def test_policy_receives_args() -> None:
 
     decide_approval("danger", {"code": "print(1)"}, risk_policy=policy, fallback="sandbox")
     assert seen == {"code": "print(1)"}
+
+
+# ======================================================================
+# Task 3：节点闸门接入三档
+# ======================================================================
+_POLICY_STATE = {"session_id": "s1", "agent_id": "a1", "trace_id": "t1",
+                 "role": "analyst", "task_id": "task-1"}
+
+
+def _tool_def_sandboxed() -> ToolDef:
+    """一个需审批、且声明在沙箱里跑的工具 —— AUTO 的唯一合法来源。"""
+    return ToolDef(
+        name="sandboxed",
+        description="沙箱内执行的低风险工具",
+        parameters={},
+        requires_approval=True,
+        run_in_sandbox=True,
+        sandbox_task="x",
+        rate_limit_per_min=1000,
+    )
+
+
+class _StubSandbox:
+    """沙箱替身：本组用例只关心"沙箱在不在"，不会真执行到它。"""
+
+    def execute(self, tool_def, args, context, sandbox_config):
+        return True, "sandbox ok", {}
+
+
+def _sandboxed_broker(pdp=None) -> ToolBroker:
+    broker = ToolBroker(
+        pdp=pdp, sandbox_executor=_StubSandbox(), circuit_breaker=False, cache=False,
+    )
+    broker.register(_tool_def_sandboxed(), lambda a, c: (True, "ok", {}))
+    return broker
+
+
+def _nodes(broker: ToolBroker):
+    from harness.nodes import ReActNodes
+
+    return ReActNodes(llm=None, broker=broker)
+
+
+def _never(payload):
+    raise AssertionError("不应弹审批卡")
+
+
+def test_auto_decision_skips_interrupt(monkeypatch) -> None:
+    """低风险 + 兜底可用 → 不弹卡，凭证带 via=risk_auto 与归因字段。"""
+    broker = _sandboxed_broker()
+    broker.register_risk_policy("sandboxed", lambda a: RISK_LOW)
+    nodes = _nodes(broker)
+    monkeypatch.setattr("harness.nodes.interrupt", _never)
+
+    approved, _, cred = nodes._request_tool_approval("sandboxed", {}, _POLICY_STATE, {})
+    assert approved is True
+    assert cred["via"] == "risk_auto"
+    assert cred["risk"] == RISK_LOW and cred["fallback"] == "sandbox"
+
+
+def test_auto_downgraded_when_sandbox_actually_unavailable(monkeypatch) -> None:
+    """配置说在沙箱里跑、但沙箱实际没连上 → 不算有兜底 → 仍要问。"""
+    broker = _guarded_broker()                     # sandbox_executor=False → sandbox is None
+    broker.register(_tool_def_sandboxed(), lambda a, c: (True, "ok", {}))
+    broker.register_risk_policy("sandboxed", lambda a: RISK_LOW)
+    nodes = _nodes(broker)
+    called = []
+    monkeypatch.setattr("harness.nodes.interrupt",
+                        lambda payload: called.append(payload) or {"approved": True})
+
+    nodes._request_tool_approval("sandboxed", {}, _POLICY_STATE, {})
+    assert len(called) == 1, "沙箱不可用时必须降级为按需审批"
+
+
+def test_auto_never_overrides_pdp(monkeypatch) -> None:
+    """命门：AUTO 档 + 被 PDP 拒绝的工具 → 仍必须被拒（与豁免同一条）。"""
+    pdp = PDP(default_policy="deny")
+    broker = _sandboxed_broker(pdp=pdp)            # 兜底齐备，本该 AUTO
+    broker.register_risk_policy("sandboxed", lambda a: RISK_LOW)
+    nodes = _nodes(broker)
+    monkeypatch.setattr("harness.nodes.interrupt", _never)
+
+    approved, observation, _ = nodes._request_tool_approval("sandboxed", {}, _POLICY_STATE, {})
+    assert approved is False, "风险判定不得越过 PDP"
+    assert "未获授权" in observation
+
+
+def test_deny_decision_blocks_without_interrupt(monkeypatch) -> None:
+    """红线档：不问，直接拒；凭证也不签发。"""
+    broker = _sandboxed_broker()
+    broker.register_risk_policy("sandboxed", lambda a: RISK_CRITICAL)
+    nodes = _nodes(broker)
+    monkeypatch.setattr("harness.nodes.interrupt", _never)
+
+    approved, observation, cred = nodes._request_tool_approval(
+        "sandboxed", {}, _POLICY_STATE, {})
+    assert approved is False and cred is None
+    assert "拒绝" in observation
+
+
+def test_no_policy_still_interrupts(monkeypatch) -> None:
+    """零回归：没注册策略的工具行为不变，人工批准不带自动放行标记。"""
+    broker = _guarded_broker()
+    nodes = _nodes(broker)
+    calls = []
+    monkeypatch.setattr("harness.nodes.interrupt",
+                        lambda payload: calls.append(payload) or {"approved": True, "comment": "ok"})
+
+    approved, _, cred = nodes._request_tool_approval("danger", {}, _POLICY_STATE, {})
+    assert approved is True and len(calls) == 1
+    assert "via" not in cred, "人工批准不带自动放行标记"
+
+
+def test_illegal_threshold_config_fails_at_startup() -> None:
+    """两条线写错要**启动即报错**，不能静默回落到某种行为。"""
+    from pydantic import ValidationError
+
+    from harness.config import ServerSettings
+
+    for bad in ("typo", "MEDIUM", ""):
+        with pytest.raises(ValidationError):
+            ServerSettings(approval_deny_threshold=bad)
+    with pytest.raises(ValidationError):
+        ServerSettings(approval_threshold="very-high")
+
+    tuned = ServerSettings(approval_threshold="high", approval_deny_threshold="high")
+    assert tuned.approval_deny_threshold == "high", "部署方可以调低拒绝线"
+
+
+@pytest.fixture
+def bus():
+    fresh = EventBus()
+    reset_event_bus(fresh)
+    yield fresh
+    reset_event_bus(None)
+
+
+def test_auto_emits_guard_event_with_attribution(bus, monkeypatch) -> None:
+    """AUTO 是静默放宽，必须可见：事件带 risk / policy / fallback。"""
+    bus.bind("s1", "t1")
+    broker = _sandboxed_broker()
+    broker.register_risk_policy("sandboxed", lambda a: RISK_LOW)
+    nodes = _nodes(broker)
+    monkeypatch.setattr("harness.nodes.interrupt", _never)
+    sub = bus.subscribe("s1")
+
+    nodes._request_tool_approval("sandboxed", {}, _POLICY_STATE, {})
+
+    events = [e for e in sub.drain() if e["type"] == "GUARD_DECISION"]
+    assert len(events) == 1
+    d = events[0]["data"]
+    assert d["layer"] == "approval" and d["decision"] == "allow"
+    assert d["risk"] == RISK_LOW and d["fallback"] == "sandbox" and d["via"] == "risk_auto"

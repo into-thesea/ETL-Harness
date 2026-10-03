@@ -129,6 +129,9 @@ class HarnessService:
             middleware_manager=middleware,
             pdp=PDP.from_settings(settings.permission),
             audit_logger=get_audit_logger(),
+            # 审批的两条线由**部署方**配（D-007）：领域包只能声明风险档。
+            approval_threshold=settings.server.approval_threshold,
+            approval_deny_threshold=settings.server.approval_deny_threshold,
         )
         # 框架侧对象先立起来（全部为空）：**工具、角色、技能都由领域包挂载进来**，
         # 框架不内置任何领域内容。
