@@ -12,8 +12,8 @@ from __future__ import annotations
 import pytest
 
 from harness.approval_policy import (
-    DECISION_ASK, DECISION_AUTO, RISK_HIGH, RISK_LOW, RISK_MEDIUM, RISK_UNKNOWN,
-    decide_approval,
+    DECISION_ASK, DECISION_AUTO, DECISION_DENY, RISK_CRITICAL, RISK_HIGH, RISK_LOW,
+    RISK_MEDIUM, RISK_UNKNOWN, decide_approval,
 )
 from tests.test_approval_gate import _guarded_broker
 
@@ -103,6 +103,34 @@ def test_illegal_threshold_asks_everything() -> None:
     """阈值配错时按最保守处理（全都问），而不是按最松处理。"""
     d = decide_approval("danger", {}, risk_policy=lambda a: RISK_LOW,
                         threshold="typo", fallback="sandbox")
+    assert d.decision == DECISION_ASK
+
+
+def test_critical_risk_hits_the_default_deny_line() -> None:
+    """红线档默认就拒 —— 连人都别问（别在半夜为人不该被问到的事报警）。"""
+    d = decide_approval("danger", {}, risk_policy=lambda a: RISK_CRITICAL, fallback="sandbox")
+    assert d.decision == DECISION_DENY
+    assert d.risk == RISK_CRITICAL
+    assert "拒绝线" in d.reason
+
+
+def test_deployment_can_lower_the_deny_line() -> None:
+    """拒绝线是**部署方**配的：调低它，high 也直接拒；领域包管不着这条线。"""
+    d = decide_approval("danger", {}, risk_policy=lambda a: RISK_HIGH,
+                        fallback="sandbox", deny_threshold=RISK_HIGH)
+    assert d.decision == DECISION_DENY
+
+
+def test_deny_line_never_touches_unknown() -> None:
+    """未知是"问人"，不是"拒" —— 判不出来就把用户的操作毙掉是另一种伤害。"""
+    d = decide_approval("danger", {}, risk_policy=lambda a: RISK_UNKNOWN, fallback="sandbox")
+    assert d.decision == DECISION_ASK
+
+
+def test_illegal_deny_threshold_cannot_become_blanket_deny() -> None:
+    """拒绝线写错 → 退回问人，而不是静默变成"无条件拒"（拒了就没法挽回）。"""
+    d = decide_approval("danger", {}, risk_policy=lambda a: RISK_CRITICAL,
+                        fallback="sandbox", deny_threshold="typo")
     assert d.decision == DECISION_ASK
 
 

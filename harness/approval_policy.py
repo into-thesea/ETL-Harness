@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 RISK_LOW = "low"
 RISK_MEDIUM = "medium"
 RISK_HIGH = "high"
+#: 硬红线档：不是"更危险的高"，而是"人也不该批"的那一类（如绕审批直连线上、
+#: 删历史规则版本）。领域包只能**声明**它，是否真的拒由部署方的拒绝线决定。
+RISK_CRITICAL = "critical"
 #: 判定不出来的一律按需审批（未知不放过）
 RISK_UNKNOWN = "unknown"
 
@@ -25,7 +28,7 @@ DECISION_ASK = "ask"
 DECISION_DENY = "deny"
 
 #: 可比较的风险等级；``unknown`` 不在此表内 —— 它不可比较，一律按需审批
-_RISK_ORDER = {RISK_LOW: 0, RISK_MEDIUM: 1, RISK_HIGH: 2}
+_RISK_ORDER = {RISK_LOW: 0, RISK_MEDIUM: 1, RISK_HIGH: 2, RISK_CRITICAL: 3}
 
 
 @dataclass(frozen=True)
@@ -46,26 +49,33 @@ def decide_approval(
     risk_policy: Optional[Callable[[dict], str]] = None,
     threshold: str = RISK_MEDIUM,
     fallback: Optional[str] = None,
+    deny_threshold: str = RISK_CRITICAL,
 ) -> ApprovalDecision:
     """决定这一次调用：自动放行 / 问人 / 直接拒。
 
     * 未声明策略 → ``ask``（与"没有本机制"时的行为一致，这是零回归的根）；
     * 策略抛错或返回非法值 → ``ask``（**fail closed**：策略是别人写的代码，它会错）；
-    * ``unknown`` 不可比较，一律 ``ask``；
-    * 风险高于阈值 → ``ask``；
-    * 风险不高于阈值但**没有兜底机制** → ``ask``（自动放行的唯一理由是机制兜底）；
+    * ``unknown`` 不可比较，一律 ``ask``（未知不放过 —— 注意**不是** deny）；
+    * 风险达到拒绝线（``deny_threshold``，默认 ``critical``）→ ``deny``，连问都不问；
+    * 风险高于 ``threshold`` → ``ask``；
+    * 风险不高于 ``threshold`` 但**没有兜底机制** → ``ask``（自动放行的唯一理由是机制兜底）；
     * 阈值配错 → 按最保守处理（全都问）。
 
-    风险值**精确匹配**词表，不做 strip/lower 归一：归一化会把拼错的 ``"LOW "`` 悄悄
-    变成自动放行（见 ``docs/技术选型决策.md`` D-006 引的 fail-open 事故）。
+    拒绝线由**部署方**配（不是领域包写死的）：包只能声明 ``critical``，要不要真拒由
+    这条线决定。两条阈值都必须精确匹配词表，不做 strip/lower 归一 —— 归一化会把拼错的
+    ``"LOW "`` 悄悄变成自动放行（见 ``docs/技术选型决策.md`` D-006 引的 fail-open 事故）。
     """
     if risk_policy is None:
         return ApprovalDecision(DECISION_ASK, "未声明风险策略，按需审批", RISK_UNKNOWN, "default")
 
-    if threshold not in _RISK_ORDER:
-        logger.warning("阈值取值非法（%r），按最保守处理：全部按需审批", threshold)
+    if threshold not in _RISK_ORDER or deny_threshold not in _RISK_ORDER:
+        logger.warning(
+            "阈值取值非法（threshold=%r, deny_threshold=%r），按最保守处理：全部按需审批",
+            threshold, deny_threshold,
+        )
         return ApprovalDecision(
-            DECISION_ASK, f"阈值非法（{threshold!r}），按需审批", RISK_UNKNOWN, "tool")
+            DECISION_ASK, f"阈值非法（{threshold!r}/{deny_threshold!r}），按需审批",
+            RISK_UNKNOWN, "tool")
 
     try:
         raw = risk_policy(dict(args or {}))
@@ -77,6 +87,10 @@ def decide_approval(
     if risk not in _RISK_ORDER:
         return ApprovalDecision(
             DECISION_ASK, f"风险等级无法判定（{raw!r}），按需审批", RISK_UNKNOWN, "tool")
+
+    if _RISK_ORDER[risk] >= _RISK_ORDER[deny_threshold]:
+        return ApprovalDecision(
+            DECISION_DENY, f"风险 {risk} 达到拒绝线 {deny_threshold}，直接拒绝", risk, "tool")
 
     if _RISK_ORDER[risk] > _RISK_ORDER[threshold]:
         return ApprovalDecision(DECISION_ASK, f"风险 {risk} 高于阈值 {threshold}", risk, "tool")
@@ -90,7 +104,7 @@ def decide_approval(
 
 
 __all__ = [
-    "RISK_LOW", "RISK_MEDIUM", "RISK_HIGH", "RISK_UNKNOWN",
+    "RISK_LOW", "RISK_MEDIUM", "RISK_HIGH", "RISK_CRITICAL", "RISK_UNKNOWN",
     "DECISION_AUTO", "DECISION_ASK", "DECISION_DENY",
     "ApprovalDecision", "decide_approval",
 ]
