@@ -9,7 +9,12 @@
 
 from __future__ import annotations
 
-from harness.approval_policy import RISK_HIGH, RISK_LOW
+import pytest
+
+from harness.approval_policy import (
+    DECISION_ASK, DECISION_AUTO, RISK_HIGH, RISK_LOW, RISK_MEDIUM, RISK_UNKNOWN,
+    decide_approval,
+)
 from tests.test_approval_gate import _guarded_broker
 
 
@@ -36,3 +41,77 @@ def test_scoped_broker_forwards_risk_policy_read() -> None:
     scoped = ScopedBroker(broker, ["danger"])
     assert scoped.risk_policy_for("danger") is fn
     assert scoped.risk_policy_for("echo") is None, "白名单外不暴露"
+
+
+# ======================================================================
+# Task 2：决策函数（纯函数，四类分流）
+# ======================================================================
+def test_no_policy_defaults_to_ask() -> None:
+    """零回归的根：不声明策略 = 与今天逐字节一致（每次都问）。"""
+    d = decide_approval("danger", {}, risk_policy=None, fallback="sandbox")
+    assert d.decision == DECISION_ASK
+    assert d.risk == RISK_UNKNOWN
+    assert d.policy == "default"
+
+
+def test_low_risk_with_fallback_is_auto() -> None:
+    d = decide_approval("danger", {}, risk_policy=lambda a: RISK_LOW, fallback="sandbox")
+    assert d.decision == DECISION_AUTO
+    assert d.fallback == "sandbox"
+
+
+def test_low_risk_without_fallback_is_downgraded_to_ask() -> None:
+    """命门：自动放行的唯一理由是"有机制兜底"，不是"我判断它安全"。"""
+    d = decide_approval("danger", {}, risk_policy=lambda a: RISK_LOW, fallback=None)
+    assert d.decision == DECISION_ASK
+    assert "兜底" in d.reason
+
+
+def test_high_risk_above_threshold_asks() -> None:
+    d = decide_approval("danger", {}, risk_policy=lambda a: RISK_HIGH,
+                        threshold=RISK_MEDIUM, fallback="sandbox")
+    assert d.decision == DECISION_ASK
+
+
+def test_unknown_risk_always_asks() -> None:
+    for fallback in (None, "sandbox"):
+        d = decide_approval("danger", {}, risk_policy=lambda a: RISK_UNKNOWN, fallback=fallback)
+        assert d.decision == DECISION_ASK, "未知不放过"
+
+
+def test_raising_policy_fails_closed() -> None:
+    def boom(args):
+        raise RuntimeError("策略作者写错了")
+
+    d = decide_approval("danger", {}, risk_policy=boom, fallback="sandbox")
+    assert d.decision == DECISION_ASK
+    assert d.risk == RISK_UNKNOWN
+
+
+@pytest.mark.parametrize("bad", ["", None, "MEDIUM ", "very-high", 3])
+def test_illegal_risk_value_fails_closed(bad) -> None:
+    """风险值**精确匹配**词表，不做 strip/lower 归一。
+
+    "MEDIUM " 这种带杂讯的值按 unknown 处理 —— 归一化会把一个**拼错的 LOW** 悄悄
+    变成自动放行，正是调研里 OpenAI #3863 / Pydantic #8060 那类 fail-open 事故。
+    """
+    d = decide_approval("danger", {}, risk_policy=lambda a: bad, fallback="sandbox")
+    assert d.decision == DECISION_ASK
+
+
+def test_illegal_threshold_asks_everything() -> None:
+    """阈值配错时按最保守处理（全都问），而不是按最松处理。"""
+    d = decide_approval("danger", {}, risk_policy=lambda a: RISK_LOW,
+                        threshold="typo", fallback="sandbox")
+    assert d.decision == DECISION_ASK
+
+
+def test_policy_receives_args() -> None:
+    seen = {}
+
+    def policy(args):
+        seen.update(args)
+        return RISK_LOW
+
+    decide_approval("danger", {"code": "print(1)"}, risk_policy=policy, fallback="sandbox")
+    assert seen == {"code": "print(1)"}
